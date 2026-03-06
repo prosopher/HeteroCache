@@ -28,20 +28,23 @@ MODEL_A_NAME = "gpt2"
 MODEL_B_NAME = "gpt2-medium"
 
 SEED = 42
-CONTEXT_LEN = 64          # toy: 짧게
-BATCH_SIZE = 2
-TRAIN_STEPS = 2000
+CONTEXT_LEN = 128
+BATCH_SIZE = 4
+GRAD_ACCUM_STEPS = 64
+TRAIN_STEPS = 50_000
 VAL_EVERY = 100
-VAL_BATCHES = 10          # validation은 일부 배치만
+VAL_BATCHES = 8
 
-LR = 1e-4
-WEIGHT_DECAY = 0.0
+LR_INIT = 1e-6
+LR_PEAK = 1e-4
+WARMUP_STEPS = 2_500
+WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 
-# shared space / translator size (toy)
-Q_DIM = 1536              # 24로 나누어 떨어짐(12,24 둘 다 OK)
-D_MODEL = 256
-N_HEADS = 8
+# shared space / translator size
+Q_DIM = 6144
+D_MODEL = 2048
+N_HEADS = 32
 DROPOUT = 0.0
 
 SAVE_PATH = "translator_ckpt.pt"
@@ -77,6 +80,22 @@ def get_kv_from_model(model, input_ids, attention_mask):
     past = out.past_key_values
     K, V = pack_past_key_values(past)
     return K, V
+
+
+def compute_lr(step: int) -> float:
+    if step <= WARMUP_STEPS:
+        alpha = (step - 1) / max(1, WARMUP_STEPS - 1)
+        return LR_INIT + alpha * (LR_PEAK - LR_INIT)
+
+    progress = (step - WARMUP_STEPS) / max(1, TRAIN_STEPS - WARMUP_STEPS)
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return LR_PEAK * cosine
+
+
+def set_optimizer_lr(optimizer, lr: float):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 @torch.no_grad()
@@ -148,35 +167,43 @@ def main():
     ).to(device)
     translator.train()
 
-    opt = torch.optim.AdamW(translator.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    opt = torch.optim.AdamW(translator.parameters(), lr=LR_INIT, weight_decay=WEIGHT_DECAY)
 
     # infinite iterator
     train_iter = iter(train_loader)
 
     for step in range(1, TRAIN_STEPS + 1):
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
-
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-
-        # target KV from frozen LMs
-        with torch.no_grad():
-            K_A, V_A = get_kv_from_model(modelA, input_ids, attention_mask)
-            K_B, V_B = get_kv_from_model(modelB, input_ids, attention_mask)
-
         opt.zero_grad(set_to_none=True)
-        loss = translator(K_A, V_A, K_B, V_B)
-        loss.backward()
+        running_micro_loss = 0.0
+
+        for micro_idx in range(GRAD_ACCUM_STEPS):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            # target KV from frozen LMs
+            with torch.no_grad():
+                K_A, V_A = get_kv_from_model(modelA, input_ids, attention_mask)
+                K_B, V_B = get_kv_from_model(modelB, input_ids, attention_mask)
+
+            loss = translator(K_A, V_A, K_B, V_B)
+            running_micro_loss += float(loss.item())
+            (loss / GRAD_ACCUM_STEPS).backward()
 
         nn.utils.clip_grad_norm_(translator.parameters(), GRAD_CLIP_NORM)
+
+        lr = compute_lr(step)
+        set_optimizer_lr(opt, lr)
         opt.step()
 
         if step % 10 == 0:
-            print(f"[train] step={step:4d} loss={loss.item():.6f}")
+            avg_micro_loss = running_micro_loss / GRAD_ACCUM_STEPS
+            print(f"[train] step={step:4d} loss={avg_micro_loss:.6f} lr={lr:.8f}")
 
         if step % VAL_EVERY == 0:
             val_loss = eval_recon_loss(translator, modelA, modelB, val_loader, device)
