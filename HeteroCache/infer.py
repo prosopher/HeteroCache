@@ -16,7 +16,7 @@ from translator_lib import (
     cosine_sim_flat,
 )
 
-CKPT_PATH = "translator_B2A_ckpt.pt"
+CKPT_PATH = "translator_B2A_paperlike_ckpt.pt"
 MAX_NEW_TOKENS = 30
 
 PREFIXES = [
@@ -71,9 +71,15 @@ def main():
     modelB.config.pad_token_id = tokenizer.eos_token_id
 
     translator = OneWayKVTranslator_B2A(
-        b_layers=cfg["b_layers"], b_hidden=cfg["b_hidden"],
-        a_layers=cfg["a_layers"], a_hidden=cfg["a_hidden"],
-        q_dim=cfg["Q_DIM"], d_model=cfg["D_MODEL"], n_heads=cfg["N_HEADS"], dropout=cfg["DROPOUT"]
+        b_layers=cfg["b_layers"],
+        b_hidden=cfg["b_hidden"],
+        a_layers=cfg["a_layers"],
+        a_hidden=cfg["a_hidden"],
+        q_dim=cfg["Q_DIM"],
+        adapter_num_heads=cfg["ADAPTER_NUM_HEADS"],
+        adapter_head_dim=cfg["ADAPTER_HEAD_DIM"],
+        translation_dim_factor=cfg["TRANSLATION_DIM_FACTOR"],
+        dropout=cfg["DROPOUT"],
     ).to(device).eval()
     translator.load_state_dict(ckpt["translator_state"])
 
