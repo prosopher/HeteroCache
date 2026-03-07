@@ -1,33 +1,29 @@
 """
 Code 2
-- Goal: run KV translation inference with the trained cross-attention translator
-- Debug: measure cosine similarity between round-trip KV and original KV
-- Test prefixes:
-    * "Seoul is the capital of"
-    * "Paris is the capital of"
-- Generation variants:
-    * generate(past_kv=A_original, model=A)
-    * generate(past_kv=A_to_B,   model=B)
-    * generate(past_kv=B_to_A,   model=A)
-    * generate(past_kv=B_original, model=B)
-
-Important HF note
-- In transformers==4.35.2, raw past_key_values alone are not enough to sample the very first next token.
-- So this script stores the KV cache for prefix[:-1] and uses the last prefix token as the seed token.
-- Functionally, this still means "continue generation from the prefix KV".
+- Goal: run top-layer KV translation inference with the trained translator
+- Debug: measure cosine similarity between round-trip translated top-layer KV and original top-layer KV
+- Accuracy-oriented evaluation: build the target model's own prefix KV by forward pass, then replace only its top N layers with translated KV
 """
 
 from pathlib import Path
 
 import torch
 
-from common import *
+from common import (
+    InferenceConfig,
+    cosine_similarity_between_past,
+    decode_full_generation,
+    generate_from_past,
+    load_translator_pool_from_checkpoint,
+    prepare_generation_prefix,
+    replace_top_layers,
+    set_seed,
+    slice_top_layers,
+)
 
-# -----------------------------------------------------------------------------
-# No argparse by request. Edit values here.
-# -----------------------------------------------------------------------------
+
 CONFIG = InferenceConfig(
-    checkpoint_path="./outputs/lsc_toy/final_checkpoint.pt",
+    checkpoint_path="./outputs/lsc_toy_topn/final_checkpoint.pt",
     max_new_tokens=32,
     do_sample=False,
     temperature=1.0,
@@ -82,8 +78,11 @@ def main() -> None:
         device_override=CONFIG.device,
     )
 
+    top_n = train_config.top_layers_to_translate
+
     print(f"[Setup] loaded checkpoint from {checkpoint_path}")
     print(f"[Setup] A={train_config.model_a_id}, B={train_config.model_b_id}, device={CONFIG.device}")
+    print(f"[Setup] top_layers_to_translate={top_n}")
 
     for prefix_text in CONFIG.prefixes:
         print("\n" + "=" * 100)
@@ -106,37 +105,45 @@ def main() -> None:
         past_a_original = prepared_a["past_key_values"]
         past_b_original = prepared_b["past_key_values"]
 
-        past_a_to_b = translator_pool.translate_past_key_values(
+        past_a_to_b_top = translator_pool.translate_top_layers(
             past_key_values=past_a_original,
             src_name="A",
             dst_name="B",
             dst_spec=model_specs["B"],
         )
-        past_b_to_a = translator_pool.translate_past_key_values(
+        past_b_to_a_top = translator_pool.translate_top_layers(
             past_key_values=past_b_original,
             src_name="B",
             dst_name="A",
             dst_spec=model_specs["A"],
         )
 
-        # Cross-model round-trip for debugging
-        past_a_round_trip = translator_pool.translate_past_key_values(
-            past_key_values=past_a_to_b,
+        past_b_mixed = replace_top_layers(
+            base_past_key_values=past_b_original,
+            translated_top_past_key_values=past_a_to_b_top,
+        )
+        past_a_mixed = replace_top_layers(
+            base_past_key_values=past_a_original,
+            translated_top_past_key_values=past_b_to_a_top,
+        )
+
+        past_a_round_trip_top = translator_pool.translate_top_layers(
+            past_key_values=past_b_mixed,
             src_name="B",
             dst_name="A",
             dst_spec=model_specs["A"],
         )
-        past_b_round_trip = translator_pool.translate_past_key_values(
-            past_key_values=past_b_to_a,
+        past_b_round_trip_top = translator_pool.translate_top_layers(
+            past_key_values=past_a_mixed,
             src_name="A",
             dst_name="B",
             dst_spec=model_specs["B"],
         )
 
-        cos_a = cosine_similarity_between_past(past_a_original, past_a_round_trip)
-        cos_b = cosine_similarity_between_past(past_b_original, past_b_round_trip)
-        print(f"[Round-Trip Cosine] A original vs A->B->A = {cos_a:.6f}")
-        print(f"[Round-Trip Cosine] B original vs B->A->B = {cos_b:.6f}")
+        cos_a = cosine_similarity_between_past(slice_top_layers(past_a_original, top_n), past_a_round_trip_top)
+        cos_b = cosine_similarity_between_past(slice_top_layers(past_b_original, top_n), past_b_round_trip_top)
+        print(f"[Top-Layer Round-Trip Cosine] A top-{top_n} original vs A->B->A = {cos_a:.6f}")
+        print(f"[Top-Layer Round-Trip Cosine] B top-{top_n} original vs B->A->B = {cos_b:.6f}")
 
         generate_and_print(
             title="generate(past_kv=A_original, model=A)",
@@ -147,20 +154,20 @@ def main() -> None:
             past_key_values=past_a_original,
         )
         generate_and_print(
-            title="generate(past_kv=A_to_B, model=B)",
+            title=f"generate(past_kv=B_original with translated A top-{top_n}, model=B)",
             model=model_b,
-            tokenizer=tokenizer,
-            full_prefix_ids=prepared_a["full_prefix_ids"],
-            seed_token=prepared_a["seed_token"],
-            past_key_values=past_a_to_b,
-        )
-        generate_and_print(
-            title="generate(past_kv=B_to_A, model=A)",
-            model=model_a,
             tokenizer=tokenizer,
             full_prefix_ids=prepared_b["full_prefix_ids"],
             seed_token=prepared_b["seed_token"],
-            past_key_values=past_b_to_a,
+            past_key_values=past_b_mixed,
+        )
+        generate_and_print(
+            title=f"generate(past_kv=A_original with translated B top-{top_n}, model=A)",
+            model=model_a,
+            tokenizer=tokenizer,
+            full_prefix_ids=prepared_a["full_prefix_ids"],
+            seed_token=prepared_a["seed_token"],
+            past_key_values=past_a_mixed,
         )
         generate_and_print(
             title="generate(past_kv=B_original, model=B)",

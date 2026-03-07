@@ -1,15 +1,14 @@
 """
 Code 1
-- Goal: train a toy cross-attention translator between GPT-2 and GPT-2 Medium
+- Goal: train a top-layer-only toy KV translator between GPT-2 and GPT-2 Medium
 - Data: OpenWebText
 - Objective: suffix LM loss only (bidirectional sum per step), no reconstruction loss
 
-Important
-- This example is intentionally compact and pragmatic.
-- It follows the paper's high-level recipe with a shared latent space and per-model in/out translators,
-  but uses a smaller, easier-to-read implementation suitable for experimentation.
-- It is written to be compatible with transformers==4.35.2, where past_key_values are plain tuples,
-  so DynamicCache is not used.
+Key change from the previous version
+- We do not replace the entire target KV cache.
+- We only translate the top N layers, in a direct layer-to-layer 1:1 fashion.
+- During training, the target model first builds its own prefix KV cache.
+- Then only the target model's top N layers are replaced by translated source layers.
 """
 
 from pathlib import Path
@@ -17,33 +16,44 @@ from pathlib import Path
 import torch
 from tqdm.auto import tqdm
 
-from common import *
+from common import (
+    TrainConfig,
+    WarmupCosineScheduler,
+    build_models_and_tokenizer,
+    build_training_dataloader,
+    build_translator_pool,
+    compute_suffix_lm_loss,
+    count_trainable_parameters,
+    extract_past_key_values,
+    replace_top_layers,
+    save_checkpoint,
+    set_seed,
+    split_prefix_and_suffix_for_exact_next_token_loss,
+    write_json,
+)
 
-# -----------------------------------------------------------------------------
-# No argparse by request. Edit values here.
-# -----------------------------------------------------------------------------
+
 CONFIG = TrainConfig(
     model_a_id="gpt2",
     model_b_id="gpt2-medium",
-    output_dir="./outputs/lsc_toy",
-    max_steps=5000,
+    output_dir="./outputs/lsc_toy_topn",
+    max_steps=20000,
     batch_size=1,
     grad_accum_steps=16,
     total_tokens=128,
     prefix_tokens=64,
     learning_rate=1e-4,
     weight_decay=1e-2,
-    warmup_steps=250,
+    warmup_steps=500,
     grad_clip_norm=1.0,
     log_every=25,
-    save_every=500,
     seed=42,
     shuffle_buffer=50_000,
-    shared_slots=32,
-    shared_dim=128,
-    translator_dim=512,
+    top_layers_to_translate=6,
+    translator_dim=1024,
     translator_heads=8,
-    translator_mlp_ratio=1,
+    translator_depth=2,
+    translator_mlp_ratio=4,
     device="cuda" if torch.cuda.is_available() else "cpu",
     dtype="float32",
 )
@@ -64,6 +74,7 @@ def main() -> None:
     print("[Setup] model specs")
     print(f"  A: layers={model_specs['A'].num_layers}, hidden={model_specs['A'].hidden_size}, heads={model_specs['A'].num_heads}")
     print(f"  B: layers={model_specs['B'].num_layers}, hidden={model_specs['B'].hidden_size}, heads={model_specs['B'].num_heads}")
+    print(f"[Setup] top_layers_to_translate = {CONFIG.top_layers_to_translate}")
     print(f"[Setup] trainable translator params = {count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, CONFIG)
@@ -97,36 +108,42 @@ def main() -> None:
                 past_a = extract_past_key_values(model_a, prefix_cache_ids)
                 past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
-            translated_a_to_b = translator_pool.translate_past_key_values(
+            translated_a_to_b_top = translator_pool.translate_top_layers(
                 past_key_values=past_a,
                 src_name="A",
                 dst_name="B",
                 dst_spec=model_specs["B"],
             )
-            translated_b_to_a = translator_pool.translate_past_key_values(
+            translated_b_to_a_top = translator_pool.translate_top_layers(
                 past_key_values=past_b,
                 src_name="B",
                 dst_name="A",
                 dst_spec=model_specs["A"],
             )
 
+            mixed_past_for_b = replace_top_layers(
+                base_past_key_values=past_b,
+                translated_top_past_key_values=translated_a_to_b_top,
+            )
+            mixed_past_for_a = replace_top_layers(
+                base_past_key_values=past_a,
+                translated_top_past_key_values=translated_b_to_a_top,
+            )
+
             loss_a_to_b = compute_suffix_lm_loss(
                 target_model=model_b,
-                translated_past_key_values=translated_a_to_b,
+                translated_past_key_values=mixed_past_for_b,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
             )
             loss_b_to_a = compute_suffix_lm_loss(
                 target_model=model_a,
-                translated_past_key_values=translated_b_to_a,
+                translated_past_key_values=mixed_past_for_a,
                 lm_input_ids=lm_input_ids,
                 lm_labels=lm_labels,
             )
 
-            # Paper-style toy objective for this two-model setting:
-            # sum of the two directional suffix-LM losses, no reconstruction loss.
-            loss = loss_a_to_b + loss_b_to_a
-            loss = loss / CONFIG.grad_accum_steps
+            loss = (loss_a_to_b + loss_b_to_a) / CONFIG.grad_accum_steps
             loss.backward()
             step_loss_value += loss.item()
 
@@ -137,31 +154,9 @@ def main() -> None:
         running_loss += step_loss_value
         if step % CONFIG.log_every == 0:
             avg_loss = running_loss / CONFIG.log_every
-            progress_bar.set_postfix(
-                loss=f"{avg_loss:.4f}",
-                lr=f"{scheduler.lr:.2e}",
-            )
-            print(
-                f"[Step {step:04d}] total_bidirectional_suffix_lm_loss={avg_loss:.4f} | lr={scheduler.lr:.2e}"
-            )
+            progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.lr:.2e}")
+            print(f"[Step {step:04d}] total_bidirectional_suffix_lm_loss={avg_loss:.4f} | lr={scheduler.lr:.2e}")
             running_loss = 0.0
-
-        # if step % CONFIG.save_every == 0:
-        #     checkpoint_path = output_dir / f"checkpoint_step_{step:04d}.pt"
-        #     save_checkpoint(
-        #         output_path=str(checkpoint_path),
-        #         translator_pool=translator_pool,
-        #         optimizer=optimizer,
-        #         scheduler=scheduler,
-        #         train_config=CONFIG,
-        #         step=step,
-        #         extra={
-        #             "note": "Toy checkpoint trained with bidirectional suffix LM loss only.",
-        #             "model_a": CONFIG.model_a_id,
-        #             "model_b": CONFIG.model_b_id,
-        #         },
-        #     )
-        #     print(f"[Checkpoint] saved to {checkpoint_path}")
 
     final_path = output_dir / "final_checkpoint.pt"
     save_checkpoint(
@@ -172,9 +167,10 @@ def main() -> None:
         train_config=CONFIG,
         step=CONFIG.max_steps,
         extra={
-            "note": "Final toy checkpoint trained with bidirectional suffix LM loss only.",
+            "note": "Final checkpoint trained with top-layer-only bidirectional suffix LM loss.",
             "model_a": CONFIG.model_a_id,
             "model_b": CONFIG.model_b_id,
+            "top_layers_to_translate": CONFIG.top_layers_to_translate,
         },
     )
     print(f"[Done] final checkpoint saved to {final_path}")
