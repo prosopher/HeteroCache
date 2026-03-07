@@ -1,156 +1,175 @@
-# code2_kv_translate_infer.py
-# 목표: 학습된 Cross Attention Translator 기반 KV 변환 추론 + 디버깅
-# - Round-trip KV cosine similarity
-# - Prefix 2개에 대해 4가지 generate 비교
-#
-# transformers==4.35.2 전제
+"""
+Code 2
+- Goal: run KV translation inference with the trained cross-attention translator
+- Debug: measure cosine similarity between round-trip KV and original KV
+- Test prefixes:
+    * "Seoul is the capital of"
+    * "Paris is the capital of"
+- Generation variants:
+    * generate(past_kv=A_original, model=A)
+    * generate(past_kv=A_to_B,   model=B)
+    * generate(past_kv=B_to_A,   model=A)
+    * generate(past_kv=B_original, model=B)
+
+Important HF note
+- In transformers==4.35.2, raw past_key_values alone are not enough to sample the very first next token.
+- So this script stores the KV cache for prefix[:-1] and uses the last prefix token as the seed token.
+- Functionally, this still means "continue generation from the prefix KV".
+"""
+
+from pathlib import Path
 
 import torch
-from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 
-from translator_lib import (
-    SharedSpaceKVTranslator,
-    ModelKVSpec,
-    pack_past_key_values,
-    unpack_past_key_values,
-    cosine_sim_flat,
+from common import *
+
+# -----------------------------------------------------------------------------
+# No argparse by request. Edit values here.
+# -----------------------------------------------------------------------------
+CONFIG = InferenceConfig(
+    checkpoint_path="./outputs/lsc_toy/final_checkpoint.pt",
+    max_new_tokens=32,
+    do_sample=False,
+    temperature=1.0,
+    top_k=50,
+    seed=42,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    prefixes=(
+        "Seoul is the capital of",
+        "Paris is the capital of",
+    ),
 )
 
-# -------------------
-# 설정 (argparse 금지)
-# -------------------
-CKPT_PATH = "translator_ckpt.pt"
-MAX_NEW_TOKENS = 30
 
-PREFIXES = [
-    "Seoul is the capital of",
-    "Paris is the capital of",
-]
+def generate_and_print(
+    title: str,
+    model,
+    tokenizer,
+    full_prefix_ids: torch.Tensor,
+    seed_token: torch.Tensor,
+    past_key_values,
+) -> None:
+    generated_ids = generate_from_past(
+        model=model,
+        seed_token=seed_token,
+        past_key_values=past_key_values,
+        max_new_tokens=CONFIG.max_new_tokens,
+        do_sample=CONFIG.do_sample,
+        temperature=CONFIG.temperature,
+        top_k=CONFIG.top_k,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    text = decode_full_generation(
+        tokenizer=tokenizer,
+        prefix_ids=full_prefix_ids,
+        generated_ids=generated_ids,
+    )
+    print(f"\n[{title}]\n{text}")
 
 
 @torch.no_grad()
-def get_past_excluding_last_token(model, input_ids: torch.Tensor) :
-    """
-    past만으로 generate를 시작하려면,
-    past가 prefix[:-1]에 대한 캐시여야 하고,
-    첫 step 입력으로 prefix[-1]을 넣어서 next token을 예측하게 만드는 게 깔끔합니다.
-    """
-    assert input_ids.size(1) >= 2, "prefix는 최소 2토큰 이상이어야 합니다."
-    out = model(input_ids=input_ids[:, :-1], use_cache=True, return_dict=True)
-    return out.past_key_values
+def main() -> None:
+    set_seed(CONFIG.seed)
+    checkpoint_path = Path(CONFIG.checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}\n"
+            "Run code1_train_cross_attention_translator.py first, or change CONFIG.checkpoint_path."
+        )
 
-
-@torch.no_grad()
-def greedy_generate_from_past(model, tokenizer, prefix_ids, past_excl_last, max_new_tokens: int):
-    model.eval()
-
-    # 첫 입력은 prefix의 마지막 토큰
-    input_ids = prefix_ids[:, -1:]
-    generated = prefix_ids.clone()
-    past = past_excl_last
-
-    for _ in range(max_new_tokens):
-        out = model(input_ids=input_ids, past_key_values=past, use_cache=True, return_dict=True)
-        logits = out.logits[:, -1, :]
-        next_id = torch.argmax(logits, dim=-1, keepdim=True)
-
-        generated = torch.cat([generated, next_id], dim=1)
-        past = out.past_key_values
-        input_ids = next_id
-
-    return tokenizer.decode(generated[0], skip_special_tokens=True)
-
-
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("device:", device)
-
-    ckpt = torch.load(CKPT_PATH, map_location="cpu")
-    cfg = ckpt["config"]
-
-    tokenizer = GPT2TokenizerFast.from_pretrained(cfg["MODEL_A_NAME"])
-    tokenizer.pad_token = tokenizer.eos_token
-
-    modelA = GPT2LMHeadModel.from_pretrained(cfg["MODEL_A_NAME"]).to(device).eval()
-    modelB = GPT2LMHeadModel.from_pretrained(cfg["MODEL_B_NAME"]).to(device).eval()
-    modelA.config.pad_token_id = tokenizer.eos_token_id
-    modelB.config.pad_token_id = tokenizer.eos_token_id
-
-    # translator
-    translator = SharedSpaceKVTranslator(
-        a_layers=cfg["a_layers"], a_hidden=cfg["a_hidden"],
-        b_layers=cfg["b_layers"], b_hidden=cfg["b_hidden"],
-        q_dim=cfg["Q_DIM"], d_model=cfg["D_MODEL"], n_heads=cfg["N_HEADS"], dropout=cfg["DROPOUT"]
-    ).to(device).eval()
-    translator.load_state_dict(ckpt["translator_state"])
-
-    # KV spec (unpack용)
-    specA = ModelKVSpec(
-        n_layers=modelA.config.n_layer,
-        n_heads=modelA.config.n_head,
-        head_dim=modelA.config.n_embd // modelA.config.n_head,
-        hidden_size=modelA.config.n_embd,
-    )
-    specB = ModelKVSpec(
-        n_layers=modelB.config.n_layer,
-        n_heads=modelB.config.n_head,
-        head_dim=modelB.config.n_embd // modelB.config.n_head,
-        hidden_size=modelB.config.n_embd,
+    train_config, translator_pool, model_specs, model_a, model_b, tokenizer = load_translator_pool_from_checkpoint(
+        checkpoint_path=str(checkpoint_path),
+        device_override=CONFIG.device,
     )
 
-    for prefix in PREFIXES:
-        print("\n" + "=" * 80)
-        print("PREFIX:", prefix)
+    print(f"[Setup] loaded checkpoint from {checkpoint_path}")
+    print(f"[Setup] A={train_config.model_a_id}, B={train_config.model_b_id}, device={CONFIG.device}")
 
-        prefix_ids = tokenizer(prefix, return_tensors="pt").input_ids.to(device)
-        if prefix_ids.size(1) < 2:
-            print("prefix token length too short; skip")
-            continue
+    for prefix_text in CONFIG.prefixes:
+        print("\n" + "=" * 100)
+        print(f"Prefix: {prefix_text}")
+        print("=" * 100)
 
-        # 1) original past (excluding last token)
-        pastA = get_past_excluding_last_token(modelA, prefix_ids)
-        pastB = get_past_excluding_last_token(modelB, prefix_ids)
+        prepared_a = prepare_generation_prefix(
+            model=model_a,
+            tokenizer=tokenizer,
+            text=prefix_text,
+            device=CONFIG.device,
+        )
+        prepared_b = prepare_generation_prefix(
+            model=model_b,
+            tokenizer=tokenizer,
+            text=prefix_text,
+            device=CONFIG.device,
+        )
 
-        K_A, V_A = pack_past_key_values(pastA)  # [B,S,L_A,D_A]
-        K_B, V_B = pack_past_key_values(pastB)  # [B,S,L_B,D_B]
+        past_a_original = prepared_a["past_key_values"]
+        past_b_original = prepared_b["past_key_values"]
 
-        # 2) translate
-        with torch.no_grad():
-            K_A_to_B, V_A_to_B = translator.translate_A_to_B(K_A, V_A)  # packed B-shape
-            K_B_to_A, V_B_to_A = translator.translate_B_to_A(K_B, V_B)  # packed A-shape
+        past_a_to_b = translator_pool.translate_past_key_values(
+            past_key_values=past_a_original,
+            src_name="A",
+            dst_name="B",
+            dst_spec=model_specs["B"],
+        )
+        past_b_to_a = translator_pool.translate_past_key_values(
+            past_key_values=past_b_original,
+            src_name="B",
+            dst_name="A",
+            dst_spec=model_specs["A"],
+        )
 
-            # 3) round-trip for debugging
-            K_A_round, V_A_round = translator.translate_B_to_A(K_A_to_B, V_A_to_B)  # A -> B -> A
-            K_B_round, V_B_round = translator.translate_A_to_B(K_B_to_A, V_B_to_A)  # B -> A -> B
+        # Cross-model round-trip for debugging
+        past_a_round_trip = translator_pool.translate_past_key_values(
+            past_key_values=past_a_to_b,
+            src_name="B",
+            dst_name="A",
+            dst_spec=model_specs["A"],
+        )
+        past_b_round_trip = translator_pool.translate_past_key_values(
+            past_key_values=past_b_to_a,
+            src_name="A",
+            dst_name="B",
+            dst_spec=model_specs["B"],
+        )
 
-        # cosine similarity (round-trip vs original)
-        cos_A_k = cosine_sim_flat(K_A, K_A_round)
-        cos_A_v = cosine_sim_flat(V_A, V_A_round)
-        cos_B_k = cosine_sim_flat(K_B, K_B_round)
-        cos_B_v = cosine_sim_flat(V_B, V_B_round)
-        print(f"[cosine] A round-trip: key={cos_A_k:.6f}, val={cos_A_v:.6f}")
-        print(f"[cosine] B round-trip: key={cos_B_k:.6f}, val={cos_B_v:.6f}")
+        cos_a = cosine_similarity_between_past(past_a_original, past_a_round_trip)
+        cos_b = cosine_similarity_between_past(past_b_original, past_b_round_trip)
+        print(f"[Round-Trip Cosine] A original vs A->B->A = {cos_a:.6f}")
+        print(f"[Round-Trip Cosine] B original vs B->A->B = {cos_b:.6f}")
 
-        # 4) unpack to HF past for generation
-        pastA_original = pastA
-        pastB_original = pastB
-        pastA_from_B = unpack_past_key_values(K_B_to_A, V_B_to_A, specA)   # B_original -> A
-        pastB_from_A = unpack_past_key_values(K_A_to_B, V_A_to_B, specB)   # A_original -> B
-
-        # 5) requested generations (4 cases)
-        out1 = greedy_generate_from_past(modelA, tokenizer, prefix_ids, pastA_original, MAX_NEW_TOKENS)
-        out2 = greedy_generate_from_past(modelB, tokenizer, prefix_ids, pastB_from_A,  MAX_NEW_TOKENS)
-        out3 = greedy_generate_from_past(modelA, tokenizer, prefix_ids, pastA_from_B,  MAX_NEW_TOKENS)
-        out4 = greedy_generate_from_past(modelB, tokenizer, prefix_ids, pastB_original, MAX_NEW_TOKENS)
-
-        print("\n[generate] (1) A_original  -> model A")
-        print(out1)
-        print("\n[generate] (2) A_to_B      -> model B")
-        print(out2)
-        print("\n[generate] (3) B_to_A      -> model A")
-        print(out3)
-        print("\n[generate] (4) B_original  -> model B")
-        print(out4)
+        generate_and_print(
+            title="generate(past_kv=A_original, model=A)",
+            model=model_a,
+            tokenizer=tokenizer,
+            full_prefix_ids=prepared_a["full_prefix_ids"],
+            seed_token=prepared_a["seed_token"],
+            past_key_values=past_a_original,
+        )
+        generate_and_print(
+            title="generate(past_kv=A_to_B, model=B)",
+            model=model_b,
+            tokenizer=tokenizer,
+            full_prefix_ids=prepared_a["full_prefix_ids"],
+            seed_token=prepared_a["seed_token"],
+            past_key_values=past_a_to_b,
+        )
+        generate_and_print(
+            title="generate(past_kv=B_to_A, model=A)",
+            model=model_a,
+            tokenizer=tokenizer,
+            full_prefix_ids=prepared_b["full_prefix_ids"],
+            seed_token=prepared_b["seed_token"],
+            past_key_values=past_b_to_a,
+        )
+        generate_and_print(
+            title="generate(past_kv=B_original, model=B)",
+            model=model_b,
+            tokenizer=tokenizer,
+            full_prefix_ids=prepared_b["full_prefix_ids"],
+            seed_token=prepared_b["seed_token"],
+            past_key_values=past_b_original,
+        )
 
 
 if __name__ == "__main__":
