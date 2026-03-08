@@ -43,21 +43,6 @@ class TrainConfig:
 
 
 @dataclass
-class InferenceConfig:
-    checkpoint_path: str = "./outputs/lsc_toy_topn/final_checkpoint.pt"
-    max_new_tokens: int = 32
-    do_sample: bool = False
-    temperature: float = 1.0
-    top_k: int = 50
-    seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    prefixes: Tuple[str, str] = (
-        "Seoul is the capital of",
-        "Paris is the capital of",
-    )
-
-
-@dataclass
 class ModelSpec:
     model_id: str
     num_layers: int

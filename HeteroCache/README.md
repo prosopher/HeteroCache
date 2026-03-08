@@ -1,4 +1,4 @@
-# HeteroCache (Toy)
+# HeteroCache
 
 ## 설치
 ```console
@@ -10,7 +10,7 @@ pip install -r requirements.txt
 python train.py
 ```
 
-## 추론
+## 평가
 ```console
-python infer.py
+python eval.py
 ```

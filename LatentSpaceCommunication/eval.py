@@ -11,7 +11,9 @@ from torch.utils.data import DataLoader, IterableDataset
 from common import (
     compute_suffix_lm_loss,
     cosine_similarity_between_past,
+    decode_full_generation,
     extract_past_key_values,
+    generate_from_past,
     load_translator_pool_from_checkpoint,
     replace_top_layers,
     set_seed,
@@ -38,6 +40,13 @@ class EvalConfig:
     # streaming / shuffling
     shuffle_eval_stream: bool = True
     shuffle_buffer: int = 10_000
+
+    # generation sanity-check samples
+    num_generation_samples_per_dataset: int = 3
+    sample_generation_max_new_tokens: int = 64
+    sample_do_sample: bool = False
+    sample_temperature: float = 1.0
+    sample_top_k: int = 50
 
     log_filename: str = "eval.log"
 
@@ -203,6 +212,28 @@ def build_eval_dataloader(
     return DataLoader(
         dataset,
         batch_size=eval_config.batch_size,
+        num_workers=eval_config.num_workers,
+    )
+
+
+def build_sample_dataloader(
+    spec: HFDatasetSpec,
+    tokenizer,
+    sequence_length: int,
+    eval_config: EvalConfig,
+) -> DataLoader:
+    dataset = HFTextChunkStream(
+        spec=spec,
+        tokenizer=tokenizer,
+        sequence_length=sequence_length,
+        max_examples=eval_config.num_generation_samples_per_dataset,
+        shuffle=False,
+        seed=eval_config.seed,
+        shuffle_buffer=eval_config.shuffle_buffer,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=1,
         num_workers=eval_config.num_workers,
     )
 
@@ -435,6 +466,191 @@ def log_overall_result(
         )
 
 
+@torch.inference_mode()
+def log_generation_samples(
+    spec: HFDatasetSpec,
+    tokenizer,
+    train_config,
+    eval_config: EvalConfig,
+    translator_pool,
+    model_specs,
+    model_a,
+    model_b,
+    logger: logging.Logger,
+) -> None:
+    if eval_config.num_generation_samples_per_dataset <= 0:
+        return
+
+    sample_dataloader = build_sample_dataloader(
+        spec=spec,
+        tokenizer=tokenizer,
+        sequence_length=train_config.total_tokens,
+        eval_config=eval_config,
+    )
+
+    logger.info("===== SAMPLE GENERATIONS: %s =====", spec.name_for_log)
+
+    sample_idx = 0
+    for input_ids in sample_dataloader:
+        input_ids = input_ids.to(train_config.device)
+
+        prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+            input_ids=input_ids,
+            prefix_tokens=train_config.prefix_tokens,
+        )
+        prefix_full_ids = input_ids[:, : train_config.prefix_tokens]
+        reference_suffix_ids = input_ids[:, train_config.prefix_tokens :]
+
+        past_a = extract_past_key_values(model_a, prefix_cache_ids)
+        past_b = extract_past_key_values(model_b, prefix_cache_ids)
+
+        translated_a_to_b_top = translator_pool.translate_top_layers(
+            past_key_values=past_a,
+            src_name="A",
+            dst_name="B",
+            dst_spec=model_specs["B"],
+        )
+        translated_b_to_a_top = translator_pool.translate_top_layers(
+            past_key_values=past_b,
+            src_name="B",
+            dst_name="A",
+            dst_spec=model_specs["A"],
+        )
+
+        target_top_b = slice_top_layers(
+            past_key_values=past_b,
+            top_layers_to_translate=train_config.top_layers_to_translate,
+        )
+        target_top_a = slice_top_layers(
+            past_key_values=past_a,
+            top_layers_to_translate=train_config.top_layers_to_translate,
+        )
+
+        cosine_a_to_b = cosine_similarity_between_past(translated_a_to_b_top, target_top_b)
+        cosine_b_to_a = cosine_similarity_between_past(translated_b_to_a_top, target_top_a)
+
+        mixed_past_for_b = replace_top_layers(
+            base_past_key_values=past_b,
+            translated_top_past_key_values=translated_a_to_b_top,
+        )
+        mixed_past_for_a = replace_top_layers(
+            base_past_key_values=past_a,
+            translated_top_past_key_values=translated_b_to_a_top,
+        )
+
+        loss_a_to_b = compute_suffix_lm_loss(
+            target_model=model_b,
+            translated_past_key_values=mixed_past_for_b,
+            lm_input_ids=lm_input_ids,
+            lm_labels=lm_labels,
+        ).item()
+
+        loss_b_to_a = compute_suffix_lm_loss(
+            target_model=model_a,
+            translated_past_key_values=mixed_past_for_a,
+            lm_input_ids=lm_input_ids,
+            lm_labels=lm_labels,
+        ).item()
+
+        max_new_tokens = min(
+            eval_config.sample_generation_max_new_tokens,
+            reference_suffix_ids.shape[1],
+        )
+        if max_new_tokens <= 0:
+            continue
+
+        seed_token = prefix_full_ids[:, -1:]
+
+        baseline_b_generated_ids = generate_from_past(
+            model=model_b,
+            seed_token=seed_token,
+            past_key_values=past_b,
+            max_new_tokens=max_new_tokens,
+            do_sample=eval_config.sample_do_sample,
+            temperature=eval_config.sample_temperature,
+            top_k=eval_config.sample_top_k,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        translated_b_generated_ids = generate_from_past(
+            model=model_b,
+            seed_token=seed_token,
+            past_key_values=mixed_past_for_b,
+            max_new_tokens=max_new_tokens,
+            do_sample=eval_config.sample_do_sample,
+            temperature=eval_config.sample_temperature,
+            top_k=eval_config.sample_top_k,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        baseline_a_generated_ids = generate_from_past(
+            model=model_a,
+            seed_token=seed_token,
+            past_key_values=past_a,
+            max_new_tokens=max_new_tokens,
+            do_sample=eval_config.sample_do_sample,
+            temperature=eval_config.sample_temperature,
+            top_k=eval_config.sample_top_k,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        translated_a_generated_ids = generate_from_past(
+            model=model_a,
+            seed_token=seed_token,
+            past_key_values=mixed_past_for_a,
+            max_new_tokens=max_new_tokens,
+            do_sample=eval_config.sample_do_sample,
+            temperature=eval_config.sample_temperature,
+            top_k=eval_config.sample_top_k,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+        prefix_text = tokenizer.decode(prefix_full_ids[0].detach().cpu(), skip_special_tokens=True)
+        reference_suffix_text = tokenizer.decode(
+            reference_suffix_ids[0, :max_new_tokens].detach().cpu(),
+            skip_special_tokens=True,
+        )
+        reference_full_text = tokenizer.decode(
+            input_ids[0, : train_config.prefix_tokens + max_new_tokens].detach().cpu(),
+            skip_special_tokens=True,
+        )
+
+        baseline_b_full_text = decode_full_generation(
+            tokenizer=tokenizer,
+            prefix_ids=prefix_full_ids,
+            generated_ids=baseline_b_generated_ids,
+        )
+        translated_b_full_text = decode_full_generation(
+            tokenizer=tokenizer,
+            prefix_ids=prefix_full_ids,
+            generated_ids=translated_b_generated_ids,
+        )
+        baseline_a_full_text = decode_full_generation(
+            tokenizer=tokenizer,
+            prefix_ids=prefix_full_ids,
+            generated_ids=baseline_a_generated_ids,
+        )
+        translated_a_full_text = decode_full_generation(
+            tokenizer=tokenizer,
+            prefix_ids=prefix_full_ids,
+            generated_ids=translated_a_generated_ids,
+        )
+
+        logger.info("--- Sample %d/%d | %s ---", sample_idx + 1, eval_config.num_generation_samples_per_dataset, spec.name_for_log)
+        logger.info("prefix_text:\n%s", prefix_text)
+        logger.info("reference_suffix_text(first %d tokens):\n%s", max_new_tokens, reference_suffix_text)
+        logger.info("reference_full_text(prefix + first %d suffix tokens):\n%s", max_new_tokens, reference_full_text)
+
+        logger.info("A_to_B sample metric | cosine=%.6f | loss=%.6f", cosine_a_to_b, loss_a_to_b)
+        logger.info("A_to_B target_baseline_full:\n%s", baseline_b_full_text)
+        logger.info("A_to_B translated_full:\n%s", translated_b_full_text)
+
+        logger.info("B_to_A sample metric | cosine=%.6f | loss=%.6f", cosine_b_to_a, loss_b_to_a)
+        logger.info("B_to_A target_baseline_full:\n%s", baseline_a_full_text)
+        logger.info("B_to_A translated_full:\n%s", translated_a_full_text)
+
+        sample_idx += 1
+        if sample_idx >= eval_config.num_generation_samples_per_dataset:
+            break
+
+
 def main() -> None:
     eval_config = CONFIG
     set_seed(eval_config.seed)
@@ -532,6 +748,18 @@ def main() -> None:
             results=results,
             model_a_id=train_config.model_a_id,
             model_b_id=train_config.model_b_id,
+        )
+
+        log_generation_samples(
+            spec=spec,
+            tokenizer=tokenizer,
+            train_config=train_config,
+            eval_config=eval_config,
+            translator_pool=translator_pool,
+            model_specs=model_specs,
+            model_a=model_a,
+            model_b=model_b,
+            logger=logger,
         )
 
         if torch.cuda.is_available():
