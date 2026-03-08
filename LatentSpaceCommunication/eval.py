@@ -1,19 +1,17 @@
 # eval.py
 import logging
-import re
-import string
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 
 from common import (
     cosine_similarity_between_past,
     extract_past_key_values,
-    generate_from_past,
     load_translator_pool_from_checkpoint,
     replace_top_layers,
     set_seed,
@@ -36,16 +34,8 @@ class EvalConfig:
     shuffle_eval_stream: bool = True
     shuffle_buffer: int = 10_000
 
-    # answer generation length control
-    qa_max_new_tokens: int = 32
-    qa_generation_buffer_tokens: int = 4
-
-    # generation sanity-check samples
+    # score sanity-check samples
     num_generation_samples_per_dataset: int = 2
-    sample_generation_max_new_tokens: int = 32
-    sample_do_sample: bool = False
-    sample_temperature: float = 1.0
-    sample_top_k: int = 50
 
     log_filename: str = "eval.log"
 
@@ -117,7 +107,7 @@ class HFQAPairStream(IterableDataset):
         emitted = 0
 
         for example in dataset:
-            qa_pair = extract_question_and_answers(self.spec, example)
+            qa_pair = extract_question_and_answer(self.spec, example)
             if qa_pair is None:
                 continue
 
@@ -131,11 +121,13 @@ class RunningAverage:
     def __init__(self) -> None:
         self.cosine_sum = 0.0
         self.accuracy_sum = 0.0
+        self.native_accuracy_sum = 0.0
         self.count = 0
 
-    def update(self, cosine_value: float, accuracy_value: float, n: int) -> None:
+    def update(self, cosine_value: float, accuracy_value: float, native_accuracy_value: float, n: int) -> None:
         self.cosine_sum += float(cosine_value) * n
         self.accuracy_sum += float(accuracy_value) * n
+        self.native_accuracy_sum += float(native_accuracy_value) * n
         self.count += n
 
     def summary(self) -> Dict[str, float]:
@@ -143,11 +135,13 @@ class RunningAverage:
             return {
                 "cosine": float("nan"),
                 "accuracy": float("nan"),
+                "native_accuracy": float("nan"),
                 "count": 0,
             }
         return {
             "cosine": self.cosine_sum / self.count,
             "accuracy": self.accuracy_sum / self.count,
+            "native_accuracy": self.native_accuracy_sum / self.count,
             "count": self.count,
         }
 
@@ -213,47 +207,21 @@ def build_sample_dataloader(
     )
 
 
-def deduplicate_preserve_order(items: Sequence[str]) -> List[str]:
-    seen = set()
-    result = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
-
-
-def extract_question_and_answers(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, List[str]]]:
+def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, str]]:
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
         return None
 
-    if spec.answer_mode == "trivia_qa":
-        answer_obj = example.get("answer", {})
-        if not isinstance(answer_obj, dict):
-            return None
-        value = answer_obj.get("value", "")
-        aliases = answer_obj.get("aliases", []) or []
-
-        answers = []
-        if isinstance(value, str) and value.strip():
-            answers.append(value.strip())
-        answers.extend(alias.strip() for alias in aliases if isinstance(alias, str) and alias.strip())
-    elif spec.answer_mode == "boolq":
-        answer_value = example.get("answer", None)
-        if not isinstance(answer_value, bool):
-            return None
-        answers = ["yes" if answer_value else "no"]
-    else:
+    if spec.answer_mode != "boolq":
         raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
-    answers = deduplicate_preserve_order(answers)
-    if not answers:
+    answer_value = example.get("answer", None)
+    if not isinstance(answer_value, bool):
         return None
 
     return {
         "question": question.strip(),
-        "answers": answers,
+        "answer": "yes" if answer_value else "no",
     }
 
 
@@ -277,60 +245,71 @@ def prepare_question_prefix(tokenizer, question: str, device: str) -> Dict[str, 
     }
 
 
-def get_answer_generation_max_new_tokens(tokenizer, answers: Sequence[str], eval_config: EvalConfig) -> int:
-    max_ref_tokens = 1
-    for answer in answers:
-        answer_ids = tokenizer(answer, add_special_tokens=False).input_ids
-        max_ref_tokens = max(max_ref_tokens, len(answer_ids))
-    return max(1, min(eval_config.qa_max_new_tokens, max_ref_tokens + eval_config.qa_generation_buffer_tokens))
+def build_boolq_choice_token_ids(tokenizer) -> Dict[str, torch.Tensor]:
+    choice_token_ids = {}
+    for label in ("yes", "no"):
+        token_ids = tokenizer(f" {label}", add_special_tokens=False).input_ids
+        if len(token_ids) < 1:
+            raise ValueError(f"Failed to tokenize BoolQ label: {label}")
+        choice_token_ids[label] = torch.tensor(token_ids, dtype=torch.long)
+    return choice_token_ids
 
 
-def decode_generated_answer(tokenizer, generated_ids: torch.Tensor) -> str:
-    if generated_ids.numel() == 0:
-        return ""
-    return tokenizer.decode(generated_ids[0].detach().cpu(), skip_special_tokens=True).strip()
+def score_candidate_logprob(
+    model,
+    past_key_values,
+    seed_token: torch.Tensor,
+    candidate_token_ids: torch.Tensor,
+) -> float:
+    device = seed_token.device
+    candidate_ids = candidate_token_ids.to(device).unsqueeze(0)
+
+    if candidate_ids.shape[1] == 1:
+        scoring_input_ids = seed_token
+    else:
+        scoring_input_ids = torch.cat([seed_token, candidate_ids[:, :-1]], dim=1)
+
+    outputs = model(
+        input_ids=scoring_input_ids,
+        past_key_values=past_key_values,
+        use_cache=False,
+    )
+    log_probs = F.log_softmax(outputs.logits, dim=-1)
+    token_log_probs = log_probs.gather(-1, candidate_ids.unsqueeze(-1)).squeeze(-1)
+    return token_log_probs.sum(dim=1).item()
 
 
-def truncate_prediction_for_match(text: str) -> str:
-    truncated = text.strip()
-    for delimiter in ["\n", "\r", "\t", "Question:", "question:", "Q:", "q:"]:
-        if delimiter in truncated:
-            truncated = truncated.split(delimiter, 1)[0].strip()
-    return truncated
+def score_boolq_choices(
+    model,
+    past_key_values,
+    seed_token: torch.Tensor,
+    boolq_choice_token_ids: Dict[str, torch.Tensor],
+) -> Dict[str, float]:
+    return {
+        "yes": score_candidate_logprob(
+            model=model,
+            past_key_values=past_key_values,
+            seed_token=seed_token,
+            candidate_token_ids=boolq_choice_token_ids["yes"],
+        ),
+        "no": score_candidate_logprob(
+            model=model,
+            past_key_values=past_key_values,
+            seed_token=seed_token,
+            candidate_token_ids=boolq_choice_token_ids["no"],
+        ),
+    }
 
 
-_ARTICLES_RE = re.compile(r"\b(a|an|the)\b")
-_WHITESPACE_RE = re.compile(r"\s+")
-
-
-def normalize_qa_text(text: str) -> str:
-    text = truncate_prediction_for_match(text).lower()
-    text = "".join(ch for ch in text if ch not in string.punctuation)
-    text = _ARTICLES_RE.sub(" ", text)
-    text = _WHITESPACE_RE.sub(" ", text).strip()
-    return text
-
-
-def is_correct_qa_prediction(prediction: str, references: Sequence[str]) -> bool:
-    normalized_prediction = normalize_qa_text(prediction)
-    if not normalized_prediction:
-        return False
-
-    for reference in references:
-        normalized_reference = normalize_qa_text(reference)
-        if not normalized_reference:
-            continue
-        if normalized_prediction == normalized_reference:
-            return True
-        if normalized_prediction.startswith(normalized_reference + " "):
-            return True
-    return False
+def predict_boolq_label(choice_scores: Dict[str, float]) -> str:
+    return "yes" if choice_scores["yes"] >= choice_scores["no"] else "no"
 
 
 def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str, Dict[str, float]]:
     results = {}
     total_cosine_sum = 0.0
     total_accuracy_sum = 0.0
+    total_native_accuracy_sum = 0.0
     total_count = 0
 
     for path_name, meter in path_metrics.items():
@@ -339,18 +318,21 @@ def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str,
 
         total_cosine_sum += meter.cosine_sum
         total_accuracy_sum += meter.accuracy_sum
+        total_native_accuracy_sum += meter.native_accuracy_sum
         total_count += meter.count
 
     if total_count == 0:
         results["AVG"] = {
             "cosine": float("nan"),
             "accuracy": float("nan"),
+            "native_accuracy": float("nan"),
             "count": 0,
         }
     else:
         results["AVG"] = {
             "cosine": total_cosine_sum / total_count,
             "accuracy": total_accuracy_sum / total_count,
+            "native_accuracy": total_native_accuracy_sum / total_count,
             "count": total_count,
         }
 
@@ -359,8 +341,8 @@ def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str,
 
 def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
     overall = {
-        "A_to_B": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "count": 0},
-        "B_to_A": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "count": 0},
+        "A_to_B": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0},
+        "B_to_A": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0},
     }
 
     for dataset_result in all_results.values():
@@ -369,11 +351,13 @@ def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]
             count = int(row["count"])
             overall[key]["cosine_sum"] += float(row["cosine"]) * count
             overall[key]["accuracy_sum"] += float(row["accuracy"]) * count
+            overall[key]["native_accuracy_sum"] += float(row["native_accuracy"]) * count
             overall[key]["count"] += count
 
     summarized = {}
     total_cosine_sum = 0.0
     total_accuracy_sum = 0.0
+    total_native_accuracy_sum = 0.0
     total_count = 0
 
     for key in ("A_to_B", "B_to_A"):
@@ -382,29 +366,34 @@ def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]
             summarized[key] = {
                 "cosine": float("nan"),
                 "accuracy": float("nan"),
+                "native_accuracy": float("nan"),
                 "count": 0,
             }
         else:
             summarized[key] = {
                 "cosine": overall[key]["cosine_sum"] / count,
                 "accuracy": overall[key]["accuracy_sum"] / count,
+                "native_accuracy": overall[key]["native_accuracy_sum"] / count,
                 "count": count,
             }
 
         total_cosine_sum += overall[key]["cosine_sum"]
         total_accuracy_sum += overall[key]["accuracy_sum"]
+        total_native_accuracy_sum += overall[key]["native_accuracy_sum"]
         total_count += count
 
     if total_count == 0:
         summarized["AVG"] = {
             "cosine": float("nan"),
             "accuracy": float("nan"),
+            "native_accuracy": float("nan"),
             "count": 0,
         }
     else:
         summarized["AVG"] = {
             "cosine": total_cosine_sum / total_count,
             "accuracy": total_accuracy_sum / total_count,
+            "native_accuracy": total_native_accuracy_sum / total_count,
             "count": total_count,
         }
 
@@ -424,6 +413,7 @@ def evaluate_dataset(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
+    boolq_choice_token_ids = build_boolq_choice_token_ids(tokenizer)
 
     path_metrics = {
         "A_to_B": RunningAverage(),
@@ -435,7 +425,7 @@ def evaluate_dataset(
     for batch_idx, batch in enumerate(dataloader, start=1):
         for example in batch:
             question = example["question"]
-            answers = example["answers"]
+            gold_answer = example["answer"]
 
             prefix = prepare_question_prefix(tokenizer=tokenizer, question=question, device=device)
             prefix_cache_ids = prefix["cache_ids"]
@@ -478,37 +468,44 @@ def evaluate_dataset(
                 translated_top_past_key_values=translated_b_to_a_top,
             )
 
-            max_new_tokens = get_answer_generation_max_new_tokens(tokenizer, answers, eval_config=CONFIG)
-
-            translated_b_generated_ids = generate_from_past(
+            translated_scores_b = score_boolq_choices(
                 model=model_b,
-                seed_token=seed_token,
                 past_key_values=mixed_past_for_b,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=1.0,
-                top_k=1,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-            translated_a_generated_ids = generate_from_past(
-                model=model_a,
                 seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
+            translated_scores_a = score_boolq_choices(
+                model=model_a,
                 past_key_values=mixed_past_for_a,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=1.0,
-                top_k=1,
-                eos_token_id=tokenizer.eos_token_id,
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
             )
 
-            translated_b_answer = decode_generated_answer(tokenizer, translated_b_generated_ids)
-            translated_a_answer = decode_generated_answer(tokenizer, translated_a_generated_ids)
+            native_scores_b = score_boolq_choices(
+                model=model_b,
+                past_key_values=past_b,
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
+            native_scores_a = score_boolq_choices(
+                model=model_a,
+                past_key_values=past_a,
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
 
-            acc_a_to_b = 1.0 if is_correct_qa_prediction(translated_b_answer, answers) else 0.0
-            acc_b_to_a = 1.0 if is_correct_qa_prediction(translated_a_answer, answers) else 0.0
+            translated_pred_b = predict_boolq_label(translated_scores_b)
+            translated_pred_a = predict_boolq_label(translated_scores_a)
+            native_pred_b = predict_boolq_label(native_scores_b)
+            native_pred_a = predict_boolq_label(native_scores_a)
 
-            path_metrics["A_to_B"].update(cosine_a_to_b, acc_a_to_b, 1)
-            path_metrics["B_to_A"].update(cosine_b_to_a, acc_b_to_a, 1)
+            acc_a_to_b = 1.0 if translated_pred_b == gold_answer else 0.0
+            acc_b_to_a = 1.0 if translated_pred_a == gold_answer else 0.0
+            native_acc_b = 1.0 if native_pred_b == gold_answer else 0.0
+            native_acc_a = 1.0 if native_pred_a == gold_answer else 0.0
+
+            path_metrics["A_to_B"].update(cosine_a_to_b, acc_a_to_b, native_acc_b, 1)
+            path_metrics["B_to_A"].update(cosine_b_to_a, acc_b_to_a, native_acc_a, 1)
 
             processed_examples += 1
 
@@ -540,10 +537,11 @@ def log_dataset_result(
     for key in ("A_to_B", "B_to_A", "AVG"):
         row = results[key]
         logger.info(
-            "%s | cosine=%.6f | accuracy=%.6f | count=%d",
+            "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_names[key],
             row["cosine"],
             row["accuracy"],
+            row["native_accuracy"],
             int(row["count"]),
         )
 
@@ -564,16 +562,17 @@ def log_overall_result(
     for key in ("A_to_B", "B_to_A", "AVG"):
         row = results[key]
         logger.info(
-            "%s | cosine=%.6f | accuracy=%.6f | count=%d",
+            "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_names[key],
             row["cosine"],
             row["accuracy"],
+            row["native_accuracy"],
             int(row["count"]),
         )
 
 
 @torch.inference_mode()
-def log_generation_samples(
+def log_boolq_score_samples(
     spec: HFDatasetSpec,
     tokenizer,
     train_config,
@@ -591,14 +590,15 @@ def log_generation_samples(
         spec=spec,
         eval_config=eval_config,
     )
+    boolq_choice_token_ids = build_boolq_choice_token_ids(tokenizer)
 
-    logger.info("===== SAMPLE GENERATIONS: %s =====", spec.name_for_log)
+    logger.info("===== SAMPLE BOOLQ SCORES: %s =====", spec.name_for_log)
 
     sample_idx = 0
     for batch in sample_dataloader:
         example = batch[0]
         question = example["question"]
-        answers = example["answers"]
+        gold_answer = example["answer"]
 
         prefix = prepare_question_prefix(tokenizer=tokenizer, question=question, device=train_config.device)
         prefix_cache_ids = prefix["cache_ids"]
@@ -630,36 +630,36 @@ def log_generation_samples(
             translated_top_past_key_values=translated_b_to_a_top,
         )
 
-        max_new_tokens = min(
-            eval_config.sample_generation_max_new_tokens,
-            get_answer_generation_max_new_tokens(tokenizer, answers, eval_config),
-        )
-        if max_new_tokens <= 0:
-            continue
-
-        translated_b_generated_ids = generate_from_past(
+        translated_scores_b = score_boolq_choices(
             model=model_b,
-            seed_token=seed_token,
             past_key_values=mixed_past_for_b,
-            max_new_tokens=max_new_tokens,
-            do_sample=eval_config.sample_do_sample,
-            temperature=eval_config.sample_temperature,
-            top_k=eval_config.sample_top_k,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-        translated_a_generated_ids = generate_from_past(
-            model=model_a,
             seed_token=seed_token,
+            boolq_choice_token_ids=boolq_choice_token_ids,
+        )
+        translated_scores_a = score_boolq_choices(
+            model=model_a,
             past_key_values=mixed_past_for_a,
-            max_new_tokens=max_new_tokens,
-            do_sample=eval_config.sample_do_sample,
-            temperature=eval_config.sample_temperature,
-            top_k=eval_config.sample_top_k,
-            eos_token_id=tokenizer.eos_token_id,
+            seed_token=seed_token,
+            boolq_choice_token_ids=boolq_choice_token_ids,
         )
 
-        translated_b_answer = decode_generated_answer(tokenizer, translated_b_generated_ids)
-        translated_a_answer = decode_generated_answer(tokenizer, translated_a_generated_ids)
+        native_scores_b = score_boolq_choices(
+            model=model_b,
+            past_key_values=past_b,
+            seed_token=seed_token,
+            boolq_choice_token_ids=boolq_choice_token_ids,
+        )
+        native_scores_a = score_boolq_choices(
+            model=model_a,
+            past_key_values=past_a,
+            seed_token=seed_token,
+            boolq_choice_token_ids=boolq_choice_token_ids,
+        )
+
+        translated_pred_b = predict_boolq_label(translated_scores_b)
+        translated_pred_a = predict_boolq_label(translated_scores_a)
+        native_pred_b = predict_boolq_label(native_scores_b)
+        native_pred_a = predict_boolq_label(native_scores_a)
 
         logger.info(
             "--- Sample %d/%d | %s ---",
@@ -668,16 +668,34 @@ def log_generation_samples(
             spec.name_for_log,
         )
         logger.info("prefix(question):\n%s", prefix_text)
-        logger.info("reference_answers:\n%s", " | ".join(answers))
+        logger.info("gold_answer: %s", gold_answer)
         logger.info(
-            "A_to_B generated_answer:\n%s\ncorrect=%s",
-            translated_b_answer,
-            is_correct_qa_prediction(translated_b_answer, answers),
+            "A_to_B translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+            translated_scores_b["yes"],
+            translated_scores_b["no"],
+            translated_pred_b,
+            translated_pred_b == gold_answer,
         )
         logger.info(
-            "B_to_A generated_answer:\n%s\ncorrect=%s",
-            translated_a_answer,
-            is_correct_qa_prediction(translated_a_answer, answers),
+            "A_to_B native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+            native_scores_b["yes"],
+            native_scores_b["no"],
+            native_pred_b,
+            native_pred_b == gold_answer,
+        )
+        logger.info(
+            "B_to_A translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+            translated_scores_a["yes"],
+            translated_scores_a["no"],
+            translated_pred_a,
+            translated_pred_a == gold_answer,
+        )
+        logger.info(
+            "B_to_A native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+            native_scores_a["yes"],
+            native_scores_a["no"],
+            native_pred_a,
+            native_pred_a == gold_answer,
         )
 
         sample_idx += 1
@@ -715,15 +733,6 @@ def main() -> None:
     logger.info("qa_eval_log_path=%s", log_path)
 
     dataset_specs = [
-        HFDatasetSpec(
-            name_for_log="TriviaQA/rc.nocontext/validation",
-            dataset_path="trivia_qa",
-            dataset_name="rc.nocontext",
-            split="validation",
-            answer_mode="trivia_qa",
-            question_field="question",
-            streaming=False,
-        ),
         HFDatasetSpec(
             name_for_log="BoolQ/validation",
             dataset_path="boolq",
@@ -765,7 +774,7 @@ def main() -> None:
             model_b_id=train_config.model_b_id,
         )
 
-        log_generation_samples(
+        log_boolq_score_samples(
             spec=spec,
             tokenizer=tokenizer,
             train_config=train_config,
@@ -783,16 +792,19 @@ def main() -> None:
     logger.info("===== FINAL SUMMARY =====")
     for dataset_name, result in all_results.items():
         logger.info(
-            "%s | A_to_B(cos=%.6f, acc=%.6f) | "
-            "B_to_A(cos=%.6f, acc=%.6f) | "
-            "AVG(cos=%.6f, acc=%.6f)",
+            "%s | A_to_B(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
+            "B_to_A(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
+            "AVG(cos=%.6f, acc=%.6f, native_acc=%.6f)",
             dataset_name,
             result["A_to_B"]["cosine"],
             result["A_to_B"]["accuracy"],
+            result["A_to_B"]["native_accuracy"],
             result["B_to_A"]["cosine"],
             result["B_to_A"]["accuracy"],
+            result["B_to_A"]["native_accuracy"],
             result["AVG"]["cosine"],
             result["AVG"]["accuracy"],
+            result["AVG"]["native_accuracy"],
         )
 
     overall_results = summarize_overall_results(all_results)
