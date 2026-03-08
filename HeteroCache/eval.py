@@ -25,15 +25,17 @@ class EvalConfig:
     checkpoint_path: str = "./outputs/lsc_toy_topn/final_checkpoint.pt"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # evaluation sampling
     batch_size: int = 1
     num_workers: int = 0
     max_examples_per_dataset: int = 512
     seed: int = 42
 
-    # If None, values restored from checkpoint train_config are used.
+    # if None, use values restored from checkpoint train_config
     total_tokens: Optional[int] = None
     prefix_tokens: Optional[int] = None
 
+    # streaming / shuffling
     shuffle_eval_stream: bool = True
     shuffle_buffer: int = 10_000
 
@@ -205,6 +207,45 @@ def build_eval_dataloader(
     )
 
 
+def summarize_dataset_metrics(metric: RunningAverage) -> Dict[str, Dict[str, float]]:
+    result = metric.summary()
+    return {
+        "B_to_A": result,
+        "AVG": result,
+    }
+
+
+def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
+    cosine_sum = 0.0
+    loss_sum = 0.0
+    count = 0
+
+    for dataset_result in all_results.values():
+        row = dataset_result["B_to_A"]
+        row_count = int(row["count"])
+        cosine_sum += float(row["cosine"]) * row_count
+        loss_sum += float(row["loss"]) * row_count
+        count += row_count
+
+    if count == 0:
+        result = {
+            "cosine": float("nan"),
+            "loss": float("nan"),
+            "count": 0,
+        }
+    else:
+        result = {
+            "cosine": cosine_sum / count,
+            "loss": loss_sum / count,
+            "count": count,
+        }
+
+    return {
+        "B_to_A": result,
+        "AVG": result,
+    }
+
+
 @torch.inference_mode()
 def evaluate_dataset(
     spec: HFDatasetSpec,
@@ -215,12 +256,8 @@ def evaluate_dataset(
     model_a,
     model_b,
     logger: logging.Logger,
-    max_examples_per_dataset: int,
 ) -> Dict[str, Dict[str, float]]:
-    path_metrics = {
-        "B_to_A": RunningAverage(),
-    }
-
+    path_metric = RunningAverage()
     processed_examples = 0
 
     for batch_idx, input_ids in enumerate(dataloader, start=1):
@@ -246,10 +283,7 @@ def evaluate_dataset(
             top_layers_to_translate=train_config.top_layers_to_translate,
         )
 
-        cosine_b_to_a = cosine_similarity_between_past(
-            translated_b_to_a_top,
-            target_top_a,
-        )
+        cosine_b_to_a = cosine_similarity_between_past(translated_b_to_a_top, target_top_a)
 
         mixed_past_for_a = replace_top_layers(
             base_past_key_values=past_a,
@@ -264,7 +298,7 @@ def evaluate_dataset(
         ).item()
 
         batch_size = input_ids.size(0)
-        path_metrics["B_to_A"].update(cosine_b_to_a, loss_b_to_a, batch_size)
+        path_metric.update(cosine_b_to_a, loss_b_to_a, batch_size)
 
         processed_examples += batch_size
         if batch_idx % 50 == 0:
@@ -272,32 +306,48 @@ def evaluate_dataset(
                 "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
-                max_examples_per_dataset,
+                CONFIG.max_examples_per_dataset,
             )
 
-    result_b_to_a = path_metrics["B_to_A"].summary()
-
-    # Only one valid direction exists, so AVG == B_to_A.
-    results = {
-        "B_to_A": result_b_to_a,
-        "AVG": dict(result_b_to_a),
-    }
-    return results
+    return summarize_dataset_metrics(path_metric)
 
 
 def log_dataset_result(
     logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
-    model_a_id: str,
     model_b_id: str,
+    model_a_id: str,
 ) -> None:
     pretty_names = {
         "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
-        "AVG": "AVG (same as B_to_A; only one valid direction)",
+        "AVG": "AVG (same as B_to_A in one-way evaluation)",
     }
 
     logger.info("===== %s =====", dataset_name)
+    for key in ("B_to_A", "AVG"):
+        row = results[key]
+        logger.info(
+            "%s | cosine=%.6f | loss=%.6f | count=%d",
+            pretty_names[key],
+            row["cosine"],
+            row["loss"],
+            int(row["count"]),
+        )
+
+
+def log_overall_result(
+    logger: logging.Logger,
+    results: Dict[str, Dict[str, float]],
+    model_b_id: str,
+    model_a_id: str,
+) -> None:
+    pretty_names = {
+        "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
+        "AVG": "AVG (weighted over all datasets; same as B_to_A in one-way evaluation)",
+    }
+
+    logger.info("===== OVERALL AVERAGE ACROSS DATASETS =====")
     for key in ("B_to_A", "AVG"):
         row = results[key]
         logger.info(
@@ -319,7 +369,6 @@ def main() -> None:
 
     log_path = checkpoint_path.parent / eval_config.log_filename
     logger = setup_logger(log_path)
-
     logger.info("Starting evaluation")
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
@@ -398,7 +447,6 @@ def main() -> None:
             model_a=model_a,
             model_b=model_b,
             logger=logger,
-            max_examples_per_dataset=eval_config.max_examples_per_dataset,
         )
         all_results[spec.name_for_log] = results
 
@@ -406,8 +454,8 @@ def main() -> None:
             logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
-            model_a_id=train_config.model_a_id,
             model_b_id=train_config.model_b_id,
+            model_a_id=train_config.model_a_id,
         )
 
         if torch.cuda.is_available():
@@ -423,6 +471,14 @@ def main() -> None:
             result["AVG"]["cosine"],
             result["AVG"]["loss"],
         )
+
+    overall_results = summarize_overall_results(all_results)
+    log_overall_result(
+        logger=logger,
+        results=overall_results,
+        model_b_id=train_config.model_b_id,
+        model_a_id=train_config.model_a_id,
+    )
 
     logger.info("Done. Saved log to %s", log_path)
 

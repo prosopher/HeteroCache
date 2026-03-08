@@ -237,6 +237,60 @@ def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str,
     return results
 
 
+def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
+    overall = {
+        "A_to_B": {"cosine_sum": 0.0, "loss_sum": 0.0, "count": 0},
+        "B_to_A": {"cosine_sum": 0.0, "loss_sum": 0.0, "count": 0},
+    }
+
+    for dataset_result in all_results.values():
+        for key in ("A_to_B", "B_to_A"):
+            row = dataset_result[key]
+            count = int(row["count"])
+            overall[key]["cosine_sum"] += float(row["cosine"]) * count
+            overall[key]["loss_sum"] += float(row["loss"]) * count
+            overall[key]["count"] += count
+
+    summarized = {}
+    total_cosine_sum = 0.0
+    total_loss_sum = 0.0
+    total_count = 0
+
+    for key in ("A_to_B", "B_to_A"):
+        count = overall[key]["count"]
+        if count == 0:
+            summarized[key] = {
+                "cosine": float("nan"),
+                "loss": float("nan"),
+                "count": 0,
+            }
+        else:
+            summarized[key] = {
+                "cosine": overall[key]["cosine_sum"] / count,
+                "loss": overall[key]["loss_sum"] / count,
+                "count": count,
+            }
+
+        total_cosine_sum += overall[key]["cosine_sum"]
+        total_loss_sum += overall[key]["loss_sum"]
+        total_count += count
+
+    if total_count == 0:
+        summarized["AVG"] = {
+            "cosine": float("nan"),
+            "loss": float("nan"),
+            "count": 0,
+        }
+    else:
+        summarized["AVG"] = {
+            "cosine": total_cosine_sum / total_count,
+            "loss": total_loss_sum / total_count,
+            "count": total_count,
+        }
+
+    return summarized
+
+
 @torch.inference_mode()
 def evaluate_dataset(
     spec: HFDatasetSpec,
@@ -357,6 +411,30 @@ def log_dataset_result(
         )
 
 
+def log_overall_result(
+    logger: logging.Logger,
+    results: Dict[str, Dict[str, float]],
+    model_a_id: str,
+    model_b_id: str,
+) -> None:
+    pretty_names = {
+        "A_to_B": f"A_to_B ({model_a_id} -> {model_b_id})",
+        "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
+        "AVG": "AVG (weighted over all datasets and both paths)",
+    }
+
+    logger.info("===== OVERALL AVERAGE ACROSS DATASETS =====")
+    for key in ("A_to_B", "B_to_A", "AVG"):
+        row = results[key]
+        logger.info(
+            "%s | cosine=%.6f | loss=%.6f | count=%d",
+            pretty_names[key],
+            row["cosine"],
+            row["loss"],
+            int(row["count"]),
+        )
+
+
 def main() -> None:
     eval_config = CONFIG
     set_seed(eval_config.seed)
@@ -398,7 +476,6 @@ def main() -> None:
     logger.info("total_tokens=%d | prefix_tokens=%d", train_config.total_tokens, train_config.prefix_tokens)
     logger.info("eval_log_path=%s", log_path)
 
-    # split 은 EvalConfig 에 두지 않고 여기서 각 dataset spec 생성 시 직접 명시
     dataset_specs = [
         HFDatasetSpec(
             name_for_log="OpenWebText/train",
@@ -474,6 +551,14 @@ def main() -> None:
             result["AVG"]["cosine"],
             result["AVG"]["loss"],
         )
+
+    overall_results = summarize_overall_results(all_results)
+    log_overall_result(
+        logger=logger,
+        results=overall_results,
+        model_a_id=train_config.model_a_id,
+        model_b_id=train_config.model_b_id,
+    )
 
     logger.info("Done. Saved log to %s", log_path)
 
