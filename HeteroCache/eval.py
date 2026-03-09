@@ -12,6 +12,7 @@ from common import (
     cosine_similarity_between_past,
     extract_past_key_values,
     load_translator_pool_from_checkpoint,
+    parse_train_directions,
     replace_top_layers,
     set_seed,
     slice_top_layers,
@@ -23,17 +24,14 @@ class EvalConfig:
     checkpoint_path: str = "./outputs/lsc_toy/final_checkpoint.pt"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # evaluation sampling
     batch_size: int = 1
     num_workers: int = 0
     max_examples_per_dataset: int = 512
     seed: int = 42
 
-    # streaming / shuffling
     shuffle_eval_stream: bool = True
     shuffle_buffer: int = 10_000
 
-    # score sanity-check samples
     num_generation_samples_per_dataset: int = 2
 
     log_filename: str = "eval.log"
@@ -338,20 +336,20 @@ def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str,
     return results
 
 
-def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
+def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]], active_directions) -> Dict[str, Dict[str, float]]:
     overall = {
-        "A_to_B": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0},
-        "B_to_A": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0},
+        direction: {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0}
+        for direction in active_directions
     }
 
     for dataset_result in all_results.values():
-        for key in ("A_to_B", "B_to_A"):
-            row = dataset_result[key]
+        for direction in active_directions:
+            row = dataset_result[direction]
             count = int(row["count"])
-            overall[key]["cosine_sum"] += float(row["cosine"]) * count
-            overall[key]["accuracy_sum"] += float(row["accuracy"]) * count
-            overall[key]["native_accuracy_sum"] += float(row["native_accuracy"]) * count
-            overall[key]["count"] += count
+            overall[direction]["cosine_sum"] += float(row["cosine"]) * count
+            overall[direction]["accuracy_sum"] += float(row["accuracy"]) * count
+            overall[direction]["native_accuracy_sum"] += float(row["native_accuracy"]) * count
+            overall[direction]["count"] += count
 
     summarized = {}
     total_cosine_sum = 0.0
@@ -359,26 +357,26 @@ def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]
     total_native_accuracy_sum = 0.0
     total_count = 0
 
-    for key in ("A_to_B", "B_to_A"):
-        count = overall[key]["count"]
+    for direction in active_directions:
+        count = overall[direction]["count"]
         if count == 0:
-            summarized[key] = {
+            summarized[direction] = {
                 "cosine": float("nan"),
                 "accuracy": float("nan"),
                 "native_accuracy": float("nan"),
                 "count": 0,
             }
         else:
-            summarized[key] = {
-                "cosine": overall[key]["cosine_sum"] / count,
-                "accuracy": overall[key]["accuracy_sum"] / count,
-                "native_accuracy": overall[key]["native_accuracy_sum"] / count,
+            summarized[direction] = {
+                "cosine": overall[direction]["cosine_sum"] / count,
+                "accuracy": overall[direction]["accuracy_sum"] / count,
+                "native_accuracy": overall[direction]["native_accuracy_sum"] / count,
                 "count": count,
             }
 
-        total_cosine_sum += overall[key]["cosine_sum"]
-        total_accuracy_sum += overall[key]["accuracy_sum"]
-        total_native_accuracy_sum += overall[key]["native_accuracy_sum"]
+        total_cosine_sum += overall[direction]["cosine_sum"]
+        total_accuracy_sum += overall[direction]["accuracy_sum"]
+        total_native_accuracy_sum += overall[direction]["native_accuracy_sum"]
         total_count += count
 
     if total_count == 0:
@@ -399,6 +397,14 @@ def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]
     return summarized
 
 
+def build_direction_pretty_name(direction: str, model_a_id: str, model_b_id: str) -> str:
+    if direction == "A_to_B":
+        return f"A_to_B ({model_a_id} -> {model_b_id})"
+    if direction == "B_to_A":
+        return f"B_to_A ({model_b_id} -> {model_a_id})"
+    return direction
+
+
 @torch.inference_mode()
 def evaluate_dataset(
     spec: HFDatasetSpec,
@@ -407,17 +413,17 @@ def evaluate_dataset(
     train_config,
     translator_pool,
     model_specs,
-    translated_model_specs,
     model_a,
     model_b,
+    active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
     boolq_choice_token_ids = build_boolq_choice_token_ids(tokenizer)
 
     path_metrics = {
-        "A_to_B": RunningAverage(),
-        "B_to_A": RunningAverage(),
+        direction: RunningAverage()
+        for direction in active_directions
     }
 
     processed_examples = 0
@@ -434,78 +440,66 @@ def evaluate_dataset(
             past_a = extract_past_key_values(model_a, prefix_cache_ids)
             past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
-            translated_a_to_b_top = translator_pool.translate_top_layers(
-                past_key_values=past_a,
-                src_name="A",
-                dst_name="B",
-                dst_spec=translated_model_specs["B"],
-            )
-            translated_b_to_a_top = translator_pool.translate_top_layers(
-                past_key_values=past_b,
-                src_name="B",
-                dst_name="A",
-                dst_spec=translated_model_specs["A"],
-            )
+            direction_contexts = {
+                "A_to_B": {
+                    "source_past": past_a,
+                    "source_name": "A",
+                    "target_name": "B",
+                    "target_spec": model_specs["B"],
+                    "target_full_past": past_b,
+                    "target_model": model_b,
+                },
+                "B_to_A": {
+                    "source_past": past_b,
+                    "source_name": "B",
+                    "target_name": "A",
+                    "target_spec": model_specs["A"],
+                    "target_full_past": past_a,
+                    "target_model": model_a,
+                },
+            }
 
-            target_top_b = slice_top_layers(
-                past_key_values=past_b,
-                top_layers_to_translate=translated_model_specs["B"].num_layers,
-            )
-            target_top_a = slice_top_layers(
-                past_key_values=past_a,
-                top_layers_to_translate=translated_model_specs["A"].num_layers,
-            )
+            for direction in active_directions:
+                context = direction_contexts[direction]
 
-            cosine_a_to_b = cosine_similarity_between_past(translated_a_to_b_top, target_top_b)
-            cosine_b_to_a = cosine_similarity_between_past(translated_b_to_a_top, target_top_a)
+                translated_top_past = translator_pool.translate_top_layers(
+                    past_key_values=context["source_past"],
+                    src_name=context["source_name"],
+                    dst_name=context["target_name"],
+                    dst_spec=context["target_spec"],
+                )
 
-            mixed_past_for_b = replace_top_layers(
-                base_past_key_values=past_b,
-                translated_top_past_key_values=translated_a_to_b_top,
-            )
-            mixed_past_for_a = replace_top_layers(
-                base_past_key_values=past_a,
-                translated_top_past_key_values=translated_b_to_a_top,
-            )
+                target_top = slice_top_layers(
+                    past_key_values=context["target_full_past"],
+                    top_layers_to_translate=train_config.top_layers_to_translate,
+                )
+                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
-            translated_scores_b = score_boolq_choices(
-                model=model_b,
-                past_key_values=mixed_past_for_b,
-                seed_token=seed_token,
-                boolq_choice_token_ids=boolq_choice_token_ids,
-            )
-            translated_scores_a = score_boolq_choices(
-                model=model_a,
-                past_key_values=mixed_past_for_a,
-                seed_token=seed_token,
-                boolq_choice_token_ids=boolq_choice_token_ids,
-            )
+                mixed_target_past = replace_top_layers(
+                    base_past_key_values=context["target_full_past"],
+                    translated_top_past_key_values=translated_top_past,
+                )
 
-            native_scores_b = score_boolq_choices(
-                model=model_b,
-                past_key_values=past_b,
-                seed_token=seed_token,
-                boolq_choice_token_ids=boolq_choice_token_ids,
-            )
-            native_scores_a = score_boolq_choices(
-                model=model_a,
-                past_key_values=past_a,
-                seed_token=seed_token,
-                boolq_choice_token_ids=boolq_choice_token_ids,
-            )
+                translated_scores = score_boolq_choices(
+                    model=context["target_model"],
+                    past_key_values=mixed_target_past,
+                    seed_token=seed_token,
+                    boolq_choice_token_ids=boolq_choice_token_ids,
+                )
+                native_scores = score_boolq_choices(
+                    model=context["target_model"],
+                    past_key_values=context["target_full_past"],
+                    seed_token=seed_token,
+                    boolq_choice_token_ids=boolq_choice_token_ids,
+                )
 
-            translated_pred_b = predict_boolq_label(translated_scores_b)
-            translated_pred_a = predict_boolq_label(translated_scores_a)
-            native_pred_b = predict_boolq_label(native_scores_b)
-            native_pred_a = predict_boolq_label(native_scores_a)
+                translated_pred = predict_boolq_label(translated_scores)
+                native_pred = predict_boolq_label(native_scores)
 
-            acc_a_to_b = 1.0 if translated_pred_b == gold_answer else 0.0
-            acc_b_to_a = 1.0 if translated_pred_a == gold_answer else 0.0
-            native_acc_b = 1.0 if native_pred_b == gold_answer else 0.0
-            native_acc_a = 1.0 if native_pred_a == gold_answer else 0.0
+                acc = 1.0 if translated_pred == gold_answer else 0.0
+                native_acc = 1.0 if native_pred == gold_answer else 0.0
 
-            path_metrics["A_to_B"].update(cosine_a_to_b, acc_a_to_b, native_acc_b, 1)
-            path_metrics["B_to_A"].update(cosine_b_to_a, acc_b_to_a, native_acc_a, 1)
+                path_metrics[direction].update(cosine_value, acc, native_acc, 1)
 
             processed_examples += 1
 
@@ -526,19 +520,19 @@ def log_dataset_result(
     results: Dict[str, Dict[str, float]],
     model_a_id: str,
     model_b_id: str,
+    active_directions,
 ) -> None:
-    pretty_names = {
-        "A_to_B": f"A_to_B ({model_a_id} -> {model_b_id})",
-        "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
-        "AVG": "AVG (weighted over both paths)",
-    }
-
     logger.info("===== %s =====", dataset_name)
-    for key in ("A_to_B", "B_to_A", "AVG"):
-        row = results[key]
+    for direction in list(active_directions) + ["AVG"]:
+        row = results[direction]
+        pretty_name = (
+            "AVG (weighted over evaluated paths)"
+            if direction == "AVG"
+            else build_direction_pretty_name(direction, model_a_id, model_b_id)
+        )
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
-            pretty_names[key],
+            pretty_name,
             row["cosine"],
             row["accuracy"],
             row["native_accuracy"],
@@ -551,19 +545,19 @@ def log_overall_result(
     results: Dict[str, Dict[str, float]],
     model_a_id: str,
     model_b_id: str,
+    active_directions,
 ) -> None:
-    pretty_names = {
-        "A_to_B": f"A_to_B ({model_a_id} -> {model_b_id})",
-        "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
-        "AVG": "AVG (weighted over all datasets and both paths)",
-    }
-
     logger.info("===== OVERALL AVERAGE ACROSS DATASETS =====")
-    for key in ("A_to_B", "B_to_A", "AVG"):
-        row = results[key]
+    for direction in list(active_directions) + ["AVG"]:
+        row = results[direction]
+        pretty_name = (
+            "AVG (weighted over all datasets and evaluated paths)"
+            if direction == "AVG"
+            else build_direction_pretty_name(direction, model_a_id, model_b_id)
+        )
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
-            pretty_names[key],
+            pretty_name,
             row["cosine"],
             row["accuracy"],
             row["native_accuracy"],
@@ -579,9 +573,9 @@ def log_boolq_score_samples(
     eval_config: EvalConfig,
     translator_pool,
     model_specs,
-    translated_model_specs,
     model_a,
     model_b,
+    active_directions,
     logger: logging.Logger,
 ) -> None:
     if eval_config.num_generation_samples_per_dataset <= 0:
@@ -609,58 +603,24 @@ def log_boolq_score_samples(
         past_a = extract_past_key_values(model_a, prefix_cache_ids)
         past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
-        translated_a_to_b_top = translator_pool.translate_top_layers(
-            past_key_values=past_a,
-            src_name="A",
-            dst_name="B",
-            dst_spec=translated_model_specs["B"],
-        )
-        translated_b_to_a_top = translator_pool.translate_top_layers(
-            past_key_values=past_b,
-            src_name="B",
-            dst_name="A",
-            dst_spec=translated_model_specs["A"],
-        )
-
-        mixed_past_for_b = replace_top_layers(
-            base_past_key_values=past_b,
-            translated_top_past_key_values=translated_a_to_b_top,
-        )
-        mixed_past_for_a = replace_top_layers(
-            base_past_key_values=past_a,
-            translated_top_past_key_values=translated_b_to_a_top,
-        )
-
-        translated_scores_b = score_boolq_choices(
-            model=model_b,
-            past_key_values=mixed_past_for_b,
-            seed_token=seed_token,
-            boolq_choice_token_ids=boolq_choice_token_ids,
-        )
-        translated_scores_a = score_boolq_choices(
-            model=model_a,
-            past_key_values=mixed_past_for_a,
-            seed_token=seed_token,
-            boolq_choice_token_ids=boolq_choice_token_ids,
-        )
-
-        native_scores_b = score_boolq_choices(
-            model=model_b,
-            past_key_values=past_b,
-            seed_token=seed_token,
-            boolq_choice_token_ids=boolq_choice_token_ids,
-        )
-        native_scores_a = score_boolq_choices(
-            model=model_a,
-            past_key_values=past_a,
-            seed_token=seed_token,
-            boolq_choice_token_ids=boolq_choice_token_ids,
-        )
-
-        translated_pred_b = predict_boolq_label(translated_scores_b)
-        translated_pred_a = predict_boolq_label(translated_scores_a)
-        native_pred_b = predict_boolq_label(native_scores_b)
-        native_pred_a = predict_boolq_label(native_scores_a)
+        direction_contexts = {
+            "A_to_B": {
+                "source_past": past_a,
+                "source_name": "A",
+                "target_name": "B",
+                "target_spec": model_specs["B"],
+                "target_full_past": past_b,
+                "target_model": model_b,
+            },
+            "B_to_A": {
+                "source_past": past_b,
+                "source_name": "B",
+                "target_name": "A",
+                "target_spec": model_specs["A"],
+                "target_full_past": past_a,
+                "target_model": model_a,
+            },
+        }
 
         logger.info(
             "--- Sample %d/%d | %s ---",
@@ -670,34 +630,54 @@ def log_boolq_score_samples(
         )
         logger.info("prefix(question):\n%s", prefix_text)
         logger.info("gold_answer: %s", gold_answer)
-        logger.info(
-            "A_to_B translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
-            translated_scores_b["yes"],
-            translated_scores_b["no"],
-            translated_pred_b,
-            translated_pred_b == gold_answer,
-        )
-        logger.info(
-            "A_to_B native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
-            native_scores_b["yes"],
-            native_scores_b["no"],
-            native_pred_b,
-            native_pred_b == gold_answer,
-        )
-        logger.info(
-            "B_to_A translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
-            translated_scores_a["yes"],
-            translated_scores_a["no"],
-            translated_pred_a,
-            translated_pred_a == gold_answer,
-        )
-        logger.info(
-            "B_to_A native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
-            native_scores_a["yes"],
-            native_scores_a["no"],
-            native_pred_a,
-            native_pred_a == gold_answer,
-        )
+
+        for direction in active_directions:
+            context = direction_contexts[direction]
+
+            translated_top_past = translator_pool.translate_top_layers(
+                past_key_values=context["source_past"],
+                src_name=context["source_name"],
+                dst_name=context["target_name"],
+                dst_spec=context["target_spec"],
+            )
+            mixed_target_past = replace_top_layers(
+                base_past_key_values=context["target_full_past"],
+                translated_top_past_key_values=translated_top_past,
+            )
+
+            translated_scores = score_boolq_choices(
+                model=context["target_model"],
+                past_key_values=mixed_target_past,
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
+            native_scores = score_boolq_choices(
+                model=context["target_model"],
+                past_key_values=context["target_full_past"],
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
+
+            translated_pred = predict_boolq_label(translated_scores)
+            native_pred = predict_boolq_label(native_scores)
+            pretty_name = build_direction_pretty_name(direction, train_config.model_a_id, train_config.model_b_id)
+
+            logger.info(
+                "%s translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+                pretty_name,
+                translated_scores["yes"],
+                translated_scores["no"],
+                translated_pred,
+                translated_pred == gold_answer,
+            )
+            logger.info(
+                "%s native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+                pretty_name,
+                native_scores["yes"],
+                native_scores["no"],
+                native_pred,
+                native_pred == gold_answer,
+            )
 
         sample_idx += 1
         if sample_idx >= eval_config.num_generation_samples_per_dataset:
@@ -722,7 +702,6 @@ def main() -> None:
         train_config,
         translator_pool,
         model_specs,
-        translated_model_specs,
         model_a,
         model_b,
         tokenizer,
@@ -731,6 +710,8 @@ def main() -> None:
         device_override=eval_config.device,
     )
 
+    active_directions = parse_train_directions(train_config.train_directions)
+
     translator_pool.eval()
     model_a.eval()
     model_b.eval()
@@ -738,14 +719,8 @@ def main() -> None:
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("model_A=%s", train_config.model_a_id)
     logger.info("model_B=%s", train_config.model_b_id)
-    logger.info("top_layers_ratio=%.6f", train_config.top_layers_ratio)
-    logger.info(
-        "translated_layers: A_top=%d/%d | B_top=%d/%d",
-        translated_model_specs["A"].num_layers,
-        model_specs["A"].num_layers,
-        translated_model_specs["B"].num_layers,
-        model_specs["B"].num_layers,
-    )
+    logger.info("top_layers_to_translate=%d", train_config.top_layers_to_translate)
+    logger.info("active_directions=%s", active_directions)
     logger.info("translation_mode=replace_top_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
 
@@ -777,9 +752,9 @@ def main() -> None:
             train_config=train_config,
             translator_pool=translator_pool,
             model_specs=model_specs,
-            translated_model_specs=translated_model_specs,
             model_a=model_a,
             model_b=model_b,
+            active_directions=active_directions,
             logger=logger,
         )
         all_results[spec.name_for_log] = results
@@ -790,6 +765,7 @@ def main() -> None:
             results=results,
             model_a_id=train_config.model_a_id,
             model_b_id=train_config.model_b_id,
+            active_directions=active_directions,
         )
 
         log_boolq_score_samples(
@@ -799,9 +775,9 @@ def main() -> None:
             eval_config=eval_config,
             translator_pool=translator_pool,
             model_specs=model_specs,
-            translated_model_specs=translated_model_specs,
             model_a=model_a,
             model_b=model_b,
+            active_directions=active_directions,
             logger=logger,
         )
 
@@ -810,28 +786,25 @@ def main() -> None:
 
     logger.info("===== FINAL SUMMARY =====")
     for dataset_name, result in all_results.items():
-        logger.info(
-            "%s | A_to_B(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
-            "B_to_A(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
-            "AVG(cos=%.6f, acc=%.6f, native_acc=%.6f)",
-            dataset_name,
-            result["A_to_B"]["cosine"],
-            result["A_to_B"]["accuracy"],
-            result["A_to_B"]["native_accuracy"],
-            result["B_to_A"]["cosine"],
-            result["B_to_A"]["accuracy"],
-            result["B_to_A"]["native_accuracy"],
-            result["AVG"]["cosine"],
-            result["AVG"]["accuracy"],
-            result["AVG"]["native_accuracy"],
+        summary_parts = []
+        for direction in active_directions:
+            row = result[direction]
+            summary_parts.append(
+                f"{direction}(cos={row['cosine']:.6f}, acc={row['accuracy']:.6f}, native_acc={row['native_accuracy']:.6f})"
+            )
+        avg_row = result["AVG"]
+        summary_parts.append(
+            f"AVG(cos={avg_row['cosine']:.6f}, acc={avg_row['accuracy']:.6f}, native_acc={avg_row['native_accuracy']:.6f})"
         )
+        logger.info("%s | %s", dataset_name, " | ".join(summary_parts))
 
-    overall_results = summarize_overall_results(all_results)
+    overall_results = summarize_overall_results(all_results, active_directions)
     log_overall_result(
         logger=logger,
         results=overall_results,
         model_a_id=train_config.model_a_id,
         model_b_id=train_config.model_b_id,
+        active_directions=active_directions,
     )
 
     logger.info("Done. Saved log to %s", log_path)

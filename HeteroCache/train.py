@@ -6,8 +6,6 @@ Code 1
 
 Important
 - This example is intentionally compact and pragmatic.
-- It follows the paper's high-level recipe with a shared latent space and per-model in/out translators,
-  but uses a smaller, easier-to-read implementation suitable for experimentation.
 - It is written to be compatible with transformers==4.35.2, where past_key_values are plain tuples,
   so DynamicCache is not used.
 """
@@ -36,9 +34,6 @@ from common import (
 )
 
 
-# -----------------------------------------------------------------------------
-# No argparse by request. Edit values here.
-# -----------------------------------------------------------------------------
 CONFIG = TrainConfig(
     model_a_id="gpt2",
     model_b_id="gpt2-medium",
@@ -56,12 +51,11 @@ CONFIG = TrainConfig(
     save_every=100,
     seed=42,
     shuffle_buffer=50_000,
-    shared_slots=32,
-    shared_dim=128,
+    top_layers_to_translate=6,
     translator_dim=1024,
-    translator_heads=4,
+    translator_heads=16,
+    translator_depth=2,
     translator_mlp_ratio=4,
-    top_layers_ratio=0.25,
     train_directions="B_to_A",
     device="cuda" if torch.cuda.is_available() else "cpu",
     dtype="float32",
@@ -108,7 +102,7 @@ def main() -> None:
     logger.info("[Setup] device=%s", CONFIG.device)
     logger.info("[Setup] loading models: A=%s, B=%s", CONFIG.model_a_id, CONFIG.model_b_id)
     model_a, model_b, tokenizer = build_models_and_tokenizer(CONFIG)
-    translator_pool, model_specs, translated_model_specs = build_translator_pool(model_a, model_b, CONFIG)
+    translator_pool, model_specs = build_translator_pool(model_a, model_b, CONFIG)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
@@ -124,18 +118,7 @@ def main() -> None:
         model_specs["B"].hidden_size,
         model_specs["B"].num_heads,
     )
-    logger.info("[Setup] translated top-layer specs")
-    logger.info(
-        "  A_top: layers=%d / %d",
-        translated_model_specs["A"].num_layers,
-        model_specs["A"].num_layers,
-    )
-    logger.info(
-        "  B_top: layers=%d / %d",
-        translated_model_specs["B"].num_layers,
-        model_specs["B"].num_layers,
-    )
-    logger.info("[Setup] top_layers_ratio = %.4f", CONFIG.top_layers_ratio)
+    logger.info("[Setup] top_layers_to_translate = %d", CONFIG.top_layers_to_translate)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, CONFIG)
@@ -174,7 +157,7 @@ def main() -> None:
                     "source_past": past_a,
                     "source_name": "A",
                     "target_name": "B",
-                    "target_top_spec": translated_model_specs["B"],
+                    "target_spec": model_specs["B"],
                     "target_full_past": past_b,
                     "target_model": model_b,
                 },
@@ -182,7 +165,7 @@ def main() -> None:
                     "source_past": past_b,
                     "source_name": "B",
                     "target_name": "A",
-                    "target_top_spec": translated_model_specs["A"],
+                    "target_spec": model_specs["A"],
                     "target_full_past": past_a,
                     "target_model": model_a,
                 },
@@ -196,7 +179,7 @@ def main() -> None:
                     past_key_values=context["source_past"],
                     src_name=context["source_name"],
                     dst_name=context["target_name"],
-                    dst_spec=context["target_top_spec"],
+                    dst_spec=context["target_spec"],
                 )
                 mixed_target_past = replace_top_layers(
                     base_past_key_values=context["target_full_past"],
@@ -247,7 +230,7 @@ def main() -> None:
         #             "note": "Toy checkpoint trained with suffix LM loss only.",
         #             "model_a": CONFIG.model_a_id,
         #             "model_b": CONFIG.model_b_id,
-        #             "top_layers_ratio": CONFIG.top_layers_ratio,
+        #             "top_layers_to_translate": CONFIG.top_layers_to_translate,
         #             "train_directions": CONFIG.train_directions,
         #         },
         #     )
@@ -265,7 +248,7 @@ def main() -> None:
             "note": "Final toy checkpoint trained with suffix LM loss only.",
             "model_a": CONFIG.model_a_id,
             "model_b": CONFIG.model_b_id,
-            "top_layers_ratio": CONFIG.top_layers_ratio,
+            "top_layers_to_translate": CONFIG.top_layers_to_translate,
             "train_directions": CONFIG.train_directions,
         },
     )

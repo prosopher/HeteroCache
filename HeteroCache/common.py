@@ -34,13 +34,12 @@ class TrainConfig:
     save_every: int = 100
     seed: int = 42
     shuffle_buffer: int = 50_000
-    shared_slots: int = 32
-    shared_dim: int = 128
-    translator_dim: int = 256
-    translator_heads: int = 4
+    top_layers_to_translate: int = 6
+    translator_dim: int = 1024
+    translator_heads: int = 16
+    translator_depth: int = 2
     translator_mlp_ratio: int = 2
-    top_layers_ratio: float = 1.0
-    train_directions: str = "A_to_B,B_to_A"
+    train_directions: str = "B_to_A"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float32"
 
@@ -52,12 +51,6 @@ class ModelSpec:
     hidden_size: int
     num_heads: int
     head_dim: int
-
-
-@dataclass
-class SharedCache:
-    key: torch.Tensor
-    value: torch.Tensor
 
 
 def set_seed(seed: int) -> None:
@@ -142,28 +135,6 @@ def get_model_spec(model: PreTrainedModel) -> ModelSpec:
     )
 
 
-def resolve_top_layers_to_translate(num_layers: int, top_layers_ratio: float) -> int:
-    if not (0.0 < top_layers_ratio <= 1.0):
-        raise ValueError(f"top_layers_ratio must be in (0, 1], got {top_layers_ratio}")
-    return max(1, min(num_layers, int(math.ceil(num_layers * top_layers_ratio))))
-
-
-def build_translated_model_specs(
-    full_model_specs: Dict[str, ModelSpec],
-    top_layers_ratio: float,
-) -> Dict[str, ModelSpec]:
-    translated_specs = {}
-    for name, spec in full_model_specs.items():
-        translated_specs[name] = ModelSpec(
-            model_id=spec.model_id,
-            num_layers=resolve_top_layers_to_translate(spec.num_layers, top_layers_ratio),
-            hidden_size=spec.hidden_size,
-            num_heads=spec.num_heads,
-            head_dim=spec.head_dim,
-        )
-    return translated_specs
-
-
 class OpenWebTextSequenceStream(IterableDataset):
     """
     Streams OpenWebText and yields fixed-length token chunks.
@@ -205,11 +176,10 @@ class OpenWebTextSequenceStream(IterableDataset):
                 yield torch.tensor(chunk, dtype=torch.long)
 
 
-class CrossAttentionBlock(nn.Module):
+class SelfAttentionBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 2) -> None:
         super().__init__()
-        self.query_norm = nn.LayerNorm(dim)
-        self.context_norm = nn.LayerNorm(dim)
+        self.attn_norm = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -218,215 +188,162 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(dim * mlp_ratio, dim),
         )
 
-    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        q = self.query_norm(hidden)
-        kv = self.context_norm(context)
-        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        norm_hidden = self.attn_norm(hidden)
+        attn_out, _ = self.attn(norm_hidden, norm_hidden, norm_hidden, need_weights=False)
         hidden = hidden + attn_out
         hidden = hidden + self.ffn(self.ffn_norm(hidden))
         return hidden
 
 
-class LocalToSharedTranslator(nn.Module):
-    """
-    Input:  [batch, seq, local_layers, local_hidden]
-    Output: [batch, seq, shared_slots, shared_dim]
-    """
-
+class PerLayerTranslator(nn.Module):
     def __init__(
         self,
-        local_hidden_size: int,
-        local_layers: int,
-        shared_slots: int,
-        shared_dim: int,
+        src_hidden_size: int,
+        dst_hidden_size: int,
         translator_dim: int,
         translator_heads: int,
+        translator_depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.local_layers = local_layers
-        self.shared_slots = shared_slots
-        self.shared_dim = shared_dim
-        self.input_norm = nn.LayerNorm(local_hidden_size)
-        self.input_proj = nn.Linear(local_hidden_size, translator_dim)
+        self.input_norm = nn.LayerNorm(src_hidden_size)
+        self.input_proj = nn.Linear(src_hidden_size, translator_dim)
         self.blocks = nn.ModuleList(
             [
-                CrossAttentionBlock(
+                SelfAttentionBlock(
                     dim=translator_dim,
                     num_heads=translator_heads,
                     mlp_ratio=mlp_ratio,
                 )
-                for _ in range(local_layers)
+                for _ in range(translator_depth)
             ]
         )
-        self.output_norm = nn.LayerNorm(local_layers * translator_dim)
-        self.output_proj = nn.Linear(local_layers * translator_dim, shared_slots * shared_dim)
+        self.output_norm = nn.LayerNorm(translator_dim)
+        self.output_proj = nn.Linear(translator_dim, dst_hidden_size)
 
-    def forward(self, local_block: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _, _ = local_block.shape
-        projected = F.gelu(self.input_proj(self.input_norm(local_block)))
-        hidden = projected[:, :, 0, :]
-        collected = []
-        for layer_idx, block in enumerate(self.blocks):
-            hidden = block(hidden, projected[:, :, layer_idx, :])
-            collected.append(hidden)
-        fused = torch.cat(collected, dim=-1)
-        shared = F.gelu(self.output_proj(self.output_norm(fused)))
-        return shared.view(batch_size, seq_len, self.shared_slots, self.shared_dim)
+    def forward(self, layer_cache: torch.Tensor) -> torch.Tensor:
+        hidden = F.gelu(self.input_proj(self.input_norm(layer_cache)))
+        for block in self.blocks:
+            hidden = block(hidden)
+        return self.output_proj(self.output_norm(hidden))
 
 
-class SharedToLocalTranslator(nn.Module):
-    """
-    Input:  [batch, seq, shared_slots, shared_dim]
-    Output: [batch, seq, local_layers, local_hidden]
-    """
-
+class TopLayerDirectionalTranslator(nn.Module):
     def __init__(
         self,
-        local_hidden_size: int,
-        local_layers: int,
-        shared_slots: int,
-        shared_dim: int,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        top_layers_to_translate: int,
         translator_dim: int,
         translator_heads: int,
+        translator_depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.local_layers = local_layers
-        self.local_hidden_size = local_hidden_size
-        self.shared_slots = shared_slots
-        self.shared_dim = shared_dim
-        flat_shared = shared_slots * shared_dim
-        self.input_norm = nn.LayerNorm(flat_shared)
-        self.input_proj = nn.Linear(flat_shared, local_layers * translator_dim)
-        self.blocks = nn.ModuleList(
+        self.top_layers_to_translate = top_layers_to_translate
+        self.key_layers = nn.ModuleList(
             [
-                CrossAttentionBlock(
-                    dim=translator_dim,
-                    num_heads=translator_heads,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(local_layers)
-            ]
-        )
-        self.output_norm = nn.LayerNorm(local_layers * translator_dim)
-        self.output_proj = nn.Linear(local_layers * translator_dim, local_layers * local_hidden_size)
-
-    def forward(self, shared_block: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _, _ = shared_block.shape
-        flat_shared = shared_block.reshape(batch_size, seq_len, self.shared_slots * self.shared_dim)
-        expanded = F.gelu(self.input_proj(self.input_norm(flat_shared)))
-        expanded = expanded.view(batch_size, seq_len, self.local_layers, -1)
-        hidden = expanded[:, :, 0, :]
-        collected = []
-        for layer_idx, block in enumerate(self.blocks):
-            hidden = block(hidden, expanded[:, :, layer_idx, :])
-            collected.append(hidden)
-        fused = torch.cat(collected, dim=-1)
-        local = F.gelu(self.output_proj(self.output_norm(fused)))
-        return local.view(batch_size, seq_len, self.local_layers, self.local_hidden_size)
-
-
-class ModelLatentAdapter(nn.Module):
-    def __init__(
-        self,
-        model_name: str,
-        local_layers: int,
-        local_hidden_size: int,
-        shared_slots: int,
-        shared_dim: int,
-        translator_dim: int,
-        translator_heads: int,
-        mlp_ratio: int,
-    ) -> None:
-        super().__init__()
-        self.model_name = model_name
-        self.key_to_shared = LocalToSharedTranslator(
-            local_hidden_size=local_hidden_size,
-            local_layers=local_layers,
-            shared_slots=shared_slots,
-            shared_dim=shared_dim,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            mlp_ratio=mlp_ratio,
-        )
-        self.value_to_shared = LocalToSharedTranslator(
-            local_hidden_size=local_hidden_size,
-            local_layers=local_layers,
-            shared_slots=shared_slots,
-            shared_dim=shared_dim,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            mlp_ratio=mlp_ratio,
-        )
-        self.key_from_shared = SharedToLocalTranslator(
-            local_hidden_size=local_hidden_size,
-            local_layers=local_layers,
-            shared_slots=shared_slots,
-            shared_dim=shared_dim,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            mlp_ratio=mlp_ratio,
-        )
-        self.value_from_shared = SharedToLocalTranslator(
-            local_hidden_size=local_hidden_size,
-            local_layers=local_layers,
-            shared_slots=shared_slots,
-            shared_dim=shared_dim,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            mlp_ratio=mlp_ratio,
-        )
-
-    def to_shared(self, key_block: torch.Tensor, value_block: torch.Tensor) -> SharedCache:
-        return SharedCache(
-            key=self.key_to_shared(key_block),
-            value=self.value_to_shared(value_block),
-        )
-
-    def from_shared(self, shared_cache: SharedCache) -> Tuple[torch.Tensor, torch.Tensor]:
-        key_block = self.key_from_shared(shared_cache.key)
-        value_block = self.value_from_shared(shared_cache.value)
-        return key_block, value_block
-
-
-class SharedKVTranslatorPool(nn.Module):
-    def __init__(
-        self,
-        translated_model_specs: Dict[str, ModelSpec],
-        shared_slots: int,
-        shared_dim: int,
-        translator_dim: int,
-        translator_heads: int,
-        mlp_ratio: int,
-    ) -> None:
-        super().__init__()
-        self.translated_model_specs = translated_model_specs
-        self.adapters = nn.ModuleDict(
-            {
-                name: ModelLatentAdapter(
-                    model_name=name,
-                    local_layers=spec.num_layers,
-                    local_hidden_size=spec.hidden_size,
-                    shared_slots=shared_slots,
-                    shared_dim=shared_dim,
+                PerLayerTranslator(
+                    src_hidden_size=src_hidden_size,
+                    dst_hidden_size=dst_hidden_size,
                     translator_dim=translator_dim,
                     translator_heads=translator_heads,
+                    translator_depth=translator_depth,
                     mlp_ratio=mlp_ratio,
                 )
-                for name, spec in translated_model_specs.items()
-            }
+                for _ in range(top_layers_to_translate)
+            ]
+        )
+        self.value_layers = nn.ModuleList(
+            [
+                PerLayerTranslator(
+                    src_hidden_size=src_hidden_size,
+                    dst_hidden_size=dst_hidden_size,
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(top_layers_to_translate)
+            ]
         )
 
-    def translate_blocks(
+    def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        key_outputs = []
+        value_outputs = []
+        for layer_idx in range(self.top_layers_to_translate):
+            key_outputs.append(self.key_layers[layer_idx](key_block[:, :, layer_idx, :]).unsqueeze(2))
+            value_outputs.append(self.value_layers[layer_idx](value_block[:, :, layer_idx, :]).unsqueeze(2))
+        translated_key = torch.cat(key_outputs, dim=2)
+        translated_value = torch.cat(value_outputs, dim=2)
+        return translated_key, translated_value
+
+
+class TopLayerTranslatorPool(nn.Module):
+    def __init__(
+        self,
+        model_specs: Dict[str, ModelSpec],
+        top_layers_to_translate: int,
+        translator_dim: int,
+        translator_heads: int,
+        translator_depth: int,
+        mlp_ratio: int,
+        active_directions: List[str],
+    ) -> None:
+        super().__init__()
+        spec_a = model_specs["A"]
+        spec_b = model_specs["B"]
+        max_allowed = min(spec_a.num_layers, spec_b.num_layers)
+        if top_layers_to_translate > max_allowed:
+            raise ValueError(
+                f"top_layers_to_translate={top_layers_to_translate} exceeds min layer count {max_allowed}."
+            )
+        if not active_directions:
+            raise ValueError("active_directions must contain at least one direction.")
+
+        self.model_specs = model_specs
+        self.top_layers_to_translate = top_layers_to_translate
+        self.active_directions = tuple(active_directions)
+
+        adapters = {}
+        if "A_to_B" in self.active_directions:
+            adapters["A_to_B"] = TopLayerDirectionalTranslator(
+                src_hidden_size=spec_a.hidden_size,
+                dst_hidden_size=spec_b.hidden_size,
+                top_layers_to_translate=top_layers_to_translate,
+                translator_dim=translator_dim,
+                translator_heads=translator_heads,
+                translator_depth=translator_depth,
+                mlp_ratio=mlp_ratio,
+            )
+        if "B_to_A" in self.active_directions:
+            adapters["B_to_A"] = TopLayerDirectionalTranslator(
+                src_hidden_size=spec_b.hidden_size,
+                dst_hidden_size=spec_a.hidden_size,
+                top_layers_to_translate=top_layers_to_translate,
+                translator_dim=translator_dim,
+                translator_heads=translator_heads,
+                translator_depth=translator_depth,
+                mlp_ratio=mlp_ratio,
+            )
+
+        self.adapters = nn.ModuleDict(adapters)
+
+    def translate_top_layer_blocks(
         self,
         key_block: torch.Tensor,
         value_block: torch.Tensor,
         src_name: str,
         dst_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        shared_cache = self.adapters[src_name].to_shared(key_block, value_block)
-        return self.adapters[dst_name].from_shared(shared_cache)
+        adapter_name = f"{src_name}_to_{dst_name}"
+        if adapter_name not in self.adapters:
+            raise ValueError(
+                f"Translator direction {adapter_name} is not available. "
+                f"Active directions: {list(self.active_directions)}"
+            )
+        return self.adapters[adapter_name](key_block, value_block)
 
     def translate_top_layers(
         self,
@@ -435,22 +352,21 @@ class SharedKVTranslatorPool(nn.Module):
         dst_name: str,
         dst_spec: ModelSpec,
     ) -> PastKeyValues:
-        src_top_layers = self.translated_model_specs[src_name].num_layers
-        src_top_past = slice_top_layers(
+        key_block, value_block = extract_top_layer_blocks(
             past_key_values=past_key_values,
-            top_layers_to_translate=src_top_layers,
+            top_layers_to_translate=self.top_layers_to_translate,
         )
-        key_block, value_block = past_key_values_to_blocks(src_top_past)
-        translated_key, translated_value = self.translate_blocks(
+        translated_key, translated_value = self.translate_top_layer_blocks(
             key_block=key_block,
             value_block=value_block,
             src_name=src_name,
             dst_name=dst_name,
         )
-        return blocks_to_past_key_values(
+        return blocks_to_partial_past_key_values(
             key_block=translated_key,
             value_block=translated_value,
-            model_spec=dst_spec,
+            num_heads=dst_spec.num_heads,
+            head_dim=dst_spec.head_dim,
         )
 
 
@@ -474,23 +390,36 @@ def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Ten
     return key_block, value_block
 
 
-def blocks_to_past_key_values(
+def extract_top_layer_blocks(
+    past_key_values: PastKeyValues,
+    top_layers_to_translate: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if top_layers_to_translate < 1:
+        raise ValueError("top_layers_to_translate must be >= 1")
+    if top_layers_to_translate > len(past_key_values):
+        raise ValueError(
+            f"Cannot extract {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
+        )
+    return past_key_values_to_blocks(past_key_values[-top_layers_to_translate:])
+
+
+def blocks_to_partial_past_key_values(
     key_block: torch.Tensor,
     value_block: torch.Tensor,
-    model_spec: ModelSpec,
+    num_heads: int,
+    head_dim: int,
 ) -> PastKeyValues:
     batch_size, seq_len, num_layers, hidden_size = key_block.shape
-    if num_layers != model_spec.num_layers:
-        raise ValueError(f"Layer mismatch: block has {num_layers}, model expects {model_spec.num_layers}.")
-    if hidden_size != model_spec.hidden_size:
-        raise ValueError(f"Hidden mismatch: block has {hidden_size}, model expects {model_spec.hidden_size}.")
+    expected_hidden = num_heads * head_dim
+    if hidden_size != expected_hidden:
+        raise ValueError(f"Hidden mismatch: block has {hidden_size}, expected {expected_hidden}.")
 
     past_key_values = []
-    for layer_idx in range(model_spec.num_layers):
+    for layer_idx in range(num_layers):
         key_layer = key_block[:, :, layer_idx, :]
         value_layer = value_block[:, :, layer_idx, :]
-        key_layer = key_layer.view(batch_size, seq_len, model_spec.num_heads, model_spec.head_dim)
-        value_layer = value_layer.view(batch_size, seq_len, model_spec.num_heads, model_spec.head_dim)
+        key_layer = key_layer.view(batch_size, seq_len, num_heads, head_dim)
+        value_layer = value_layer.view(batch_size, seq_len, num_heads, head_dim)
         key_layer = key_layer.permute(0, 2, 1, 3).contiguous()
         value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
         past_key_values.append((key_layer, value_layer))
@@ -501,11 +430,9 @@ def slice_top_layers(
     past_key_values: PastKeyValues,
     top_layers_to_translate: int,
 ) -> PastKeyValues:
-    if top_layers_to_translate < 1:
-        raise ValueError("top_layers_to_translate must be >= 1")
     if top_layers_to_translate > len(past_key_values):
         raise ValueError(
-            f"Requested top {top_layers_to_translate} layers, but cache only has {len(past_key_values)} layers."
+            f"Cannot slice {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
         )
     return tuple(past_key_values[-top_layers_to_translate:])
 
@@ -583,12 +510,11 @@ def compute_suffix_lm_loss(
     )
     logits = outputs.logits
     vocab_size = logits.shape[-1]
-    loss = F.cross_entropy(
+    return F.cross_entropy(
         logits.reshape(-1, vocab_size),
         lm_labels.reshape(-1),
         reduction="mean",
     )
-    return loss
 
 
 class InfiniteDataLoader:
@@ -622,14 +548,6 @@ def split_prefix_and_suffix_for_exact_next_token_loss(
     input_ids: torch.Tensor,
     prefix_tokens: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    For exact next-token supervision on the suffix:
-      - prefix_cache_ids: tokens [0, ..., prefix_tokens-2]
-      - lm_input_ids:     tokens [prefix_tokens-1, ..., T-2]
-      - lm_labels:        tokens [prefix_tokens,   ..., T-1]
-
-    This lets the first suffix label be predicted from the last prefix token.
-    """
     if prefix_tokens < 2:
         raise ValueError("prefix_tokens must be >= 2")
     prefix_cache_ids = input_ids[:, : prefix_tokens - 1]
@@ -665,25 +583,23 @@ def build_translator_pool(
     model_a: PreTrainedModel,
     model_b: PreTrainedModel,
     config: TrainConfig,
-) -> Tuple[SharedKVTranslatorPool, Dict[str, ModelSpec], Dict[str, ModelSpec]]:
-    full_model_specs = {
+) -> Tuple[TopLayerTranslatorPool, Dict[str, ModelSpec]]:
+    model_specs = {
         "A": get_model_spec(model_a),
         "B": get_model_spec(model_b),
     }
-    translated_model_specs = build_translated_model_specs(
-        full_model_specs=full_model_specs,
-        top_layers_ratio=config.top_layers_ratio,
-    )
-    translator_pool = SharedKVTranslatorPool(
-        translated_model_specs=translated_model_specs,
-        shared_slots=config.shared_slots,
-        shared_dim=config.shared_dim,
+    active_directions = parse_train_directions(config.train_directions)
+    translator_pool = TopLayerTranslatorPool(
+        model_specs=model_specs,
+        top_layers_to_translate=config.top_layers_to_translate,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
+        translator_depth=config.translator_depth,
         mlp_ratio=config.translator_mlp_ratio,
+        active_directions=active_directions,
     )
     translator_pool.to(config.device)
-    return translator_pool, full_model_specs, translated_model_specs
+    return translator_pool, model_specs
 
 
 def build_models_and_tokenizer(config: TrainConfig) -> Tuple[PreTrainedModel, PreTrainedModel, PreTrainedTokenizerBase]:
@@ -695,7 +611,7 @@ def build_models_and_tokenizer(config: TrainConfig) -> Tuple[PreTrainedModel, Pr
 
 def save_checkpoint(
     output_path: str,
-    translator_pool: SharedKVTranslatorPool,
+    translator_pool: TopLayerTranslatorPool,
     optimizer: torch.optim.Optimizer,
     scheduler: WarmupCosineScheduler,
     train_config: TrainConfig,
@@ -726,8 +642,7 @@ def load_translator_pool_from_checkpoint(
     device_override: Optional[str] = None,
 ) -> Tuple[
     TrainConfig,
-    SharedKVTranslatorPool,
-    Dict[str, ModelSpec],
+    TopLayerTranslatorPool,
     Dict[str, ModelSpec],
     PreTrainedModel,
     PreTrainedModel,
@@ -738,11 +653,11 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = device_override
     model_a, model_b, tokenizer = build_models_and_tokenizer(config)
-    translator_pool, full_model_specs, translated_model_specs = build_translator_pool(model_a, model_b, config)
+    translator_pool, model_specs = build_translator_pool(model_a, model_b, config)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return config, translator_pool, full_model_specs, translated_model_specs, model_a, model_b, tokenizer
+    return config, translator_pool, model_specs, model_a, model_b, tokenizer
 
 
 def write_json(path: str, payload: Dict) -> None:
