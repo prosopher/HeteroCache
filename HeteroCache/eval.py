@@ -1,7 +1,7 @@
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -209,17 +209,31 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
     if not isinstance(question, str) or not question.strip():
         return None
 
-    if spec.answer_mode != "boolq":
-        raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
+    if spec.answer_mode == "boolq":
+        answer_value = example.get("answer", None)
+        if not isinstance(answer_value, bool):
+            return None
 
-    answer_value = example.get("answer", None)
-    if not isinstance(answer_value, bool):
-        return None
+        return {
+            "question": question.strip(),
+            "answer": "yes" if answer_value else "no",
+        }
 
-    return {
-        "question": question.strip(),
-        "answer": "yes" if answer_value else "no",
-    }
+    if spec.answer_mode == "pubmed_qa":
+        answer_value = example.get("final_decision", None)
+        if not isinstance(answer_value, str):
+            return None
+
+        normalized_answer = answer_value.strip().lower()
+        if normalized_answer not in {"yes", "no", "maybe"}:
+            return None
+
+        return {
+            "question": question.strip(),
+            "answer": normalized_answer,
+        }
+
+    raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
 
 def format_question_prefix(question: str) -> str:
@@ -242,12 +256,20 @@ def prepare_question_prefix(tokenizer, question: str, device: str) -> Dict[str, 
     }
 
 
-def build_boolq_choice_token_ids(tokenizer) -> Dict[str, torch.Tensor]:
+def get_choice_labels(answer_mode: str) -> List[str]:
+    if answer_mode == "boolq":
+        return ["yes", "no"]
+    if answer_mode == "pubmed_qa":
+        return ["yes", "no", "maybe"]
+    raise ValueError(f"Unsupported answer_mode: {answer_mode}")
+
+
+def build_choice_token_ids(tokenizer, choice_labels: List[str]) -> Dict[str, torch.Tensor]:
     choice_token_ids = {}
-    for label in ("yes", "no"):
+    for label in choice_labels:
         token_ids = tokenizer(f" {label}", add_special_tokens=False).input_ids
         if len(token_ids) < 1:
-            raise ValueError(f"Failed to tokenize BoolQ label: {label}")
+            raise ValueError(f"Failed to tokenize answer label: {label}")
         choice_token_ids[label] = torch.tensor(token_ids, dtype=torch.long)
     return choice_token_ids
 
@@ -276,30 +298,32 @@ def score_candidate_logprob(
     return token_log_probs.sum(dim=1).item()
 
 
-def score_boolq_choices(
+def score_answer_choices(
     model,
     past_key_values,
     seed_token: torch.Tensor,
-    boolq_choice_token_ids: Dict[str, torch.Tensor],
+    choice_token_ids: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
     return {
-        "yes": score_candidate_logprob(
+        label: score_candidate_logprob(
             model=model,
             past_key_values=past_key_values,
             seed_token=seed_token,
-            candidate_token_ids=boolq_choice_token_ids["yes"],
-        ),
-        "no": score_candidate_logprob(
-            model=model,
-            past_key_values=past_key_values,
-            seed_token=seed_token,
-            candidate_token_ids=boolq_choice_token_ids["no"],
-        ),
+            candidate_token_ids=choice_token_ids[label],
+        )
+        for label in choice_token_ids
     }
 
 
-def predict_boolq_label(choice_scores: Dict[str, float]) -> str:
-    return "yes" if choice_scores["yes"] >= choice_scores["no"] else "no"
+def predict_answer_label(choice_scores: Dict[str, float]) -> str:
+    return max(choice_scores.items(), key=lambda item: item[1])[0]
+
+
+def format_choice_scores(choice_scores: Dict[str, float]) -> str:
+    return " | ".join(
+        f"{label}={score:.6f}"
+        for label, score in choice_scores.items()
+    )
 
 
 def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str, Dict[str, float]]:
@@ -419,7 +443,8 @@ def evaluate_dataset(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
-    boolq_choice_token_ids = build_boolq_choice_token_ids(tokenizer)
+    choice_labels = get_choice_labels(spec.answer_mode)
+    choice_token_ids = build_choice_token_ids(tokenizer, choice_labels)
 
     path_metrics = {
         direction: RunningAverage()
@@ -480,21 +505,21 @@ def evaluate_dataset(
                     translated_top_past_key_values=translated_top_past,
                 )
 
-                translated_scores = score_boolq_choices(
+                translated_scores = score_answer_choices(
                     model=context["target_model"],
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
-                    boolq_choice_token_ids=boolq_choice_token_ids,
+                    choice_token_ids=choice_token_ids,
                 )
-                native_scores = score_boolq_choices(
+                native_scores = score_answer_choices(
                     model=context["target_model"],
                     past_key_values=context["target_full_past"],
                     seed_token=seed_token,
-                    boolq_choice_token_ids=boolq_choice_token_ids,
+                    choice_token_ids=choice_token_ids,
                 )
 
-                translated_pred = predict_boolq_label(translated_scores)
-                native_pred = predict_boolq_label(native_scores)
+                translated_pred = predict_answer_label(translated_scores)
+                native_pred = predict_answer_label(native_scores)
 
                 acc = 1.0 if translated_pred == gold_answer else 0.0
                 native_acc = 1.0 if native_pred == gold_answer else 0.0
@@ -566,7 +591,7 @@ def log_overall_result(
 
 
 @torch.inference_mode()
-def log_boolq_score_samples(
+def log_qa_score_samples(
     spec: HFDatasetSpec,
     tokenizer,
     train_config,
@@ -585,9 +610,10 @@ def log_boolq_score_samples(
         spec=spec,
         eval_config=eval_config,
     )
-    boolq_choice_token_ids = build_boolq_choice_token_ids(tokenizer)
+    choice_labels = get_choice_labels(spec.answer_mode)
+    choice_token_ids = build_choice_token_ids(tokenizer, choice_labels)
 
-    logger.info("===== SAMPLE BOOLQ SCORES: %s =====", spec.name_for_log)
+    logger.info("===== SAMPLE QA SCORES: %s =====", spec.name_for_log)
 
     sample_idx = 0
     for batch in sample_dataloader:
@@ -645,36 +671,34 @@ def log_boolq_score_samples(
                 translated_top_past_key_values=translated_top_past,
             )
 
-            translated_scores = score_boolq_choices(
+            translated_scores = score_answer_choices(
                 model=context["target_model"],
                 past_key_values=mixed_target_past,
                 seed_token=seed_token,
-                boolq_choice_token_ids=boolq_choice_token_ids,
+                choice_token_ids=choice_token_ids,
             )
-            native_scores = score_boolq_choices(
+            native_scores = score_answer_choices(
                 model=context["target_model"],
                 past_key_values=context["target_full_past"],
                 seed_token=seed_token,
-                boolq_choice_token_ids=boolq_choice_token_ids,
+                choice_token_ids=choice_token_ids,
             )
 
-            translated_pred = predict_boolq_label(translated_scores)
-            native_pred = predict_boolq_label(native_scores)
+            translated_pred = predict_answer_label(translated_scores)
+            native_pred = predict_answer_label(native_scores)
             pretty_name = build_direction_pretty_name(direction, train_config.model_a_id, train_config.model_b_id)
 
             logger.info(
-                "%s translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+                "%s translated_scores: %s | pred=%s | correct=%s",
                 pretty_name,
-                translated_scores["yes"],
-                translated_scores["no"],
+                format_choice_scores(translated_scores),
                 translated_pred,
                 translated_pred == gold_answer,
             )
             logger.info(
-                "%s native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+                "%s native_baseline_scores: %s | pred=%s | correct=%s",
                 pretty_name,
-                native_scores["yes"],
-                native_scores["no"],
+                format_choice_scores(native_scores),
                 native_pred,
                 native_pred == gold_answer,
             )
@@ -734,6 +758,15 @@ def main() -> None:
             question_field="question",
             streaming=False,
         ),
+        HFDatasetSpec(
+            name_for_log="PubMedQA/pqa_labeled/train",
+            dataset_path="qiaojin/PubMedQA",
+            dataset_name="pqa_labeled",
+            split="train",
+            answer_mode="pubmed_qa",
+            question_field="question",
+            streaming=False,
+        ),
     ]
 
     all_results = {}
@@ -768,7 +801,7 @@ def main() -> None:
             active_directions=active_directions,
         )
 
-        log_boolq_score_samples(
+        log_qa_score_samples(
             spec=spec,
             tokenizer=tokenizer,
             train_config=train_config,
