@@ -20,17 +20,18 @@ from tqdm.auto import tqdm
 
 from common import (
     TrainConfig,
+    WarmupCosineScheduler,
     build_models_and_tokenizer,
     build_training_dataloader,
     build_translator_pool,
     compute_suffix_lm_loss,
     count_trainable_parameters,
     extract_past_key_values,
+    parse_train_directions,
     replace_top_layers,
     save_checkpoint,
     set_seed,
     split_prefix_and_suffix_for_exact_next_token_loss,
-    WarmupCosineScheduler,
     write_json,
 )
 
@@ -61,6 +62,7 @@ CONFIG = TrainConfig(
     translator_heads=4,
     translator_mlp_ratio=4,
     top_layers_ratio=1.0,
+    train_directions="A_to_B,B_to_A",
     device="cuda" if torch.cuda.is_available() else "cpu",
     dtype="float32",
 )
@@ -99,6 +101,9 @@ def main() -> None:
     logger = setup_logger(log_path)
     logger.info("Starting training")
     logger.info("train_config=%s", CONFIG.__dict__)
+
+    train_directions = parse_train_directions(CONFIG.train_directions)
+    logger.info("train_directions=%s", train_directions)
 
     logger.info("[Setup] device=%s", CONFIG.device)
     logger.info("[Setup] loading models: A=%s, B=%s", CONFIG.model_a_id, CONFIG.model_b_id)
@@ -164,43 +169,48 @@ def main() -> None:
                 past_a = extract_past_key_values(model_a, prefix_cache_ids)
                 past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
-            translated_a_to_b_top = translator_pool.translate_top_layers(
-                past_key_values=past_a,
-                src_name="A",
-                dst_name="B",
-                dst_spec=translated_model_specs["B"],
-            )
-            translated_b_to_a_top = translator_pool.translate_top_layers(
-                past_key_values=past_b,
-                src_name="B",
-                dst_name="A",
-                dst_spec=translated_model_specs["A"],
-            )
+            direction_contexts = {
+                "A_to_B": {
+                    "source_past": past_a,
+                    "source_name": "A",
+                    "target_name": "B",
+                    "target_top_spec": translated_model_specs["B"],
+                    "target_full_past": past_b,
+                    "target_model": model_b,
+                },
+                "B_to_A": {
+                    "source_past": past_b,
+                    "source_name": "B",
+                    "target_name": "A",
+                    "target_top_spec": translated_model_specs["A"],
+                    "target_full_past": past_a,
+                    "target_model": model_a,
+                },
+            }
 
-            mixed_past_for_b = replace_top_layers(
-                base_past_key_values=past_b,
-                translated_top_past_key_values=translated_a_to_b_top,
-            )
-            mixed_past_for_a = replace_top_layers(
-                base_past_key_values=past_a,
-                translated_top_past_key_values=translated_b_to_a_top,
-            )
+            total_direction_loss = 0.0
+            for direction in train_directions:
+                context = direction_contexts[direction]
 
-            loss_a_to_b = compute_suffix_lm_loss(
-                target_model=model_b,
-                past_key_values=mixed_past_for_b,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            )
-            loss_b_to_a = compute_suffix_lm_loss(
-                target_model=model_a,
-                past_key_values=mixed_past_for_a,
-                lm_input_ids=lm_input_ids,
-                lm_labels=lm_labels,
-            )
+                translated_top_past = translator_pool.translate_top_layers(
+                    past_key_values=context["source_past"],
+                    src_name=context["source_name"],
+                    dst_name=context["target_name"],
+                    dst_spec=context["target_top_spec"],
+                )
+                mixed_target_past = replace_top_layers(
+                    base_past_key_values=context["target_full_past"],
+                    translated_top_past_key_values=translated_top_past,
+                )
+                direction_loss = compute_suffix_lm_loss(
+                    target_model=context["target_model"],
+                    past_key_values=mixed_target_past,
+                    lm_input_ids=lm_input_ids,
+                    lm_labels=lm_labels,
+                )
+                total_direction_loss = total_direction_loss + direction_loss
 
-            loss = loss_a_to_b + loss_b_to_a
-            loss = loss / CONFIG.grad_accum_steps
+            loss = total_direction_loss / CONFIG.grad_accum_steps
             loss.backward()
             step_loss_value += loss.item()
 
@@ -216,10 +226,11 @@ def main() -> None:
                 lr=f"{scheduler.lr:.2e}",
             )
             logger.info(
-                "[Step %04d] total_bidirectional_suffix_lm_loss=%.4f | lr=%.2e",
+                "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | train_directions=%s",
                 step,
                 avg_loss,
                 scheduler.lr,
+                ",".join(train_directions),
             )
             running_loss = 0.0
 
@@ -233,10 +244,11 @@ def main() -> None:
         #         train_config=CONFIG,
         #         step=step,
         #         extra={
-        #             "note": "Toy checkpoint trained with bidirectional suffix LM loss only.",
+        #             "note": "Toy checkpoint trained with suffix LM loss only.",
         #             "model_a": CONFIG.model_a_id,
         #             "model_b": CONFIG.model_b_id,
         #             "top_layers_ratio": CONFIG.top_layers_ratio,
+        #             "train_directions": CONFIG.train_directions,
         #         },
         #     )
         #     logger.info("[Checkpoint] saved to %s", checkpoint_path)
@@ -250,10 +262,11 @@ def main() -> None:
         train_config=CONFIG,
         step=CONFIG.max_steps,
         extra={
-            "note": "Final toy checkpoint trained with bidirectional suffix LM loss only.",
+            "note": "Final toy checkpoint trained with suffix LM loss only.",
             "model_a": CONFIG.model_a_id,
             "model_b": CONFIG.model_b_id,
             "top_layers_ratio": CONFIG.top_layers_ratio,
+            "train_directions": CONFIG.train_directions,
         },
     )
     logger.info("[Done] final checkpoint saved to %s", final_path)

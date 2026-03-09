@@ -40,6 +40,7 @@ class TrainConfig:
     translator_heads: int = 4
     translator_mlp_ratio: int = 2
     top_layers_ratio: float = 1.0
+    train_directions: str = "A_to_B,B_to_A"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float32"
 
@@ -79,6 +80,26 @@ def get_torch_dtype(dtype_name: str) -> torch.dtype:
     if key not in mapping:
         raise ValueError(f"Unsupported dtype: {dtype_name}")
     return mapping[key]
+
+
+def parse_train_directions(train_directions: str) -> List[str]:
+    allowed = {"A_to_B", "B_to_A"}
+    parsed = [item.strip() for item in train_directions.split(",") if item.strip()]
+    if not parsed:
+        raise ValueError("train_directions must contain at least one direction.")
+
+    deduped = []
+    seen = set()
+    for item in parsed:
+        if item not in allowed:
+            raise ValueError(
+                f"Unsupported train direction: {item}. "
+                f"Allowed values are: {sorted(allowed)}"
+            )
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
 
 
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:

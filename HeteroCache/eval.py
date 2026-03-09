@@ -1,4 +1,3 @@
-# eval.py
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,7 +20,7 @@ from common import (
 
 @dataclass
 class EvalConfig:
-    checkpoint_path: str = "./outputs/lsc_toy_topn/final_checkpoint.pt"
+    checkpoint_path: str = "./outputs/lsc_toy/final_checkpoint.pt"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # evaluation sampling
@@ -341,11 +340,12 @@ def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str,
 
 def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
     overall = {
+        "A_to_B": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0},
         "B_to_A": {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0},
     }
 
     for dataset_result in all_results.values():
-        for key in ("B_to_A",):
+        for key in ("A_to_B", "B_to_A"):
             row = dataset_result[key]
             count = int(row["count"])
             overall[key]["cosine_sum"] += float(row["cosine"]) * count
@@ -359,7 +359,7 @@ def summarize_overall_results(all_results: Dict[str, Dict[str, Dict[str, float]]
     total_native_accuracy_sum = 0.0
     total_count = 0
 
-    for key in ("B_to_A",):
+    for key in ("A_to_B", "B_to_A"):
         count = overall[key]["count"]
         if count == 0:
             summarized[key] = {
@@ -407,6 +407,7 @@ def evaluate_dataset(
     train_config,
     translator_pool,
     model_specs,
+    translated_model_specs,
     model_a,
     model_b,
     logger: logging.Logger,
@@ -415,6 +416,7 @@ def evaluate_dataset(
     boolq_choice_token_ids = build_boolq_choice_token_ids(tokenizer)
 
     path_metrics = {
+        "A_to_B": RunningAverage(),
         "B_to_A": RunningAverage(),
     }
 
@@ -432,25 +434,46 @@ def evaluate_dataset(
             past_a = extract_past_key_values(model_a, prefix_cache_ids)
             past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
+            translated_a_to_b_top = translator_pool.translate_top_layers(
+                past_key_values=past_a,
+                src_name="A",
+                dst_name="B",
+                dst_spec=translated_model_specs["B"],
+            )
             translated_b_to_a_top = translator_pool.translate_top_layers(
                 past_key_values=past_b,
                 src_name="B",
                 dst_name="A",
-                dst_spec=model_specs["A"],
+                dst_spec=translated_model_specs["A"],
             )
 
+            target_top_b = slice_top_layers(
+                past_key_values=past_b,
+                top_layers_to_translate=translated_model_specs["B"].num_layers,
+            )
             target_top_a = slice_top_layers(
                 past_key_values=past_a,
-                top_layers_to_translate=train_config.top_layers_to_translate,
+                top_layers_to_translate=translated_model_specs["A"].num_layers,
             )
 
+            cosine_a_to_b = cosine_similarity_between_past(translated_a_to_b_top, target_top_b)
             cosine_b_to_a = cosine_similarity_between_past(translated_b_to_a_top, target_top_a)
 
+            mixed_past_for_b = replace_top_layers(
+                base_past_key_values=past_b,
+                translated_top_past_key_values=translated_a_to_b_top,
+            )
             mixed_past_for_a = replace_top_layers(
                 base_past_key_values=past_a,
                 translated_top_past_key_values=translated_b_to_a_top,
             )
 
+            translated_scores_b = score_boolq_choices(
+                model=model_b,
+                past_key_values=mixed_past_for_b,
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
             translated_scores_a = score_boolq_choices(
                 model=model_a,
                 past_key_values=mixed_past_for_a,
@@ -458,6 +481,12 @@ def evaluate_dataset(
                 boolq_choice_token_ids=boolq_choice_token_ids,
             )
 
+            native_scores_b = score_boolq_choices(
+                model=model_b,
+                past_key_values=past_b,
+                seed_token=seed_token,
+                boolq_choice_token_ids=boolq_choice_token_ids,
+            )
             native_scores_a = score_boolq_choices(
                 model=model_a,
                 past_key_values=past_a,
@@ -465,12 +494,17 @@ def evaluate_dataset(
                 boolq_choice_token_ids=boolq_choice_token_ids,
             )
 
+            translated_pred_b = predict_boolq_label(translated_scores_b)
             translated_pred_a = predict_boolq_label(translated_scores_a)
+            native_pred_b = predict_boolq_label(native_scores_b)
             native_pred_a = predict_boolq_label(native_scores_a)
 
+            acc_a_to_b = 1.0 if translated_pred_b == gold_answer else 0.0
             acc_b_to_a = 1.0 if translated_pred_a == gold_answer else 0.0
+            native_acc_b = 1.0 if native_pred_b == gold_answer else 0.0
             native_acc_a = 1.0 if native_pred_a == gold_answer else 0.0
 
+            path_metrics["A_to_B"].update(cosine_a_to_b, acc_a_to_b, native_acc_b, 1)
             path_metrics["B_to_A"].update(cosine_b_to_a, acc_b_to_a, native_acc_a, 1)
 
             processed_examples += 1
@@ -494,12 +528,13 @@ def log_dataset_result(
     model_b_id: str,
 ) -> None:
     pretty_names = {
+        "A_to_B": f"A_to_B ({model_a_id} -> {model_b_id})",
         "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
-        "AVG": "AVG (weighted over evaluated paths)",
+        "AVG": "AVG (weighted over both paths)",
     }
 
     logger.info("===== %s =====", dataset_name)
-    for key in ("B_to_A", "AVG"):
+    for key in ("A_to_B", "B_to_A", "AVG"):
         row = results[key]
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
@@ -518,12 +553,13 @@ def log_overall_result(
     model_b_id: str,
 ) -> None:
     pretty_names = {
+        "A_to_B": f"A_to_B ({model_a_id} -> {model_b_id})",
         "B_to_A": f"B_to_A ({model_b_id} -> {model_a_id})",
-        "AVG": "AVG (weighted over all datasets and evaluated paths)",
+        "AVG": "AVG (weighted over all datasets and both paths)",
     }
 
     logger.info("===== OVERALL AVERAGE ACROSS DATASETS =====")
-    for key in ("B_to_A", "AVG"):
+    for key in ("A_to_B", "B_to_A", "AVG"):
         row = results[key]
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
@@ -543,6 +579,7 @@ def log_boolq_score_samples(
     eval_config: EvalConfig,
     translator_pool,
     model_specs,
+    translated_model_specs,
     model_a,
     model_b,
     logger: logging.Logger,
@@ -572,18 +609,34 @@ def log_boolq_score_samples(
         past_a = extract_past_key_values(model_a, prefix_cache_ids)
         past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
+        translated_a_to_b_top = translator_pool.translate_top_layers(
+            past_key_values=past_a,
+            src_name="A",
+            dst_name="B",
+            dst_spec=translated_model_specs["B"],
+        )
         translated_b_to_a_top = translator_pool.translate_top_layers(
             past_key_values=past_b,
             src_name="B",
             dst_name="A",
-            dst_spec=model_specs["A"],
+            dst_spec=translated_model_specs["A"],
         )
 
+        mixed_past_for_b = replace_top_layers(
+            base_past_key_values=past_b,
+            translated_top_past_key_values=translated_a_to_b_top,
+        )
         mixed_past_for_a = replace_top_layers(
             base_past_key_values=past_a,
             translated_top_past_key_values=translated_b_to_a_top,
         )
 
+        translated_scores_b = score_boolq_choices(
+            model=model_b,
+            past_key_values=mixed_past_for_b,
+            seed_token=seed_token,
+            boolq_choice_token_ids=boolq_choice_token_ids,
+        )
         translated_scores_a = score_boolq_choices(
             model=model_a,
             past_key_values=mixed_past_for_a,
@@ -591,6 +644,12 @@ def log_boolq_score_samples(
             boolq_choice_token_ids=boolq_choice_token_ids,
         )
 
+        native_scores_b = score_boolq_choices(
+            model=model_b,
+            past_key_values=past_b,
+            seed_token=seed_token,
+            boolq_choice_token_ids=boolq_choice_token_ids,
+        )
         native_scores_a = score_boolq_choices(
             model=model_a,
             past_key_values=past_a,
@@ -598,7 +657,9 @@ def log_boolq_score_samples(
             boolq_choice_token_ids=boolq_choice_token_ids,
         )
 
+        translated_pred_b = predict_boolq_label(translated_scores_b)
         translated_pred_a = predict_boolq_label(translated_scores_a)
+        native_pred_b = predict_boolq_label(native_scores_b)
         native_pred_a = predict_boolq_label(native_scores_a)
 
         logger.info(
@@ -609,6 +670,20 @@ def log_boolq_score_samples(
         )
         logger.info("prefix(question):\n%s", prefix_text)
         logger.info("gold_answer: %s", gold_answer)
+        logger.info(
+            "A_to_B translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+            translated_scores_b["yes"],
+            translated_scores_b["no"],
+            translated_pred_b,
+            translated_pred_b == gold_answer,
+        )
+        logger.info(
+            "A_to_B native_baseline_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
+            native_scores_b["yes"],
+            native_scores_b["no"],
+            native_pred_b,
+            native_pred_b == gold_answer,
+        )
         logger.info(
             "B_to_A translated_scores: yes=%.6f | no=%.6f | pred=%s | correct=%s",
             translated_scores_a["yes"],
@@ -643,7 +718,15 @@ def main() -> None:
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
 
-    train_config, translator_pool, model_specs, model_a, model_b, tokenizer = load_translator_pool_from_checkpoint(
+    (
+        train_config,
+        translator_pool,
+        model_specs,
+        translated_model_specs,
+        model_a,
+        model_b,
+        tokenizer,
+    ) = load_translator_pool_from_checkpoint(
         checkpoint_path=str(checkpoint_path),
         device_override=eval_config.device,
     )
@@ -655,7 +738,15 @@ def main() -> None:
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("model_A=%s", train_config.model_a_id)
     logger.info("model_B=%s", train_config.model_b_id)
-    logger.info("top_layers_to_translate=%d", train_config.top_layers_to_translate)
+    logger.info("top_layers_ratio=%.6f", train_config.top_layers_ratio)
+    logger.info(
+        "translated_layers: A_top=%d/%d | B_top=%d/%d",
+        translated_model_specs["A"].num_layers,
+        model_specs["A"].num_layers,
+        translated_model_specs["B"].num_layers,
+        model_specs["B"].num_layers,
+    )
+    logger.info("translation_mode=replace_top_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
 
     dataset_specs = [
@@ -686,6 +777,7 @@ def main() -> None:
             train_config=train_config,
             translator_pool=translator_pool,
             model_specs=model_specs,
+            translated_model_specs=translated_model_specs,
             model_a=model_a,
             model_b=model_b,
             logger=logger,
@@ -707,6 +799,7 @@ def main() -> None:
             eval_config=eval_config,
             translator_pool=translator_pool,
             model_specs=model_specs,
+            translated_model_specs=translated_model_specs,
             model_a=model_a,
             model_b=model_b,
             logger=logger,
@@ -718,9 +811,13 @@ def main() -> None:
     logger.info("===== FINAL SUMMARY =====")
     for dataset_name, result in all_results.items():
         logger.info(
-            "%s | B_to_A(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
+            "%s | A_to_B(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
+            "B_to_A(cos=%.6f, acc=%.6f, native_acc=%.6f) | "
             "AVG(cos=%.6f, acc=%.6f, native_acc=%.6f)",
             dataset_name,
+            result["A_to_B"]["cosine"],
+            result["A_to_B"]["accuracy"],
+            result["A_to_B"]["native_accuracy"],
             result["B_to_A"]["cosine"],
             result["B_to_A"]["accuracy"],
             result["B_to_A"]["native_accuracy"],
