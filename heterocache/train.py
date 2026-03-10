@@ -380,6 +380,8 @@ def run_train(config: TrainConfig) -> Path:
         total_steps=config.max_steps,
     )
 
+    gpu_memory_tracker = GPUMemoryTracker(config.device)
+
     running_loss = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
@@ -446,6 +448,7 @@ def run_train(config: TrainConfig) -> Path:
         torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
+        gpu_memory_tracker.update()
 
         running_loss += step_loss_value
         if step % config.log_every == 0:
@@ -454,12 +457,14 @@ def run_train(config: TrainConfig) -> Path:
                 loss=f"{avg_loss:.4f}",
                 lr=f"{scheduler.lr:.2e}",
             )
+            gpu_memory = gpu_memory_tracker.summary()
             logger.info(
-                "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | train_directions=%s",
+                "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
                 scheduler.lr,
-                ",".join(train_directions),
+                gpu_memory["avg_allocated_pretty"],
+                gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
 
@@ -478,6 +483,13 @@ def run_train(config: TrainConfig) -> Path:
             "top_layers_to_translate": config.top_layers_to_translate,
             "train_directions": config.train_directions,
         },
+    )
+    final_gpu_memory = gpu_memory_tracker.summary()
+    logger.info(
+        "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
+        final_gpu_memory["avg_allocated_pretty"],
+        final_gpu_memory["peak_allocated_pretty"],
+        final_gpu_memory["num_samples"],
     )
     logger.info("[Done] final checkpoint saved to %s", final_path)
     logger.info("Saved train log to %s", log_path)

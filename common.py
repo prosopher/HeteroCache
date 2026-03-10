@@ -392,6 +392,65 @@ def count_trainable_parameters(module: nn.Module) -> int:
     return sum(param.numel() for param in module.parameters() if param.requires_grad)
 
 
+def format_memory_gib(num_bytes: float) -> str:
+    gib = float(num_bytes) / (1024 ** 3)
+    return f"{gib:.2f} GiB"
+
+
+class GPUMemoryTracker:
+    def __init__(self, device: str) -> None:
+        self.device = device
+        self.enabled = torch.cuda.is_available() and str(device).startswith("cuda")
+        self.total_allocated_bytes = 0.0
+        self.num_samples = 0
+        self.peak_allocated_bytes = 0
+
+        if self.enabled:
+            self.device_index = torch.device(device).index
+            if self.device_index is None:
+                self.device_index = torch.cuda.current_device()
+            torch.cuda.reset_peak_memory_stats(self.device_index)
+        else:
+            self.device_index = None
+
+    def update(self) -> None:
+        if not self.enabled:
+            return
+
+        allocated = torch.cuda.memory_allocated(self.device_index)
+        peak = torch.cuda.max_memory_allocated(self.device_index)
+
+        self.total_allocated_bytes += float(allocated)
+        self.num_samples += 1
+        self.peak_allocated_bytes = max(self.peak_allocated_bytes, int(peak))
+
+    @property
+    def avg_allocated_bytes(self) -> float:
+        if self.num_samples == 0:
+            return 0.0
+        return self.total_allocated_bytes / self.num_samples
+
+    def summary(self) -> Dict[str, object]:
+        if not self.enabled:
+            return {
+                "enabled": False,
+                "avg_allocated_bytes": None,
+                "peak_allocated_bytes": None,
+                "avg_allocated_pretty": "N/A",
+                "peak_allocated_pretty": "N/A",
+                "num_samples": 0,
+            }
+
+        return {
+            "enabled": True,
+            "avg_allocated_bytes": self.avg_allocated_bytes,
+            "peak_allocated_bytes": self.peak_allocated_bytes,
+            "avg_allocated_pretty": format_memory_gib(self.avg_allocated_bytes),
+            "peak_allocated_pretty": format_memory_gib(self.peak_allocated_bytes),
+            "num_samples": self.num_samples,
+        }
+
+
 def move_past_to_device(past_key_values: PastKeyValues, device: str) -> PastKeyValues:
     moved = []
     for key, value in past_key_values:
