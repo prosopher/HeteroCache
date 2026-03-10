@@ -1,33 +1,32 @@
 import argparse
+import importlib
 from pathlib import Path
 
-from common import build_timestamped_output_dir
-from heterocache.train import TrainConfig as HeteroCacheTrainConfig
-from heterocache.train import CONFIG as HETEROCACHE_CONFIG
-from heterocache.train import run_train as run_heterocache_train
-from lsc.train import TrainConfig as LSCTrainConfig
-from lsc.train import CONFIG as LSC_CONFIG
-from lsc.train import run_train as run_lsc_train
+
+def load_train_module(alg: str):
+    module_name = f"{alg}.train"
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            raise SystemExit(f"Unsupported alg: {alg}") from exc
+        raise
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("alg", choices=["heterocache", "lsc"])
+    parser.add_argument("alg")
     parser.add_argument("--output-root", default="outputs")
     args = parser.parse_args()
 
-    output_dir = build_timestamped_output_dir(args.alg, output_root=args.output_root)
+    train_module = load_train_module(args.alg)
+    config = train_module.TrainConfig(
+        alg=args.alg,
+        output_root=args.output_root,
+    )
+    final_checkpoint = Path(train_module.run_train(config))
 
-    if args.alg == "heterocache":
-        config = HeteroCacheTrainConfig(**HETEROCACHE_CONFIG.__dict__)
-        config.output_dir = str(output_dir)
-        final_checkpoint = run_heterocache_train(config)
-    else:
-        config = LSCTrainConfig(**LSC_CONFIG.__dict__)
-        config.output_dir = str(output_dir)
-        final_checkpoint = run_lsc_train(config)
-
-    print(f"Saved outputs to {Path(final_checkpoint).parent}")
+    print(f"Saved outputs to {final_checkpoint.parent}")
     print(f"Final checkpoint: {final_checkpoint}")
 
 

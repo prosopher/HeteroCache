@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,9 +12,16 @@ from common import *
 
 @dataclass
 class TrainConfig:
+    alg: str = ""
+    output_root: str = "outputs"
+    timestamp: Optional[str] = None
+    output_dir: Optional[str] = None
+    config_path: Optional[str] = None
+    log_path: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+
     model_a_id: str = "gpt2"
     model_b_id: str = "gpt2-medium"
-    output_dir: str = "./outputs/lsc_toy"
     max_steps: int = 500
     batch_size: int = 1
     grad_accum_steps: int = 16
@@ -35,6 +42,9 @@ class TrainConfig:
     train_directions: str = "B_to_A"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "float32"
+
+    def __post_init__(self) -> None:
+        initialize_train_output_paths(self)
 
 
 class SelfAttentionBlock(nn.Module):
@@ -313,45 +323,24 @@ def load_translator_pool_from_checkpoint(
     return config, translator_pool, model_specs, model_a, model_b, tokenizer
 
 
-CONFIG = TrainConfig(
-    model_a_id="gpt2",
-    model_b_id="gpt2-medium",
-    output_dir="./outputs/lsc_toy",
-    max_steps=10_000,
-    batch_size=1,
-    grad_accum_steps=16,
-    total_tokens=128,
-    prefix_tokens=64,
-    learning_rate=1e-4,
-    weight_decay=1e-2,
-    warmup_steps=500,
-    grad_clip_norm=1.0,
-    log_every=25,
-    seed=42,
-    shuffle_buffer=50_000,
-    top_layers_to_translate=6,
-    translator_dim=1024,
-    translator_heads=16,
-    translator_depth=2,
-    translator_mlp_ratio=4,
-    train_directions="B_to_A",
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    dtype="float32",
-)
-
-
-def run_train(config: Optional[TrainConfig] = None) -> Path:
-    config = TrainConfig(**(CONFIG.__dict__ if config is None else config.__dict__))
+def run_train(config: TrainConfig) -> Path:
+    if (
+        config.output_dir is None
+        or config.config_path is None
+        or config.log_path is None
+        or config.checkpoint_path is None
+    ):
+        raise ValueError("TrainConfig paths must be initialized before run_train.")
 
     set_seed(config.seed)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "train_config.json", config.__dict__)
+    write_json(config.config_path, asdict(config))
 
-    log_path = output_dir / "train.log"
-    logger = setup_logger("heterocache_train", log_path)
+    log_path = Path(config.log_path)
+    logger = setup_logger(f"{config.alg}_train", log_path)
     logger.info("Starting training")
-    logger.info("train_config=%s", config.__dict__)
+    logger.info("train_config=%s", asdict(config))
 
     train_directions = parse_train_directions(config.train_directions)
     logger.info("train_directions=%s", train_directions)
@@ -474,7 +463,7 @@ def run_train(config: Optional[TrainConfig] = None) -> Path:
             )
             running_loss = 0.0
 
-    final_path = output_dir / "final_checkpoint.pt"
+    final_path = Path(config.checkpoint_path)
     save_checkpoint(
         output_path=str(final_path),
         translator_pool=translator_pool,
@@ -483,7 +472,7 @@ def run_train(config: Optional[TrainConfig] = None) -> Path:
         train_config=config,
         step=config.max_steps,
         extra={
-            "note": "Final toy checkpoint trained with suffix LM loss only.",
+            "note": "Final checkpoint trained with suffix LM loss only.",
             "model_a": config.model_a_id,
             "model_b": config.model_b_id,
             "top_layers_to_translate": config.top_layers_to_translate,

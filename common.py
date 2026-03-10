@@ -52,7 +52,14 @@ class ModelSpec:
 
 @dataclass
 class EvalConfig:
-    checkpoint_path: str = "./outputs/lsc_toy/final_checkpoint.pt"
+    alg: str = ""
+    output_root: str = "outputs"
+    timestamp: Optional[str] = None
+    output_dir: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+    config_path: Optional[str] = None
+    log_filename: str = "eval.log"
+    log_path: Optional[str] = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # evaluation sampling
@@ -68,7 +75,8 @@ class EvalConfig:
     # score sanity-check samples
     num_generation_samples_per_dataset: int = 2
 
-    log_filename: str = "eval.log"
+    def __post_init__(self) -> None:
+        initialize_eval_output_paths(self)
 
 
 @dataclass
@@ -244,7 +252,7 @@ def get_model_spec(model: PreTrainedModel) -> ModelSpec:
     hidden_size = getattr(config, "n_embd", None)
     num_layers = getattr(config, "n_layer", None)
     if num_heads is None or hidden_size is None or num_layers is None:
-        raise ValueError("This toy example expects GPT-2 style configs with n_head/n_embd/n_layer.")
+        raise ValueError("This example expects GPT-2 style configs with n_head/n_embd/n_layer.")
     if hidden_size % num_heads != 0:
         raise ValueError("hidden_size must be divisible by num_heads.")
     return ModelSpec(
@@ -261,7 +269,7 @@ class OpenWebTextSequenceStream(IterableDataset):
     Streams OpenWebText and yields fixed-length token chunks.
 
     This behaves like a rolling token buffer, which is usually a better fit for
-    language-model style toy experiments than per-document truncation.
+    language-model experiments than per-document truncation.
     """
 
     def __init__(
@@ -525,6 +533,76 @@ def build_timestamped_output_dir(
 ) -> Path:
     run_timestamp = timestamp or build_timestamp_string()
     return Path(output_root) / f"{alg}_{run_timestamp}"
+
+
+def initialize_train_output_paths(
+    config,
+    config_filename: str = "train_config.json",
+    log_filename: str = "train.log",
+    checkpoint_filename: str = "final_checkpoint.pt",
+) -> None:
+    alg = getattr(config, "alg", "")
+    output_dir = getattr(config, "output_dir", None)
+    output_root = getattr(config, "output_root", "outputs")
+    timestamp = getattr(config, "timestamp", None)
+
+    if output_dir is None:
+        if not alg:
+            return
+        if timestamp is None:
+            timestamp = build_timestamp_string()
+            setattr(config, "timestamp", timestamp)
+        output_dir_path = build_timestamped_output_dir(
+            alg=alg,
+            output_root=output_root,
+            timestamp=timestamp,
+        )
+    else:
+        output_dir_path = Path(output_dir)
+
+    setattr(config, "output_dir", str(output_dir_path))
+
+    if getattr(config, "config_path", None) is None:
+        setattr(config, "config_path", str(output_dir_path / config_filename))
+    if getattr(config, "log_path", None) is None:
+        setattr(config, "log_path", str(output_dir_path / log_filename))
+    if getattr(config, "checkpoint_path", None) is None:
+        setattr(config, "checkpoint_path", str(output_dir_path / checkpoint_filename))
+
+
+def initialize_eval_output_paths(
+    config,
+    config_filename: str = "eval_config.json",
+) -> None:
+    output_dir = getattr(config, "output_dir", None)
+    checkpoint_path = getattr(config, "checkpoint_path", None)
+
+    if output_dir is None:
+        if checkpoint_path is not None:
+            output_dir_path = Path(checkpoint_path).parent
+        else:
+            alg = getattr(config, "alg", "")
+            if not alg:
+                return
+            output_root = getattr(config, "output_root", "outputs")
+            timestamp = getattr(config, "timestamp", None)
+            if timestamp is None:
+                timestamp = build_timestamp_string()
+                setattr(config, "timestamp", timestamp)
+            output_dir_path = build_timestamped_output_dir(
+                alg=alg,
+                output_root=output_root,
+                timestamp=timestamp,
+            )
+    else:
+        output_dir_path = Path(output_dir)
+
+    setattr(config, "output_dir", str(output_dir_path))
+
+    if getattr(config, "config_path", None) is None:
+        setattr(config, "config_path", str(output_dir_path / config_filename))
+    if getattr(config, "log_path", None) is None:
+        setattr(config, "log_path", str(output_dir_path / getattr(config, "log_filename", "eval.log")))
 
 
 def resolve_latest_checkpoint_for_alg(

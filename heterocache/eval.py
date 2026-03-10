@@ -1,15 +1,12 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 from torch.utils.data import DataLoader
 
 from common import *
 from heterocache.train import load_translator_pool_from_checkpoint
-
-
-CONFIG = EvalConfig()
 
 
 @torch.inference_mode()
@@ -241,18 +238,20 @@ def log_qa_score_samples(
             break
 
 
-def run_eval(eval_config: Optional[EvalConfig] = None) -> Path:
-    eval_config = EvalConfig(**(CONFIG.__dict__ if eval_config is None else eval_config.__dict__))
+def run_eval(eval_config: EvalConfig) -> Path:
+    if eval_config.checkpoint_path is None:
+        raise ValueError("EvalConfig.checkpoint_path must be set before run_eval.")
+
     set_seed(eval_config.seed)
 
     checkpoint_path = Path(eval_config.checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    write_json(checkpoint_path.parent / "eval_config.json", asdict(eval_config))
+    write_json(eval_config.config_path, asdict(eval_config))
 
-    log_path = checkpoint_path.parent / eval_config.log_filename
-    logger = setup_logger("heterocache_eval", log_path)
+    log_path = Path(eval_config.log_path)
+    logger = setup_logger(f"{eval_config.alg}_eval", log_path)
     logger.info("Starting evaluation")
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
