@@ -1,7 +1,12 @@
 import argparse
 import importlib
 
-from common import EvalConfig, add_dataclass_arguments, extract_dataclass_kwargs_from_namespace
+from common import (
+    EvalConfig,
+    add_dataclass_arguments,
+    extract_dataclass_kwargs_from_namespace,
+    resolve_latest_checkpoint_for_alg,
+)
 
 
 def load_eval_module(alg: str):
@@ -34,6 +39,13 @@ def main() -> None:
         args,
         exclude_fields={"alg"},
     )
+
+    if "checkpoint_path" not in eval_config_kwargs or eval_config_kwargs["checkpoint_path"] is None:
+        output_root = eval_config_kwargs.get("output_root", "outputs")
+        eval_config_kwargs["checkpoint_path"] = str(
+            resolve_latest_checkpoint_for_alg(args.alg, output_root=output_root)
+        )
+
     eval_config = EvalConfig(
         alg=args.alg,
         **eval_config_kwargs,
