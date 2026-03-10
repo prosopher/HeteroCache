@@ -1,14 +1,12 @@
-import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Dict, Optional
 
 import torch
 from torch.utils.data import DataLoader
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-
 from common import *
-from train import load_translator_pool_from_checkpoint
+from heterocache.train import load_translator_pool_from_checkpoint
 
 
 CONFIG = EvalConfig()
@@ -20,6 +18,7 @@ def evaluate_dataset(
     dataloader: DataLoader,
     tokenizer,
     train_config,
+    eval_config: EvalConfig,
     translator_pool,
     model_specs,
     model_a,
@@ -118,7 +117,7 @@ def evaluate_dataset(
                 "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
-                CONFIG.max_examples_per_dataset,
+                eval_config.max_examples_per_dataset,
             )
 
     return summarize_path_metrics(path_metrics)
@@ -242,16 +241,18 @@ def log_qa_score_samples(
             break
 
 
-def main() -> None:
-    eval_config = CONFIG
+def run_eval(eval_config: Optional[EvalConfig] = None) -> Path:
+    eval_config = EvalConfig(**(CONFIG.__dict__ if eval_config is None else eval_config.__dict__))
     set_seed(eval_config.seed)
 
     checkpoint_path = Path(eval_config.checkpoint_path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
+    write_json(checkpoint_path.parent / "eval_config.json", asdict(eval_config))
+
     log_path = checkpoint_path.parent / eval_config.log_filename
-    logger = setup_logger("eval", log_path)
+    logger = setup_logger("heterocache_eval", log_path)
     logger.info("Starting evaluation")
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
@@ -317,6 +318,7 @@ def main() -> None:
             dataloader=dataloader,
             tokenizer=tokenizer,
             train_config=train_config,
+            eval_config=eval_config,
             translator_pool=translator_pool,
             model_specs=model_specs,
             model_a=model_a,
@@ -375,7 +377,4 @@ def main() -> None:
     )
 
     logger.info("Done. Saved log to %s", log_path)
-
-
-if __name__ == "__main__":
-    main()
+    return log_path

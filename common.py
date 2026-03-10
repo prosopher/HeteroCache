@@ -3,6 +3,7 @@ import logging
 import math
 import random
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -511,6 +512,37 @@ def write_json(path: str, payload: Dict) -> None:
     path_obj.parent.mkdir(parents=True, exist_ok=True)
     with path_obj.open("w", encoding="utf-8") as fp:
         json.dump(payload, fp, indent=2, ensure_ascii=False)
+
+
+def build_timestamp_string() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def build_timestamped_output_dir(
+    alg: str,
+    output_root: str = "outputs",
+    timestamp: Optional[str] = None,
+) -> Path:
+    run_timestamp = timestamp or build_timestamp_string()
+    return Path(output_root) / f"{alg}_{run_timestamp}"
+
+
+def resolve_latest_checkpoint_for_alg(
+    alg: str,
+    output_root: str = "outputs",
+    checkpoint_name: str = "final_checkpoint.pt",
+) -> Path:
+    output_root_path = Path(output_root)
+    candidates = sorted(
+        path
+        for path in output_root_path.glob(f"{alg}_*")
+        if path.is_dir() and (path / checkpoint_name).exists()
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No checkpoint directories found for alg={alg!r} under {output_root_path}"
+        )
+    return candidates[-1] / checkpoint_name
 
 
 def build_eval_dataloader(

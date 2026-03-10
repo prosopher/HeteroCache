@@ -1,13 +1,11 @@
-import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from common import *
 
@@ -342,24 +340,26 @@ CONFIG = TrainConfig(
 )
 
 
-def main() -> None:
-    set_seed(CONFIG.seed)
-    output_dir = Path(CONFIG.output_dir)
+def run_train(config: Optional[TrainConfig] = None) -> Path:
+    config = TrainConfig(**(CONFIG.__dict__ if config is None else config.__dict__))
+
+    set_seed(config.seed)
+    output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "train_config.json", CONFIG.__dict__)
+    write_json(output_dir / "train_config.json", config.__dict__)
 
     log_path = output_dir / "train.log"
-    logger = setup_logger("train", log_path)
+    logger = setup_logger("heterocache_train", log_path)
     logger.info("Starting training")
-    logger.info("train_config=%s", CONFIG.__dict__)
+    logger.info("train_config=%s", config.__dict__)
 
-    train_directions = parse_train_directions(CONFIG.train_directions)
+    train_directions = parse_train_directions(config.train_directions)
     logger.info("train_directions=%s", train_directions)
 
-    logger.info("[Setup] device=%s", CONFIG.device)
-    logger.info("[Setup] loading models: A=%s, B=%s", CONFIG.model_a_id, CONFIG.model_b_id)
-    model_a, model_b, tokenizer = build_models_and_tokenizer(CONFIG)
-    translator_pool, model_specs = build_translator_pool(model_a, model_b, CONFIG)
+    logger.info("[Setup] device=%s", config.device)
+    logger.info("[Setup] loading models: A=%s, B=%s", config.model_a_id, config.model_b_id)
+    model_a, model_b, tokenizer = build_models_and_tokenizer(config)
+    translator_pool, model_specs = build_translator_pool(model_a, model_b, config)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
@@ -375,34 +375,34 @@ def main() -> None:
         model_specs["B"].hidden_size,
         model_specs["B"].num_heads,
     )
-    logger.info("[Setup] top_layers_to_translate = %d", CONFIG.top_layers_to_translate)
+    logger.info("[Setup] top_layers_to_translate = %d", config.top_layers_to_translate)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
-    dataloader = build_training_dataloader(tokenizer, CONFIG)
+    dataloader = build_training_dataloader(tokenizer, config)
 
     optimizer = torch.optim.AdamW(
         translator_pool.parameters(),
-        lr=CONFIG.learning_rate,
-        weight_decay=CONFIG.weight_decay,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
     scheduler = WarmupCosineScheduler(
         optimizer=optimizer,
-        warmup_steps=CONFIG.warmup_steps,
-        total_steps=CONFIG.max_steps,
+        warmup_steps=config.warmup_steps,
+        total_steps=config.max_steps,
     )
 
     running_loss = 0.0
-    progress_bar = tqdm(range(1, CONFIG.max_steps + 1), desc="Training")
+    progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
     for step in progress_bar:
         optimizer.zero_grad(set_to_none=True)
         step_loss_value = 0.0
 
-        for _ in range(CONFIG.grad_accum_steps):
-            input_ids = next(dataloader).to(CONFIG.device)
+        for _ in range(config.grad_accum_steps):
+            input_ids = next(dataloader).to(config.device)
             prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
                 input_ids=input_ids,
-                prefix_tokens=CONFIG.prefix_tokens,
+                prefix_tokens=config.prefix_tokens,
             )
 
             with torch.no_grad():
@@ -450,17 +450,17 @@ def main() -> None:
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 
-            loss = total_direction_loss / CONFIG.grad_accum_steps
+            loss = total_direction_loss / config.grad_accum_steps
             loss.backward()
             step_loss_value += loss.item()
 
-        torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), CONFIG.grad_clip_norm)
+        torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
 
         running_loss += step_loss_value
-        if step % CONFIG.log_every == 0:
-            avg_loss = running_loss / CONFIG.log_every
+        if step % config.log_every == 0:
+            avg_loss = running_loss / config.log_every
             progress_bar.set_postfix(
                 loss=f"{avg_loss:.4f}",
                 lr=f"{scheduler.lr:.2e}",
@@ -480,19 +480,16 @@ def main() -> None:
         translator_pool=translator_pool,
         optimizer=optimizer,
         scheduler=scheduler,
-        train_config=CONFIG,
-        step=CONFIG.max_steps,
+        train_config=config,
+        step=config.max_steps,
         extra={
             "note": "Final toy checkpoint trained with suffix LM loss only.",
-            "model_a": CONFIG.model_a_id,
-            "model_b": CONFIG.model_b_id,
-            "top_layers_to_translate": CONFIG.top_layers_to_translate,
-            "train_directions": CONFIG.train_directions,
+            "model_a": config.model_a_id,
+            "model_b": config.model_b_id,
+            "top_layers_to_translate": config.top_layers_to_translate,
+            "train_directions": config.train_directions,
         },
     )
     logger.info("[Done] final checkpoint saved to %s", final_path)
     logger.info("Saved train log to %s", log_path)
-
-
-if __name__ == "__main__":
-    main()
+    return final_path
