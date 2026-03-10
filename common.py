@@ -1,11 +1,12 @@
+import argparse
 import json
 import logging
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union, get_args, get_origin
 
 import torch
 import torch.nn as nn
@@ -533,6 +534,82 @@ def build_timestamped_output_dir(
 ) -> Path:
     run_timestamp = timestamp or build_timestamp_string()
     return Path(output_root) / f"{alg}_{run_timestamp}"
+
+
+T = TypeVar("T")
+
+
+def parse_bool_arg(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def _unwrap_optional_type(annotation):
+    origin = get_origin(annotation)
+    if origin is Union:
+        args = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _resolve_argparse_type(annotation):
+    annotation = _unwrap_optional_type(annotation)
+    if annotation is bool:
+        return parse_bool_arg
+    if annotation in {str, int, float}:
+        return annotation
+    return str
+
+
+def add_dataclass_arguments(
+    parser: argparse.ArgumentParser,
+    config_cls: Type[T],
+    exclude_fields: Optional[set[str]] = None,
+) -> None:
+    if not is_dataclass(config_cls):
+        raise TypeError(f"{config_cls} must be a dataclass type.")
+
+    excluded = exclude_fields or set()
+
+    for field_info in fields(config_cls):
+        if field_info.name in excluded:
+            continue
+
+        option_name = f"--{field_info.name.replace('_', '-')}"
+        parser.add_argument(
+            option_name,
+            dest=field_info.name,
+            type=_resolve_argparse_type(field_info.type),
+            default=argparse.SUPPRESS,
+        )
+
+
+def extract_dataclass_kwargs_from_namespace(
+    config_cls: Type[T],
+    args: argparse.Namespace,
+    exclude_fields: Optional[set[str]] = None,
+) -> Dict[str, Any]:
+    if not is_dataclass(config_cls):
+        raise TypeError(f"{config_cls} must be a dataclass type.")
+
+    excluded = exclude_fields or set()
+    kwargs: Dict[str, Any] = {}
+
+    for field_info in fields(config_cls):
+        if field_info.name in excluded:
+            continue
+        if hasattr(args, field_info.name):
+            kwargs[field_info.name] = getattr(args, field_info.name)
+
+    return kwargs
 
 
 def initialize_train_output_paths(

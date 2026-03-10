@@ -1,7 +1,7 @@
 import argparse
 import importlib
 
-from common import EvalConfig, resolve_latest_checkpoint_for_alg
+from common import EvalConfig, add_dataclass_arguments, extract_dataclass_kwargs_from_namespace
 
 
 def load_eval_module(alg: str):
@@ -14,21 +14,29 @@ def load_eval_module(alg: str):
         raise
 
 
-def main() -> None:
+def build_eval_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("alg")
-    parser.add_argument("--checkpoint-path", default=None)
-    parser.add_argument("--output-root", default="outputs")
+    add_dataclass_arguments(
+        parser,
+        EvalConfig,
+        exclude_fields={"alg"},
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_eval_parser()
     args = parser.parse_args()
 
-    checkpoint_path = args.checkpoint_path or str(
-        resolve_latest_checkpoint_for_alg(args.alg, output_root=args.output_root)
+    eval_config_kwargs = extract_dataclass_kwargs_from_namespace(
+        EvalConfig,
+        args,
+        exclude_fields={"alg"},
     )
-
     eval_config = EvalConfig(
         alg=args.alg,
-        output_root=args.output_root,
-        checkpoint_path=checkpoint_path,
+        **eval_config_kwargs,
     )
 
     eval_module = load_eval_module(args.alg)
