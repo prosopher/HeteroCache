@@ -6,6 +6,7 @@ import random
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
+from tqdm.auto import tqdm
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union, get_args, get_origin
 
 import torch
@@ -14,6 +15,15 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
+
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            self.handleError(record)
 
 
 def setup_logger(name: str, log_path: Path) -> logging.Logger:
@@ -32,7 +42,7 @@ def setup_logger(name: str, log_path: Path) -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler()
+    stream_handler = TqdmLoggingHandler()
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
@@ -295,7 +305,7 @@ class OpenWebTextSequenceStream(IterableDataset):
             text = example.get("text", "")
             if not text or text.isspace():
                 continue
-            token_ids = self.tokenizer(text, add_special_tokens=False).input_ids
+            token_ids = self.tokenizer(text, add_special_tokens=False, verbose=False).input_ids
             if len(token_ids) < 8:
                 continue
             token_buffer.extend(token_ids)
