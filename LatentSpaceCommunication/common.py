@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import random
 from dataclasses import asdict, dataclass
@@ -11,6 +12,29 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
+
+def setup_logger(name: str, log_path: Path) -> logging.Logger:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
 PastKeyValues = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
@@ -31,7 +55,6 @@ class TrainConfig:
     warmup_steps: int = 50
     grad_clip_norm: float = 1.0
     log_every: int = 25
-    save_every: int = 100
     seed: int = 42
     shuffle_buffer: int = 50_000
     shared_slots: int = 32
@@ -583,12 +606,11 @@ def compute_suffix_lm_loss(
     )
     logits = outputs.logits
     vocab_size = logits.shape[-1]
-    loss = F.cross_entropy(
+    return F.cross_entropy(
         logits.reshape(-1, vocab_size),
         lm_labels.reshape(-1),
         reduction="mean",
     )
-    return loss
 
 
 class InfiniteDataLoader:
@@ -622,14 +644,6 @@ def split_prefix_and_suffix_for_exact_next_token_loss(
     input_ids: torch.Tensor,
     prefix_tokens: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    For exact next-token supervision on the suffix:
-      - prefix_cache_ids: tokens [0, ..., prefix_tokens-2]
-      - lm_input_ids:     tokens [prefix_tokens-1, ..., T-2]
-      - lm_labels:        tokens [prefix_tokens,   ..., T-1]
-
-    This lets the first suffix label be predicted from the last prefix token.
-    """
     if prefix_tokens < 2:
         raise ValueError("prefix_tokens must be >= 2")
     prefix_cache_ids = input_ids[:, : prefix_tokens - 1]

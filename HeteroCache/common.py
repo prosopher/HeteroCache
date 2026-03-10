@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import random
 from dataclasses import asdict, dataclass
@@ -11,6 +12,29 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
+
+def setup_logger(name: str, log_path: Path) -> logging.Logger:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
 PastKeyValues = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
@@ -31,7 +55,6 @@ class TrainConfig:
     warmup_steps: int = 50
     grad_clip_norm: float = 1.0
     log_every: int = 25
-    save_every: int = 100
     seed: int = 42
     shuffle_buffer: int = 50_000
     top_layers_to_translate: int = 6

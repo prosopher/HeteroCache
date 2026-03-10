@@ -1,44 +1,11 @@
-"""
-Code 1
-- Goal: train a toy cross-attention translator between GPT-2 and GPT-2 Medium
-- Data: OpenWebText
-- Objective: suffix LM loss only (bidirectional sum per step), no reconstruction loss
-
-Important
-- This example is intentionally compact and pragmatic.
-- It follows the paper's high-level recipe with a shared latent space and per-model in/out translators,
-  but uses a smaller, easier-to-read implementation suitable for experimentation.
-- It is written to be compatible with transformers==4.35.2, where past_key_values are plain tuples,
-  so DynamicCache is not used.
-"""
-
-import logging
 from pathlib import Path
 
 import torch
 from tqdm.auto import tqdm
 
-from common import (
-    TrainConfig,
-    WarmupCosineScheduler,
-    build_models_and_tokenizer,
-    build_training_dataloader,
-    build_translator_pool,
-    compute_suffix_lm_loss,
-    count_trainable_parameters,
-    extract_past_key_values,
-    parse_train_directions,
-    replace_top_layers,
-    save_checkpoint,
-    set_seed,
-    split_prefix_and_suffix_for_exact_next_token_loss,
-    write_json,
-)
+from common import *
 
 
-# -----------------------------------------------------------------------------
-# No argparse by request. Edit values here.
-# -----------------------------------------------------------------------------
 CONFIG = TrainConfig(
     model_a_id="gpt2",
     model_b_id="gpt2-medium",
@@ -53,7 +20,6 @@ CONFIG = TrainConfig(
     warmup_steps=500,
     grad_clip_norm=1.0,
     log_every=25,
-    save_every=100,
     seed=42,
     shuffle_buffer=50_000,
     shared_slots=32,
@@ -68,29 +34,6 @@ CONFIG = TrainConfig(
 )
 
 
-def setup_logger(log_path: Path) -> logging.Logger:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger("lsc_train")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
-    return logger
-
-
 def main() -> None:
     set_seed(CONFIG.seed)
     output_dir = Path(CONFIG.output_dir)
@@ -98,7 +41,7 @@ def main() -> None:
     write_json(output_dir / "train_config.json", CONFIG.__dict__)
 
     log_path = output_dir / "train.log"
-    logger = setup_logger(log_path)
+    logger = setup_logger("train", log_path)
     logger.info("Starting training")
     logger.info("train_config=%s", CONFIG.__dict__)
 
@@ -233,25 +176,6 @@ def main() -> None:
                 ",".join(train_directions),
             )
             running_loss = 0.0
-
-        # if step % CONFIG.save_every == 0:
-        #     checkpoint_path = output_dir / f"checkpoint_step_{step:04d}.pt"
-        #     save_checkpoint(
-        #         output_path=str(checkpoint_path),
-        #         translator_pool=translator_pool,
-        #         optimizer=optimizer,
-        #         scheduler=scheduler,
-        #         train_config=CONFIG,
-        #         step=step,
-        #         extra={
-        #             "note": "Toy checkpoint trained with suffix LM loss only.",
-        #             "model_a": CONFIG.model_a_id,
-        #             "model_b": CONFIG.model_b_id,
-        #             "top_layers_ratio": CONFIG.top_layers_ratio,
-        #             "train_directions": CONFIG.train_directions,
-        #         },
-        #     )
-        #     logger.info("[Checkpoint] saved to %s", checkpoint_path)
 
     final_path = output_dir / "final_checkpoint.pt"
     save_checkpoint(

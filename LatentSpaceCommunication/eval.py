@@ -1,4 +1,3 @@
-import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -8,14 +7,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 
-from common import (
-    cosine_similarity_between_past,
-    extract_past_key_values,
-    load_translator_pool_from_checkpoint,
-    replace_top_layers,
-    set_seed,
-    slice_top_layers,
-)
+from common import *
 
 
 @dataclass
@@ -143,29 +135,6 @@ class RunningAverage:
             "native_accuracy": self.native_accuracy_sum / self.count,
             "count": self.count,
         }
-
-
-def setup_logger(log_path: Path) -> logging.Logger:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger("lsc_eval")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
-    return logger
 
 
 def build_eval_dataloader(
@@ -735,7 +704,7 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     log_path = checkpoint_path.parent / eval_config.log_filename
-    logger = setup_logger(log_path)
+    logger = setup_logger("name", log_path)
     logger.info("Starting evaluation")
     logger.info("checkpoint_path=%s", checkpoint_path)
     logger.info("eval_config=%s", asdict(eval_config))
