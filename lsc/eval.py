@@ -5,7 +5,7 @@ from typing import Dict
 import torch
 from torch.utils.data import DataLoader
 
-from common import *
+from eval_util import *
 from lsc.train import load_translator_pool_from_checkpoint
 
 

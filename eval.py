@@ -1,12 +1,8 @@
 import argparse
 import importlib
 
-from common import (
-    EvalConfig,
-    add_dataclass_arguments,
-    extract_dataclass_kwargs_from_namespace,
-    resolve_latest_checkpoint_for_alg,
-)
+from common import add_dataclass_arguments, extract_dataclass_kwargs_from_namespace
+from eval_util import EvalConfig, resolve_latest_checkpoint_for_alg
 
 
 def load_eval_module(alg: str):
