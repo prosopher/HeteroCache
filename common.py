@@ -76,15 +76,12 @@ class EvalConfig:
     # evaluation sampling
     batch_size: int = 1
     num_workers: int = 0
-    max_examples_per_dataset: int = 512
+    max_examples_per_dataset: int = 100
     seed: int = 42
 
     # streaming / shuffling
     shuffle_eval_stream: bool = True
     shuffle_buffer: int = 10_000
-
-    # sample logs
-    num_generation_samples_per_dataset: int = 2
 
     # generation QA
     generation_max_new_tokens: int = 32
@@ -838,25 +835,6 @@ def build_eval_dataloader(
     )
 
 
-def build_sample_dataloader(
-    spec: HFDatasetSpec,
-    eval_config: EvalConfig,
-) -> DataLoader:
-    dataset = HFQAPairStream(
-        spec=spec,
-        max_examples=eval_config.num_generation_samples_per_dataset,
-        shuffle=False,
-        seed=eval_config.seed,
-        shuffle_buffer=eval_config.shuffle_buffer,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=eval_config.num_workers,
-        collate_fn=lambda batch: batch,
-    )
-
-
 def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
@@ -1346,41 +1324,6 @@ def summarize_generation_overall_results(
     return summarized
 
 
-def summarize_combined_qa_accuracy(
-    logit_score_results: Dict[str, Dict[str, float]],
-    generation_results: Dict[str, Dict[str, float]],
-    active_directions,
-) -> Dict[str, Dict[str, float]]:
-    combined = {}
-
-    for direction in list(active_directions) + ["AVG"]:
-        logit_row = logit_score_results[direction]
-        generation_row = generation_results[direction]
-
-        logit_count = int(logit_row["count"])
-        generation_count = int(generation_row["count"])
-        total_count = logit_count + generation_count
-
-        if total_count == 0:
-            combined_accuracy = float("nan")
-        else:
-            combined_accuracy = (
-                float(logit_row["accuracy"]) * logit_count
-                + float(generation_row["exact_match"]) * generation_count
-            ) / total_count
-
-        combined[direction] = {
-            "logit_score_accuracy": float(logit_row["accuracy"]),
-            "generation_accuracy": float(generation_row["exact_match"]),
-            "combined_accuracy": combined_accuracy,
-            "logit_score_count": logit_count,
-            "generation_count": generation_count,
-            "total_count": total_count,
-        }
-
-    return combined
-
-
 def build_direction_pretty_name(direction: str, model_a_id: str, model_b_id: str) -> str:
     if direction == "A_to_B":
         return f"A_to_B ({model_a_id} -> {model_b_id})"
@@ -1492,31 +1435,4 @@ def log_generation_overall_result(
             row["native_exact_match"],
             row["native_f1"],
             int(row["count"]),
-        )
-
-
-def log_combined_qa_accuracy_result(
-    logger: logging.Logger,
-    results: Dict[str, Dict[str, float]],
-    model_a_id: str,
-    model_b_id: str,
-    active_directions,
-) -> None:
-    logger.info("===== OVERALL QA ACCURACY ACROSS LOGIT-SCORE QA + GENERATION QA =====")
-    for direction in list(active_directions) + ["AVG"]:
-        row = results[direction]
-        pretty_name = (
-            "AVG (weighted over all logit-score and generation QA examples)"
-            if direction == "AVG"
-            else build_direction_pretty_name(direction, model_a_id, model_b_id)
-        )
-        logger.info(
-            "%s | logit_score_accuracy=%.6f | generation_accuracy_em=%.6f | combined_accuracy=%.6f | logit_score_count=%d | generation_count=%d | total_count=%d",
-            pretty_name,
-            row["logit_score_accuracy"],
-            row["generation_accuracy"],
-            row["combined_accuracy"],
-            int(row["logit_score_count"]),
-            int(row["generation_count"]),
-            int(row["total_count"]),
         )
