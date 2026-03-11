@@ -17,4 +17,5 @@ python train.py lsc --default-config-path configs/train_lsc_toy.json
 ## 평가
 ```console
 python eval.py
+python eval.py --default-config-path configs/eval_toy.json
 ```
