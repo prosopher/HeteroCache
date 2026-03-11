@@ -38,6 +38,7 @@ class HFDatasetSpec:
     question_field: str = "question"
     context_field: Optional[str] = None
     answers_field: Optional[str] = None
+    subject_field: Optional[str] = None
     streaming: bool = False
 
 
@@ -279,6 +280,44 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             "answer": normalized_answer,
         }
 
+    if spec.answer_mode == "mmlu":
+        choices = example.get("choices", None)
+        if not isinstance(choices, list) or len(choices) != 4:
+            return None
+
+        normalized_choices = [
+            choice.strip()
+            for choice in choices
+            if isinstance(choice, str) and choice.strip()
+        ]
+        if len(normalized_choices) != 4:
+            return None
+
+        answer_value = example.get("answer", None)
+        if isinstance(answer_value, int):
+            if answer_value < 0 or answer_value >= 4:
+                return None
+            normalized_answer = chr(ord("A") + answer_value)
+        elif isinstance(answer_value, str):
+            normalized_answer = answer_value.strip().upper()
+            if normalized_answer not in {"A", "B", "C", "D"}:
+                return None
+        else:
+            return None
+
+        qa_example = {
+            "question": question.strip(),
+            "choices": normalized_choices,
+            "answer": normalized_answer,
+        }
+
+        subject_field = spec.subject_field or "subject"
+        subject = example.get(subject_field, None)
+        if isinstance(subject, str) and subject.strip():
+            qa_example["subject"] = subject.strip()
+
+        return qa_example
+
     if spec.answer_mode == "squad":
         context_field = spec.context_field or "context"
         answers_field = spec.answers_field or "answers"
@@ -317,8 +356,30 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
     raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
 
-def format_question_prefix(question: str) -> str:
-    return f"Question: {question.strip()}\nAnswer:"
+def format_question_prefix(
+    question: str,
+    choices: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+) -> str:
+    if not choices:
+        return f"Question: {question.strip()}\nAnswer:"
+
+    prompt_lines = []
+    if isinstance(subject, str) and subject.strip():
+        prompt_lines.append(
+            "The following is a multiple choice question about "
+            f"{subject.strip().replace('_', ' ')}."
+        )
+        prompt_lines.append("")
+
+    prompt_lines.append(f"Question: {question.strip()}")
+    prompt_lines.append("Choices:")
+    for idx, choice in enumerate(choices):
+        label = chr(ord("A") + idx)
+        prompt_lines.append(f"{label}. {choice.strip()}")
+    prompt_lines.append("Answer with the option letter only.")
+    prompt_lines.append("Answer:")
+    return "\n".join(prompt_lines)
 
 
 def format_generation_prompt(context: str, question: str) -> str:
@@ -345,8 +406,18 @@ def prepare_text_prefix(tokenizer, prefix_text: str, device: str) -> Dict[str, t
     }
 
 
-def prepare_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_question_prefix(question)
+def prepare_question_prefix(
+    tokenizer,
+    question: str,
+    device: str,
+    choices: Optional[List[str]] = None,
+    subject: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    prefix_text = format_question_prefix(
+        question,
+        choices=choices,
+        subject=subject,
+    )
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
@@ -360,6 +431,8 @@ def get_choice_labels(answer_mode: str) -> List[str]:
         return ["yes", "no"]
     if answer_mode == "pubmed_qa":
         return ["yes", "no", "maybe"]
+    if answer_mode == "mmlu":
+        return ["A", "B", "C", "D"]
     raise ValueError(f"Unsupported answer_mode: {answer_mode}")
 
 

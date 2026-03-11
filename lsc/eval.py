@@ -40,7 +40,13 @@ def evaluate_dataset(
             question = example["question"]
             gold_answer = example["answer"]
 
-            prefix = prepare_question_prefix(tokenizer=tokenizer, question=question, device=device)
+            prefix = prepare_question_prefix(
+                tokenizer=tokenizer,
+                question=question,
+                device=device,
+                choices=example.get("choices"),
+                subject=example.get("subject"),
+            )
             prefix_cache_ids = prefix["cache_ids"]
             seed_token = prefix["seed_token"]
 
@@ -317,6 +323,16 @@ def run_eval(eval_config: EvalConfig) -> Path:
             split="train",
             answer_mode="pubmed_qa",
             question_field="question",
+            streaming=False,
+        ),
+        HFDatasetSpec(
+            name_for_log="MMLU/all/validation",
+            dataset_path="cais/mmlu",
+            dataset_name="all",
+            split="validation",
+            answer_mode="mmlu",
+            question_field="question",
+            subject_field="subject",
             streaming=False,
         ),
     ]
