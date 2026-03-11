@@ -1,0 +1,14 @@
+{
+  "outputs_path": "outputs",
+  "timestamp": null,
+  "output_path": null,
+  "checkpoint_path": null,
+  "device": "auto",
+  "batch_size": 1,
+  "num_workers": 0,
+  "max_examples_per_dataset": 100,
+  "seed": 42,
+  "shuffle_eval_stream": true,
+  "shuffle_buffer": 10000,
+  "generation_max_new_tokens": 32
+}

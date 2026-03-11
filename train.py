@@ -2,7 +2,7 @@ import argparse
 import importlib
 from pathlib import Path
 
-from common import add_dataclass_arguments, extract_dataclass_kwargs_from_namespace
+from common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 
 
 def load_train_module(alg: str):
@@ -20,6 +20,11 @@ def build_train_parser(alg: str):
 
     parser = argparse.ArgumentParser()
     parser.add_argument("alg")
+    parser.add_argument(
+        "--default-config-path",
+        dest="default_config_path",
+        default=f"configs/train_{alg}.json",
+    )
     add_dataclass_arguments(
         parser,
         train_module.TrainConfig,
@@ -36,9 +41,10 @@ def main() -> None:
     parser, train_module = build_train_parser(bootstrap_args.alg)
     args = parser.parse_args()
 
-    config_kwargs = extract_dataclass_kwargs_from_namespace(
-        train_module.TrainConfig,
-        args,
+    config_kwargs = build_dataclass_kwargs_from_json_and_namespace(
+        config_cls=train_module.TrainConfig,
+        default_config_path=args.default_config_path,
+        args=args,
         exclude_fields={"alg"},
     )
     config = train_module.TrainConfig(

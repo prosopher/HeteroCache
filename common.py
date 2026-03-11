@@ -70,6 +70,13 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def resolve_device(device: str) -> str:
+    normalized = str(device).strip().lower()
+    if normalized == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
 def get_torch_dtype(dtype_name: str) -> torch.dtype:
     mapping = {
         "float32": torch.float32,
@@ -298,6 +305,16 @@ def move_past_to_device(past_key_values: PastKeyValues, device: str) -> PastKeyV
     return tuple(moved)
 
 
+def read_json(path: Union[str, Path]) -> Dict[str, Any]:
+    path_obj = Path(path)
+    with path_obj.open("r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON config at {path_obj} must contain a top-level object.")
+    return payload
+
+
 def write_json(path: str, payload: Dict) -> None:
     path_obj = Path(path)
     path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -392,3 +409,48 @@ def extract_dataclass_kwargs_from_namespace(
             kwargs[field_info.name] = getattr(args, field_info.name)
 
     return kwargs
+
+
+def build_dataclass_kwargs_from_json_and_namespace(
+    config_cls: Type[T],
+    default_config_path: Union[str, Path],
+    args: argparse.Namespace,
+    exclude_fields: Optional[set[str]] = None,
+) -> Dict[str, Any]:
+    if not is_dataclass(config_cls):
+        raise TypeError(f"{config_cls} must be a dataclass type.")
+
+    excluded = exclude_fields or set()
+    default_kwargs = read_json(default_config_path)
+
+    valid_field_names = {field_info.name for field_info in fields(config_cls)}
+    unknown_keys = sorted(set(default_kwargs) - valid_field_names)
+    if unknown_keys:
+        raise ValueError(
+            f"Unknown config keys in {default_config_path}: {unknown_keys}"
+        )
+
+    merged_kwargs = {
+        key: value
+        for key, value in default_kwargs.items()
+        if key not in excluded
+    }
+    merged_kwargs.update(
+        extract_dataclass_kwargs_from_namespace(
+            config_cls=config_cls,
+            args=args,
+            exclude_fields=exclude_fields,
+        )
+    )
+
+    missing_keys = [
+        field_info.name
+        for field_info in fields(config_cls)
+        if field_info.name not in excluded and field_info.name not in merged_kwargs
+    ]
+    if missing_keys:
+        raise ValueError(
+            f"Missing required config keys in {default_config_path}: {missing_keys}"
+        )
+
+    return merged_kwargs

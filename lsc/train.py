@@ -12,36 +12,37 @@ from train_util import *
 
 @dataclass
 class TrainConfig:
-    alg: str = ""
-    outputs_path: str = "outputs"
-    timestamp: Optional[str] = None
-    output_path: Optional[str] = None
+    alg: str
+    outputs_path: str
+    timestamp: Optional[str]
+    output_path: Optional[str]
 
-    model_a_id: str = "gpt2"
-    model_b_id: str = "gpt2-medium"
-    max_steps: int = 500
-    batch_size: int = 1
-    grad_accum_steps: int = 16
-    total_tokens: int = 128
-    prefix_tokens: int = 64
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-2
-    warmup_steps: int = 50
-    grad_clip_norm: float = 1.0
-    log_every: int = 25
-    seed: int = 42
-    shuffle_buffer: int = 50_000
-    shared_slots: int = 32
-    shared_dim: int = 128
-    translator_dim: int = 256
-    translator_heads: int = 4
-    translator_mlp_ratio: int = 2
-    top_layers_ratio: float = 1.0
-    train_directions: str = "A_to_B,B_to_A"
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype: str = "float32"
+    model_a_id: str
+    model_b_id: str
+    max_steps: int
+    batch_size: int
+    grad_accum_steps: int
+    total_tokens: int
+    prefix_tokens: int
+    learning_rate: float
+    weight_decay: float
+    warmup_steps: int
+    grad_clip_norm: float
+    log_every: int
+    seed: int
+    shuffle_buffer: int
+    shared_slots: int
+    shared_dim: int
+    translator_dim: int
+    translator_heads: int
+    translator_mlp_ratio: int
+    top_layers_ratio: float
+    train_directions: str
+    device: str
+    dtype: str
 
     def __post_init__(self) -> None:
+        self.device = resolve_device(self.device)
         initialize_train_output_paths(self)
 
 

@@ -3,27 +3,28 @@ from common import *
 
 @dataclass
 class EvalConfig:
-    alg: str = ""
-    outputs_path: str = "outputs"
-    timestamp: Optional[str] = None
-    output_path: Optional[str] = None
-    checkpoint_path: Optional[str] = None
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    alg: str
+    outputs_path: str
+    timestamp: Optional[str]
+    output_path: Optional[str]
+    checkpoint_path: Optional[str]
+    device: str
 
     # evaluation sampling
-    batch_size: int = 1
-    num_workers: int = 0
-    max_examples_per_dataset: int = 100
-    seed: int = 42
+    batch_size: int
+    num_workers: int
+    max_examples_per_dataset: int
+    seed: int
 
     # streaming / shuffling
-    shuffle_eval_stream: bool = True
-    shuffle_buffer: int = 10_000
+    shuffle_eval_stream: bool
+    shuffle_buffer: int
 
     # generation QA
-    generation_max_new_tokens: int = 32
+    generation_max_new_tokens: int
 
     def __post_init__(self) -> None:
+        self.device = resolve_device(self.device)
         initialize_eval_output_paths(self)
 
 

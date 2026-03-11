@@ -1,7 +1,7 @@
 import argparse
 import importlib
 
-from common import add_dataclass_arguments, extract_dataclass_kwargs_from_namespace
+from common import add_dataclass_arguments, build_dataclass_kwargs_from_json_and_namespace
 from eval_util import EvalConfig, resolve_latest_checkpoint_for_alg
 
 
@@ -18,6 +18,11 @@ def load_eval_module(alg: str):
 def build_eval_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("alg")
+    parser.add_argument(
+        "--default-config-path",
+        dest="default_config_path",
+        default="configs/eval.json",
+    )
     add_dataclass_arguments(
         parser,
         EvalConfig,
@@ -30,14 +35,15 @@ def main() -> None:
     parser = build_eval_parser()
     args = parser.parse_args()
 
-    eval_config_kwargs = extract_dataclass_kwargs_from_namespace(
-        EvalConfig,
-        args,
+    eval_config_kwargs = build_dataclass_kwargs_from_json_and_namespace(
+        config_cls=EvalConfig,
+        default_config_path=args.default_config_path,
+        args=args,
         exclude_fields={"alg"},
     )
 
-    if "checkpoint_path" not in eval_config_kwargs or eval_config_kwargs["checkpoint_path"] is None:
-        outputs_path = eval_config_kwargs.get("outputs_path", "outputs")
+    if eval_config_kwargs["checkpoint_path"] is None:
+        outputs_path = eval_config_kwargs["outputs_path"]
         eval_config_kwargs["checkpoint_path"] = str(
             resolve_latest_checkpoint_for_alg(args.alg, outputs_path=outputs_path)
         )
