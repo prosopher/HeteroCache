@@ -3,6 +3,9 @@ import json
 import logging
 import math
 import random
+import re
+import string
+from collections import Counter
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -80,8 +83,11 @@ class EvalConfig:
     shuffle_eval_stream: bool = True
     shuffle_buffer: int = 10_000
 
-    # score sanity-check samples
+    # sample logs
     num_generation_samples_per_dataset: int = 2
+
+    # generation QA
+    generation_max_new_tokens: int = 32
 
     def __post_init__(self) -> None:
         initialize_eval_output_paths(self)
@@ -95,6 +101,8 @@ class HFDatasetSpec:
     split: str
     answer_mode: str
     question_field: str = "question"
+    context_field: Optional[str] = None
+    answers_field: Optional[str] = None
     streaming: bool = False
 
 
@@ -186,6 +194,51 @@ class RunningAverage:
             "cosine": self.cosine_sum / self.count,
             "accuracy": self.accuracy_sum / self.count,
             "native_accuracy": self.native_accuracy_sum / self.count,
+            "count": self.count,
+        }
+
+
+class GenerationRunningAverage:
+    def __init__(self) -> None:
+        self.cosine_sum = 0.0
+        self.exact_match_sum = 0.0
+        self.f1_sum = 0.0
+        self.native_exact_match_sum = 0.0
+        self.native_f1_sum = 0.0
+        self.count = 0
+
+    def update(
+        self,
+        cosine_value: float,
+        exact_match_value: float,
+        f1_value: float,
+        native_exact_match_value: float,
+        native_f1_value: float,
+        n: int,
+    ) -> None:
+        self.cosine_sum += float(cosine_value) * n
+        self.exact_match_sum += float(exact_match_value) * n
+        self.f1_sum += float(f1_value) * n
+        self.native_exact_match_sum += float(native_exact_match_value) * n
+        self.native_f1_sum += float(native_f1_value) * n
+        self.count += n
+
+    def summary(self) -> Dict[str, float]:
+        if self.count == 0:
+            return {
+                "cosine": float("nan"),
+                "exact_match": float("nan"),
+                "f1": float("nan"),
+                "native_exact_match": float("nan"),
+                "native_f1": float("nan"),
+                "count": 0,
+            }
+        return {
+            "cosine": self.cosine_sum / self.count,
+            "exact_match": self.exact_match_sum / self.count,
+            "f1": self.f1_sum / self.count,
+            "native_exact_match": self.native_exact_match_sum / self.count,
+            "native_f1": self.native_f1_sum / self.count,
             "count": self.count,
         }
 
@@ -804,7 +857,7 @@ def build_sample_dataloader(
     )
 
 
-def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, str]]:
+def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
         return None
@@ -833,6 +886,41 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             "answer": normalized_answer,
         }
 
+    if spec.answer_mode == "squad":
+        context_field = spec.context_field or "context"
+        answers_field = spec.answers_field or "answers"
+
+        context = example.get(context_field, "")
+        answers = example.get(answers_field, None)
+
+        if not isinstance(context, str) or not context.strip():
+            return None
+
+        answer_texts: List[str] = []
+        if isinstance(answers, dict):
+            raw_texts = answers.get("text", [])
+            if isinstance(raw_texts, list):
+                answer_texts = [
+                    item.strip()
+                    for item in raw_texts
+                    if isinstance(item, str) and item.strip()
+                ]
+        elif isinstance(answers, list):
+            answer_texts = [
+                item.strip()
+                for item in answers
+                if isinstance(item, str) and item.strip()
+            ]
+
+        if not answer_texts:
+            return None
+
+        return {
+            "question": question.strip(),
+            "context": context.strip(),
+            "answers": answer_texts,
+        }
+
     raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
 
@@ -840,12 +928,20 @@ def format_question_prefix(question: str) -> str:
     return f"Question: {question.strip()}\nAnswer:"
 
 
-def prepare_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_question_prefix(question)
+def format_generation_prompt(context: str, question: str) -> str:
+    return (
+        "Read the passage and answer the question briefly.\n\n"
+        f"Context: {context.strip()}\n"
+        f"Question: {question.strip()}\n"
+        "Answer:"
+    )
+
+
+def prepare_text_prefix(tokenizer, prefix_text: str, device: str) -> Dict[str, torch.Tensor]:
     tokenized = tokenizer(prefix_text, return_tensors="pt")
     input_ids = tokenized.input_ids.to(device)
     if input_ids.shape[1] < 2:
-        raise ValueError("Question prefix must tokenize to at least 2 tokens.")
+        raise ValueError("Prefix must tokenize to at least 2 tokens.")
     cache_ids = input_ids[:, :-1]
     seed_token = input_ids[:, -1:]
     return {
@@ -854,6 +950,16 @@ def prepare_question_prefix(tokenizer, question: str, device: str) -> Dict[str, 
         "cache_ids": cache_ids,
         "seed_token": seed_token,
     }
+
+
+def prepare_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_question_prefix(question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
+def prepare_generation_prefix(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_generation_prompt(context=context, question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
 def get_choice_labels(answer_mode: str) -> List[str]:
@@ -926,6 +1032,95 @@ def format_choice_scores(choice_scores: Dict[str, float]) -> str:
     )
 
 
+@torch.inference_mode()
+def generate_greedy_answer(
+    model,
+    tokenizer,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+    max_new_tokens: int,
+) -> str:
+    generated_token_ids: List[int] = []
+    current_input_ids = seed_token
+    current_past = past_key_values
+    eos_token_id = tokenizer.eos_token_id
+
+    for _ in range(max_new_tokens):
+        outputs = model(
+            input_ids=current_input_ids,
+            past_key_values=current_past,
+            use_cache=True,
+        )
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token_id = int(next_token.item())
+
+        if eos_token_id is not None and next_token_id == eos_token_id:
+            break
+
+        generated_token_ids.append(next_token_id)
+        current_input_ids = next_token
+        current_past = outputs.past_key_values
+
+    decoded = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+    return postprocess_generated_answer(decoded)
+
+
+def postprocess_generated_answer(text: str) -> str:
+    cleaned = text.strip()
+    for stopper in ["\n", "\r", "Question:", "Context:", "Answer:"]:
+        if stopper in cleaned:
+            cleaned = cleaned.split(stopper, 1)[0].strip()
+    return cleaned
+
+
+def normalize_qa_text(text: str) -> str:
+    def remove_articles(value: str) -> str:
+        return re.sub(r"\b(a|an|the)\b", " ", value)
+
+    def white_space_fix(value: str) -> str:
+        return " ".join(value.split())
+
+    def remove_punc(value: str) -> str:
+        exclude = set(string.punctuation)
+        return "".join(ch for ch in value if ch not in exclude)
+
+    def lower(value: str) -> str:
+        return value.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(text))))
+
+
+def compute_generation_exact_match(prediction: str, gold_answers: List[str]) -> float:
+    normalized_prediction = normalize_qa_text(prediction)
+    for gold_answer in gold_answers:
+        if normalized_prediction == normalize_qa_text(gold_answer):
+            return 1.0
+    return 0.0
+
+
+def _compute_pair_f1(prediction: str, gold_answer: str) -> float:
+    pred_tokens = normalize_qa_text(prediction).split()
+    gold_tokens = normalize_qa_text(gold_answer).split()
+
+    if not pred_tokens and not gold_tokens:
+        return 1.0
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+
+    common = Counter(pred_tokens) & Counter(gold_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gold_tokens)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def compute_generation_f1(prediction: str, gold_answers: List[str]) -> float:
+    return max(_compute_pair_f1(prediction, gold_answer) for gold_answer in gold_answers)
+
+
 def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str, Dict[str, float]]:
     results = {}
     total_cosine_sum = 0.0
@@ -954,6 +1149,48 @@ def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str,
             "cosine": total_cosine_sum / total_count,
             "accuracy": total_accuracy_sum / total_count,
             "native_accuracy": total_native_accuracy_sum / total_count,
+            "count": total_count,
+        }
+
+    return results
+
+
+def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningAverage]) -> Dict[str, Dict[str, float]]:
+    results = {}
+    total_cosine_sum = 0.0
+    total_exact_match_sum = 0.0
+    total_f1_sum = 0.0
+    total_native_exact_match_sum = 0.0
+    total_native_f1_sum = 0.0
+    total_count = 0
+
+    for path_name, meter in path_metrics.items():
+        path_result = meter.summary()
+        results[path_name] = path_result
+
+        total_cosine_sum += meter.cosine_sum
+        total_exact_match_sum += meter.exact_match_sum
+        total_f1_sum += meter.f1_sum
+        total_native_exact_match_sum += meter.native_exact_match_sum
+        total_native_f1_sum += meter.native_f1_sum
+        total_count += meter.count
+
+    if total_count == 0:
+        results["AVG"] = {
+            "cosine": float("nan"),
+            "exact_match": float("nan"),
+            "f1": float("nan"),
+            "native_exact_match": float("nan"),
+            "native_f1": float("nan"),
+            "count": 0,
+        }
+    else:
+        results["AVG"] = {
+            "cosine": total_cosine_sum / total_count,
+            "exact_match": total_exact_match_sum / total_count,
+            "f1": total_f1_sum / total_count,
+            "native_exact_match": total_native_exact_match_sum / total_count,
+            "native_f1": total_native_f1_sum / total_count,
             "count": total_count,
         }
 
@@ -1024,6 +1261,126 @@ def summarize_overall_results(
     return summarized
 
 
+def summarize_generation_overall_results(
+    all_results: Dict[str, Dict[str, Dict[str, float]]],
+    active_directions,
+) -> Dict[str, Dict[str, float]]:
+    overall = {
+        direction: {
+            "cosine_sum": 0.0,
+            "exact_match_sum": 0.0,
+            "f1_sum": 0.0,
+            "native_exact_match_sum": 0.0,
+            "native_f1_sum": 0.0,
+            "count": 0,
+        }
+        for direction in active_directions
+    }
+
+    for dataset_result in all_results.values():
+        for direction in active_directions:
+            row = dataset_result[direction]
+            count = int(row["count"])
+            overall[direction]["cosine_sum"] += float(row["cosine"]) * count
+            overall[direction]["exact_match_sum"] += float(row["exact_match"]) * count
+            overall[direction]["f1_sum"] += float(row["f1"]) * count
+            overall[direction]["native_exact_match_sum"] += float(row["native_exact_match"]) * count
+            overall[direction]["native_f1_sum"] += float(row["native_f1"]) * count
+            overall[direction]["count"] += count
+
+    summarized = {}
+    total_cosine_sum = 0.0
+    total_exact_match_sum = 0.0
+    total_f1_sum = 0.0
+    total_native_exact_match_sum = 0.0
+    total_native_f1_sum = 0.0
+    total_count = 0
+
+    for direction in active_directions:
+        count = overall[direction]["count"]
+        if count == 0:
+            summarized[direction] = {
+                "cosine": float("nan"),
+                "exact_match": float("nan"),
+                "f1": float("nan"),
+                "native_exact_match": float("nan"),
+                "native_f1": float("nan"),
+                "count": 0,
+            }
+        else:
+            summarized[direction] = {
+                "cosine": overall[direction]["cosine_sum"] / count,
+                "exact_match": overall[direction]["exact_match_sum"] / count,
+                "f1": overall[direction]["f1_sum"] / count,
+                "native_exact_match": overall[direction]["native_exact_match_sum"] / count,
+                "native_f1": overall[direction]["native_f1_sum"] / count,
+                "count": count,
+            }
+
+        total_cosine_sum += overall[direction]["cosine_sum"]
+        total_exact_match_sum += overall[direction]["exact_match_sum"]
+        total_f1_sum += overall[direction]["f1_sum"]
+        total_native_exact_match_sum += overall[direction]["native_exact_match_sum"]
+        total_native_f1_sum += overall[direction]["native_f1_sum"]
+        total_count += count
+
+    if total_count == 0:
+        summarized["AVG"] = {
+            "cosine": float("nan"),
+            "exact_match": float("nan"),
+            "f1": float("nan"),
+            "native_exact_match": float("nan"),
+            "native_f1": float("nan"),
+            "count": 0,
+        }
+    else:
+        summarized["AVG"] = {
+            "cosine": total_cosine_sum / total_count,
+            "exact_match": total_exact_match_sum / total_count,
+            "f1": total_f1_sum / total_count,
+            "native_exact_match": total_native_exact_match_sum / total_count,
+            "native_f1": total_native_f1_sum / total_count,
+            "count": total_count,
+        }
+
+    return summarized
+
+
+def summarize_combined_qa_accuracy(
+    logit_score_results: Dict[str, Dict[str, float]],
+    generation_results: Dict[str, Dict[str, float]],
+    active_directions,
+) -> Dict[str, Dict[str, float]]:
+    combined = {}
+
+    for direction in list(active_directions) + ["AVG"]:
+        logit_row = logit_score_results[direction]
+        generation_row = generation_results[direction]
+
+        logit_count = int(logit_row["count"])
+        generation_count = int(generation_row["count"])
+        total_count = logit_count + generation_count
+
+        if total_count == 0:
+            combined_accuracy = float("nan")
+        else:
+            combined_accuracy = (
+                float(logit_row["accuracy"]) * logit_count
+                + float(generation_row["exact_match"]) * generation_count
+            ) / total_count
+
+        combined[direction] = {
+            "logit_score_accuracy": float(logit_row["accuracy"]),
+            "generation_accuracy": float(generation_row["exact_match"]),
+            "combined_accuracy": combined_accuracy,
+            "logit_score_count": logit_count,
+            "generation_count": generation_count,
+            "total_count": total_count,
+        }
+
+    return combined
+
+
 def build_direction_pretty_name(direction: str, model_a_id: str, model_b_id: str) -> str:
     if direction == "A_to_B":
         return f"A_to_B ({model_a_id} -> {model_b_id})"
@@ -1058,6 +1415,34 @@ def log_dataset_result(
         )
 
 
+def log_generation_dataset_result(
+    logger: logging.Logger,
+    dataset_name: str,
+    results: Dict[str, Dict[str, float]],
+    model_a_id: str,
+    model_b_id: str,
+    active_directions,
+) -> None:
+    logger.info("===== %s =====", dataset_name)
+    for direction in list(active_directions) + ["AVG"]:
+        row = results[direction]
+        pretty_name = (
+            "AVG (weighted over evaluated paths)"
+            if direction == "AVG"
+            else build_direction_pretty_name(direction, model_a_id, model_b_id)
+        )
+        logger.info(
+            "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
+            pretty_name,
+            row["cosine"],
+            row["exact_match"],
+            row["f1"],
+            row["native_exact_match"],
+            row["native_f1"],
+            int(row["count"]),
+        )
+
+
 def log_overall_result(
     logger: logging.Logger,
     results: Dict[str, Dict[str, float]],
@@ -1065,11 +1450,11 @@ def log_overall_result(
     model_b_id: str,
     active_directions,
 ) -> None:
-    logger.info("===== OVERALL AVERAGE ACROSS DATASETS =====")
+    logger.info("===== OVERALL AVERAGE ACROSS LOGIT-SCORE QA DATASETS =====")
     for direction in list(active_directions) + ["AVG"]:
         row = results[direction]
         pretty_name = (
-            "AVG (weighted over all datasets and evaluated paths)"
+            "AVG (weighted over all logit-score QA datasets and evaluated paths)"
             if direction == "AVG"
             else build_direction_pretty_name(direction, model_a_id, model_b_id)
         )
@@ -1080,4 +1465,58 @@ def log_overall_result(
             row["accuracy"],
             row["native_accuracy"],
             int(row["count"]),
+        )
+
+
+def log_generation_overall_result(
+    logger: logging.Logger,
+    results: Dict[str, Dict[str, float]],
+    model_a_id: str,
+    model_b_id: str,
+    active_directions,
+) -> None:
+    logger.info("===== OVERALL AVERAGE ACROSS GENERATION QA DATASETS =====")
+    for direction in list(active_directions) + ["AVG"]:
+        row = results[direction]
+        pretty_name = (
+            "AVG (weighted over all generation QA datasets and evaluated paths)"
+            if direction == "AVG"
+            else build_direction_pretty_name(direction, model_a_id, model_b_id)
+        )
+        logger.info(
+            "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
+            pretty_name,
+            row["cosine"],
+            row["exact_match"],
+            row["f1"],
+            row["native_exact_match"],
+            row["native_f1"],
+            int(row["count"]),
+        )
+
+
+def log_combined_qa_accuracy_result(
+    logger: logging.Logger,
+    results: Dict[str, Dict[str, float]],
+    model_a_id: str,
+    model_b_id: str,
+    active_directions,
+) -> None:
+    logger.info("===== OVERALL QA ACCURACY ACROSS LOGIT-SCORE QA + GENERATION QA =====")
+    for direction in list(active_directions) + ["AVG"]:
+        row = results[direction]
+        pretty_name = (
+            "AVG (weighted over all logit-score and generation QA examples)"
+            if direction == "AVG"
+            else build_direction_pretty_name(direction, model_a_id, model_b_id)
+        )
+        logger.info(
+            "%s | logit_score_accuracy=%.6f | generation_accuracy_em=%.6f | combined_accuracy=%.6f | logit_score_count=%d | generation_count=%d | total_count=%d",
+            pretty_name,
+            row["logit_score_accuracy"],
+            row["generation_accuracy"],
+            row["combined_accuracy"],
+            int(row["logit_score_count"]),
+            int(row["generation_count"]),
+            int(row["total_count"]),
         )
