@@ -64,13 +64,10 @@ class ModelSpec:
 @dataclass
 class EvalConfig:
     alg: str = ""
-    output_root: str = "outputs"
+    outputs_path: str = "outputs"
     timestamp: Optional[str] = None
-    output_dir: Optional[str] = None
+    output_path: Optional[str] = None
     checkpoint_path: Optional[str] = None
-    config_path: Optional[str] = None
-    log_filename: str = "eval.log"
-    log_path: Optional[str] = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # evaluation sampling
@@ -596,13 +593,33 @@ def build_timestamp_string() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def build_timestamped_output_dir(
+def build_timestamped_output_path(
     alg: str,
-    output_root: str = "outputs",
+    outputs_path: str = "outputs",
     timestamp: Optional[str] = None,
 ) -> Path:
     run_timestamp = timestamp or build_timestamp_string()
-    return Path(output_root) / f"{alg}_{run_timestamp}"
+    return Path(outputs_path) / f"{alg}_{run_timestamp}"
+
+
+def get_train_config_path(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "train_config.json"
+
+
+def get_train_log_path(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "train.log"
+
+
+def get_train_checkpoint_path(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "final_checkpoint_path.pt"
+
+
+def get_eval_config_path(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "eval_config.json"
+
+
+def get_eval_log_path(output_path: Union[str, Path]) -> Path:
+    return Path(output_path) / "eval.log"
 
 
 T = TypeVar("T")
@@ -681,90 +698,70 @@ def extract_dataclass_kwargs_from_namespace(
     return kwargs
 
 
-def initialize_train_output_paths(
-    config,
-    config_filename: str = "train_config.json",
-    log_filename: str = "train.log",
-    checkpoint_filename: str = "final_checkpoint.pt",
-) -> None:
+def initialize_train_output_paths(config) -> None:
     alg = getattr(config, "alg", "")
-    output_dir = getattr(config, "output_dir", None)
-    output_root = getattr(config, "output_root", "outputs")
+    output_path = getattr(config, "output_path", None)
+    outputs_path = getattr(config, "outputs_path", "outputs")
     timestamp = getattr(config, "timestamp", None)
 
-    if output_dir is None:
+    if output_path is None:
         if not alg:
             return
         if timestamp is None:
             timestamp = build_timestamp_string()
             setattr(config, "timestamp", timestamp)
-        output_dir_path = build_timestamped_output_dir(
+        output_path_obj = build_timestamped_output_path(
             alg=alg,
-            output_root=output_root,
+            outputs_path=outputs_path,
             timestamp=timestamp,
         )
     else:
-        output_dir_path = Path(output_dir)
+        output_path_obj = Path(output_path)
 
-    setattr(config, "output_dir", str(output_dir_path))
-
-    if getattr(config, "config_path", None) is None:
-        setattr(config, "config_path", str(output_dir_path / config_filename))
-    if getattr(config, "log_path", None) is None:
-        setattr(config, "log_path", str(output_dir_path / log_filename))
-    if getattr(config, "checkpoint_path", None) is None:
-        setattr(config, "checkpoint_path", str(output_dir_path / checkpoint_filename))
+    setattr(config, "output_path", str(output_path_obj))
 
 
-def initialize_eval_output_paths(
-    config,
-    config_filename: str = "eval_config.json",
-) -> None:
-    output_dir = getattr(config, "output_dir", None)
+def initialize_eval_output_paths(config) -> None:
+    output_path = getattr(config, "output_path", None)
     checkpoint_path = getattr(config, "checkpoint_path", None)
 
-    if output_dir is None:
+    if output_path is None:
         if checkpoint_path is not None:
-            output_dir_path = Path(checkpoint_path).parent
+            output_path_obj = Path(checkpoint_path).parent
         else:
             alg = getattr(config, "alg", "")
             if not alg:
                 return
-            output_root = getattr(config, "output_root", "outputs")
+            outputs_path = getattr(config, "outputs_path", "outputs")
             timestamp = getattr(config, "timestamp", None)
             if timestamp is None:
                 timestamp = build_timestamp_string()
                 setattr(config, "timestamp", timestamp)
-            output_dir_path = build_timestamped_output_dir(
+            output_path_obj = build_timestamped_output_path(
                 alg=alg,
-                output_root=output_root,
+                outputs_path=outputs_path,
                 timestamp=timestamp,
             )
     else:
-        output_dir_path = Path(output_dir)
+        output_path_obj = Path(output_path)
 
-    setattr(config, "output_dir", str(output_dir_path))
-
-    if getattr(config, "config_path", None) is None:
-        setattr(config, "config_path", str(output_dir_path / config_filename))
-    if getattr(config, "log_path", None) is None:
-        setattr(config, "log_path", str(output_dir_path / getattr(config, "log_filename", "eval.log")))
+    setattr(config, "output_path", str(output_path_obj))
 
 
 def resolve_latest_checkpoint_for_alg(
     alg: str,
-    output_root: str = "outputs",
-    checkpoint_name: str = "final_checkpoint.pt",
+    outputs_path: str = "outputs",
+    checkpoint_name: str = "final_checkpoint_path.pt",
 ) -> Path:
-    output_root_path = Path(output_root)
+    outputs_path_obj = Path(outputs_path)
     candidates = sorted(
         path
-        for path in output_root_path.glob(f"{alg}_*")
+        for path in outputs_path_obj.glob(f"{alg}_*")
         if path.is_dir() and (path / checkpoint_name).exists()
     )
     if not candidates:
         raise FileNotFoundError(
-            f"No checkpoint directories found for alg={alg!r} under {output_root_path}"
+            f"No checkpoint directories found for alg={alg!r} under {outputs_path_obj}"
         )
     return candidates[-1] / checkpoint_name
 

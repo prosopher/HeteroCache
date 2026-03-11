@@ -13,12 +13,9 @@ from common import *
 @dataclass
 class TrainConfig:
     alg: str = ""
-    output_root: str = "outputs"
+    outputs_path: str = "outputs"
     timestamp: Optional[str] = None
-    output_dir: Optional[str] = None
-    config_path: Optional[str] = None
-    log_path: Optional[str] = None
-    checkpoint_path: Optional[str] = None
+    output_path: Optional[str] = None
 
     model_a_id: str = "gpt2"
     model_b_id: str = "gpt2-medium"
@@ -398,20 +395,17 @@ def load_translator_pool_from_checkpoint(
 
 
 def run_train(config: TrainConfig) -> Path:
-    if (
-        config.output_dir is None
-        or config.config_path is None
-        or config.log_path is None
-        or config.checkpoint_path is None
-    ):
-        raise ValueError("TrainConfig paths must be initialized before run_train.")
+    if config.output_path is None:
+        raise ValueError("TrainConfig.output_path must be initialized before run_train.")
 
     set_seed(config.seed)
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(config.config_path, asdict(config))
+    output_path = Path(config.output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    log_path = Path(config.log_path)
+    config_path = get_train_config_path(output_path)
+    write_json(str(config_path), asdict(config))
+
+    log_path = get_train_log_path(output_path)
     logger = setup_logger(f"{config.alg}_train", log_path)
     logger.info("Starting training")
     logger.info("train_config=%s", asdict(config))
@@ -553,7 +547,7 @@ def run_train(config: TrainConfig) -> Path:
             )
             running_loss = 0.0
 
-    final_path = Path(config.checkpoint_path)
+    final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
         output_path=str(final_path),
         translator_pool=translator_pool,

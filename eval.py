@@ -41,9 +41,9 @@ def main() -> None:
     )
 
     if "checkpoint_path" not in eval_config_kwargs or eval_config_kwargs["checkpoint_path"] is None:
-        output_root = eval_config_kwargs.get("output_root", "outputs")
+        outputs_path = eval_config_kwargs.get("outputs_path", "outputs")
         eval_config_kwargs["checkpoint_path"] = str(
-            resolve_latest_checkpoint_for_alg(args.alg, output_root=output_root)
+            resolve_latest_checkpoint_for_alg(args.alg, outputs_path=outputs_path)
         )
 
     eval_config = EvalConfig(
