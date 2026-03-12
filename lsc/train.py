@@ -17,8 +17,8 @@ class TrainConfig:
     timestamp: Optional[str]
     output_path: Optional[str]
 
-    model_a_id: str
-    model_b_id: str
+    model_ids: str
+    model_directions: str
     max_steps: int
     batch_size: int
     grad_accum_steps: int
@@ -37,12 +37,12 @@ class TrainConfig:
     translator_heads: int
     translator_mlp_ratio: int
     top_layers_ratio: float
-    train_directions: str
     device: str
     dtype: str
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
+        parse_model_ids_csv(self.model_ids)
         initialize_train_output_paths(self)
 
 
@@ -347,13 +347,13 @@ def blocks_to_past_key_values(
 
 
 def build_translator_pool(
-    model_a: PreTrainedModel,
-    model_b: PreTrainedModel,
+    models: Dict[str, PreTrainedModel],
     config: TrainConfig,
-) -> Tuple[SharedKVTranslatorPool, Dict[str, ModelSpec], Dict[str, ModelSpec]]:
+) -> Tuple[SharedKVTranslatorPool, Dict[str, ModelSpec], Dict[str, ModelSpec], List[Node], List[Edge]]:
+    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     full_model_specs = {
-        "A": get_model_spec(model_a),
-        "B": get_model_spec(model_b),
+        node.id: get_model_spec(models[node.id])
+        for node in nodes
     }
     translated_model_specs = build_translated_model_specs(
         full_model_specs=full_model_specs,
@@ -368,7 +368,7 @@ def build_translator_pool(
         mlp_ratio=config.translator_mlp_ratio,
     )
     translator_pool.to(config.device)
-    return translator_pool, full_model_specs, translated_model_specs
+    return translator_pool, full_model_specs, translated_model_specs, nodes, edges
 
 
 def load_translator_pool_from_checkpoint(
@@ -379,20 +379,21 @@ def load_translator_pool_from_checkpoint(
     SharedKVTranslatorPool,
     Dict[str, ModelSpec],
     Dict[str, ModelSpec],
-    PreTrainedModel,
-    PreTrainedModel,
+    Dict[str, PreTrainedModel],
     PreTrainedTokenizerBase,
+    List[Node],
+    List[Edge],
 ]:
     payload = torch.load(checkpoint_path, map_location="cpu")
-    config = TrainConfig(**payload["train_config"])
+    config = TrainConfig(**normalize_train_config_dict(payload["train_config"]))
     if device_override is not None:
         config.device = device_override
-    model_a, model_b, tokenizer = build_models_and_tokenizer(config)
-    translator_pool, full_model_specs, translated_model_specs = build_translator_pool(model_a, model_b, config)
+    models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
+    translator_pool, full_model_specs, translated_model_specs, _, _ = build_translator_pool(models, config)
     translator_pool.load_state_dict(payload["translator_pool"])
     translator_pool.to(config.device)
     translator_pool.eval()
-    return config, translator_pool, full_model_specs, translated_model_specs, model_a, model_b, tokenizer
+    return config, translator_pool, full_model_specs, translated_model_specs, models, tokenizer, nodes, edges
 
 
 def run_train(config: TrainConfig) -> Path:
@@ -403,6 +404,10 @@ def run_train(config: TrainConfig) -> Path:
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
+    node_map = build_node_map(nodes)
+    edge_map = build_edge_map(edges)
+
     config_path = get_train_config_path(output_path)
     write_json(str(config_path), asdict(config))
 
@@ -411,39 +416,43 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("Starting training")
     logger.info("train_config=%s", asdict(config))
 
-    train_directions = parse_train_directions(config.train_directions)
-    logger.info("train_directions=%s", train_directions)
+    model_directions = parse_model_directions(
+        config.model_directions,
+        allowed_directions=[edge.id for edge in edges],
+    )
+    logger.info("nodes=%s", [asdict(node) for node in nodes])
+    logger.info("model_directions=%s", model_directions)
 
     logger.info("[Setup] device=%s", config.device)
-    logger.info("[Setup] loading models: A=%s, B=%s", config.model_a_id, config.model_b_id)
-    model_a, model_b, tokenizer = build_models_and_tokenizer(config)
-    translator_pool, model_specs, translated_model_specs = build_translator_pool(model_a, model_b, config)
+    logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
+    models, tokenizer, _, _ = build_models_and_tokenizer(config)
+    translator_pool, model_specs, translated_model_specs, _, _ = build_translator_pool(models, config)
     translator_pool.train()
 
     logger.info("[Setup] full model specs")
-    logger.info(
-        "  A: layers=%d, hidden=%d, heads=%d",
-        model_specs["A"].num_layers,
-        model_specs["A"].hidden_size,
-        model_specs["A"].num_heads,
-    )
-    logger.info(
-        "  B: layers=%d, hidden=%d, heads=%d",
-        model_specs["B"].num_layers,
-        model_specs["B"].hidden_size,
-        model_specs["B"].num_heads,
-    )
+    for node in nodes:
+        spec = model_specs[node.id]
+        logger.info(
+            "  %s (%s): layers=%d, hidden=%d, heads=%d",
+            node.id,
+            node.model_id,
+            spec.num_layers,
+            spec.hidden_size,
+            spec.num_heads,
+        )
+
     logger.info("[Setup] translated top-layer specs")
-    logger.info(
-        "  A_top: layers=%d / %d",
-        translated_model_specs["A"].num_layers,
-        model_specs["A"].num_layers,
-    )
-    logger.info(
-        "  B_top: layers=%d / %d",
-        translated_model_specs["B"].num_layers,
-        model_specs["B"].num_layers,
-    )
+    for node in nodes:
+        translated_spec = translated_model_specs[node.id]
+        full_spec = model_specs[node.id]
+        logger.info(
+            "  %s_top (%s): layers=%d / %d",
+            node.id,
+            node.model_id,
+            translated_spec.num_layers,
+            full_spec.num_layers,
+        )
+
     logger.info("[Setup] top_layers_ratio = %.4f", config.top_layers_ratio)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
@@ -477,44 +486,26 @@ def run_train(config: TrainConfig) -> Path:
             )
 
             with torch.no_grad():
-                past_a = extract_past_key_values(model_a, prefix_cache_ids)
-                past_b = extract_past_key_values(model_b, prefix_cache_ids)
-
-            direction_contexts = {
-                "A_to_B": {
-                    "source_past": past_a,
-                    "source_name": "A",
-                    "target_name": "B",
-                    "target_top_spec": translated_model_specs["B"],
-                    "target_full_past": past_b,
-                    "target_model": model_b,
-                },
-                "B_to_A": {
-                    "source_past": past_b,
-                    "source_name": "B",
-                    "target_name": "A",
-                    "target_top_spec": translated_model_specs["A"],
-                    "target_full_past": past_a,
-                    "target_model": model_a,
-                },
-            }
+                past_by_node_id = {
+                    node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                    for node in nodes
+                }
 
             total_direction_loss = 0.0
-            for direction in train_directions:
-                context = direction_contexts[direction]
-
+            for direction in model_directions:
+                edge = edge_map[direction]
                 translated_top_past = translator_pool.translate_top_layers(
-                    past_key_values=context["source_past"],
-                    src_name=context["source_name"],
-                    dst_name=context["target_name"],
-                    dst_spec=context["target_top_spec"],
+                    past_key_values=past_by_node_id[edge.src_id],
+                    src_name=edge.src_id,
+                    dst_name=edge.dst_id,
+                    dst_spec=translated_model_specs[edge.dst_id],
                 )
                 mixed_target_past = replace_top_layers(
-                    base_past_key_values=context["target_full_past"],
+                    base_past_key_values=past_by_node_id[edge.dst_id],
                     translated_top_past_key_values=translated_top_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
-                    target_model=context["target_model"],
+                    target_model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
@@ -558,10 +549,9 @@ def run_train(config: TrainConfig) -> Path:
         step=config.max_steps,
         extra={
             "note": "Final checkpoint trained with suffix LM loss only.",
-            "model_a": config.model_a_id,
-            "model_b": config.model_b_id,
+            "model_ids": config.model_ids,
             "top_layers_ratio": config.top_layers_ratio,
-            "train_directions": config.train_directions,
+            "model_directions": config.model_directions,
         },
     )
     final_gpu_memory = gpu_memory_tracker.summary()

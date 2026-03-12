@@ -64,6 +64,155 @@ class ModelSpec:
     head_dim: int
 
 
+@dataclass(frozen=True)
+class Node:
+    id: str
+    model_id: str
+
+
+@dataclass(frozen=True)
+class Edge:
+    id: str
+    src_id: str
+    dst_id: str
+
+
+def index_to_node_id(index: int) -> str:
+    if index < 0:
+        raise ValueError(f"index must be >= 0, got {index}")
+
+    chars = []
+    current = index
+    while True:
+        current, remainder = divmod(current, 26)
+        chars.append(chr(ord("A") + remainder))
+        if current == 0:
+            break
+        current -= 1
+    return "".join(reversed(chars))
+
+
+def parse_model_ids_csv(model_ids: str) -> List[str]:
+    parsed = [item.strip() for item in str(model_ids).split(",") if item.strip()]
+    if len(parsed) < 2:
+        raise ValueError("model_ids must contain at least two comma-separated model ids.")
+
+    duplicates = [item for item, count in Counter(parsed).items() if count > 1]
+    if duplicates:
+        raise ValueError(f"Duplicate model_ids are not allowed: {sorted(duplicates)}")
+    return parsed
+
+
+def build_nodes_from_model_ids(model_ids: str) -> List[Node]:
+    return [
+        Node(id=index_to_node_id(index), model_id=model_id)
+        for index, model_id in enumerate(parse_model_ids_csv(model_ids))
+    ]
+
+
+def build_allowed_edge_ids(nodes: List[Node]) -> List[str]:
+    edge_ids = []
+    for src_node in nodes:
+        for dst_node in nodes:
+            if src_node.id == dst_node.id:
+                continue
+            edge_ids.append(f"{src_node.id}_to_{dst_node.id}")
+    return edge_ids
+
+
+def parse_model_directions(model_directions: str, allowed_directions: Optional[Iterable[str]] = None) -> List[str]:
+    parsed = [item.strip() for item in str(model_directions).split(",") if item.strip()]
+    if not parsed:
+        raise ValueError("model_directions must contain at least one direction.")
+
+    allowed_set = None
+    if allowed_directions is not None:
+        allowed_set = set(allowed_directions)
+        if not allowed_set:
+            raise ValueError("allowed_directions must not be empty when provided.")
+
+    deduped = []
+    seen = set()
+    for item in parsed:
+        if allowed_set is not None and item not in allowed_set:
+            raise ValueError(
+                f"Unsupported model direction: {item}. "
+                f"Allowed values are: {sorted(allowed_set)}"
+            )
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
+
+
+def build_node_map(nodes: Iterable[Node]) -> Dict[str, Node]:
+    return {node.id: node for node in nodes}
+
+
+def build_edge_map(edges: Iterable[Edge]) -> Dict[str, Edge]:
+    return {edge.id: edge for edge in edges}
+
+
+def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edge]:
+    node_map = build_node_map(nodes)
+    direction_ids = parse_model_directions(
+        model_directions,
+        allowed_directions=build_allowed_edge_ids(nodes),
+    )
+
+    edges = []
+    for direction_id in direction_ids:
+        match = re.fullmatch(r"([A-Z]+)_to_([A-Z]+)", direction_id)
+        if match is None:
+            raise ValueError(
+                f"Invalid model direction format: {direction_id}. Expected format is <SRC>_to_<DST>."
+            )
+        src_id, dst_id = match.groups()
+        if src_id == dst_id:
+            raise ValueError(f"Self-direction is not allowed: {direction_id}")
+        if src_id not in node_map or dst_id not in node_map:
+            raise ValueError(
+                f"Unknown node in model direction: {direction_id}. Available node ids are: {sorted(node_map)}"
+            )
+        edges.append(
+            Edge(
+                id=direction_id,
+                src_id=src_id,
+                dst_id=dst_id,
+            )
+        )
+    return edges
+
+
+def build_nodes_and_edges(model_ids: str, model_directions: str) -> Tuple[List[Node], List[Edge]]:
+    nodes = build_nodes_from_model_ids(model_ids)
+    edges = build_edges_from_nodes(nodes, model_directions)
+    return nodes, edges
+
+
+def get_model_directions_value(config) -> str:
+    model_directions = getattr(config, "model_directions", None)
+    if model_directions is not None:
+        return model_directions
+
+    legacy_train_directions = getattr(config, "train_directions", None)
+    if legacy_train_directions is not None:
+        return legacy_train_directions
+
+    raise AttributeError("config must define model_directions")
+
+
+def normalize_train_config_dict(train_config: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(train_config)
+    if "model_directions" not in normalized and "train_directions" in normalized:
+        normalized["model_directions"] = normalized.pop("train_directions")
+    return normalized
+
+
+def parse_train_directions(train_directions: str, allowed_directions: Optional[Iterable[str]] = None) -> List[str]:
+    return parse_model_directions(train_directions, allowed_directions=allowed_directions)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -91,26 +240,6 @@ def get_torch_dtype(dtype_name: str) -> torch.dtype:
     if key not in mapping:
         raise ValueError(f"Unsupported dtype: {dtype_name}")
     return mapping[key]
-
-
-def parse_train_directions(train_directions: str) -> List[str]:
-    allowed = {"A_to_B", "B_to_A"}
-    parsed = [item.strip() for item in train_directions.split(",") if item.strip()]
-    if not parsed:
-        raise ValueError("train_directions must contain at least one direction.")
-
-    deduped = []
-    seen = set()
-    for item in parsed:
-        if item not in allowed:
-            raise ValueError(
-                f"Unsupported train direction: {item}. "
-                f"Allowed values are: {sorted(allowed)}"
-            )
-        if item not in seen:
-            deduped.append(item)
-            seen.add(item)
-    return deduped
 
 
 def load_tokenizer(model_id: str) -> PreTrainedTokenizerBase:
@@ -424,6 +553,8 @@ def build_dataclass_kwargs_from_json_and_namespace(
     default_kwargs = read_json(default_config_path)
 
     valid_field_names = {field_info.name for field_info in fields(config_cls)}
+    if "model_directions" in valid_field_names and "model_directions" not in default_kwargs and "train_directions" in default_kwargs:
+        default_kwargs["model_directions"] = default_kwargs.pop("train_directions")
     unknown_keys = sorted(set(default_kwargs) - valid_field_names)
     if unknown_keys:
         raise ValueError(

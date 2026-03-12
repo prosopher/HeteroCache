@@ -2,8 +2,8 @@
   "outputs_path": "outputs",
   "timestamp": null,
   "output_path": null,
-  "model_a_id": "gpt2",
-  "model_b_id": "gpt2-medium",
+  "model_ids": "gpt2,gpt2-medium",
+  "model_directions": "B_to_A",
   "max_steps": 500,
   "batch_size": 1,
   "grad_accum_steps": 16,
@@ -21,7 +21,6 @@
   "translator_heads": 16,
   "translator_depth": 2,
   "translator_mlp_ratio": 2,
-  "train_directions": "B_to_A",
   "device": "auto",
   "dtype": "float32"
 }

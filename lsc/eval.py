@@ -19,12 +19,14 @@ def evaluate_dataset(
     translator_pool,
     model_specs,
     translated_model_specs,
-    model_a,
-    model_b,
+    models,
+    nodes,
+    edges,
     active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
+    edge_map = build_edge_map(edges)
 
     path_metrics = {
         direction: RunningAverage()
@@ -56,59 +58,41 @@ def evaluate_dataset(
                 example=example,
             )
 
-            past_a = extract_past_key_values(model_a, prefix_cache_ids)
-            past_b = extract_past_key_values(model_b, prefix_cache_ids)
-
-            direction_contexts = {
-                "A_to_B": {
-                    "source_past": past_a,
-                    "source_name": "A",
-                    "target_name": "B",
-                    "target_top_spec": translated_model_specs["B"],
-                    "target_full_past": past_b,
-                    "target_model": model_b,
-                },
-                "B_to_A": {
-                    "source_past": past_b,
-                    "source_name": "B",
-                    "target_name": "A",
-                    "target_top_spec": translated_model_specs["A"],
-                    "target_full_past": past_a,
-                    "target_model": model_a,
-                },
+            past_by_node_id = {
+                node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                for node in nodes
             }
 
             for direction in active_directions:
-                context = direction_contexts[direction]
-
+                edge = edge_map[direction]
                 translated_top_past = translator_pool.translate_top_layers(
-                    past_key_values=context["source_past"],
-                    src_name=context["source_name"],
-                    dst_name=context["target_name"],
-                    dst_spec=context["target_top_spec"],
+                    past_key_values=past_by_node_id[edge.src_id],
+                    src_name=edge.src_id,
+                    dst_name=edge.dst_id,
+                    dst_spec=translated_model_specs[edge.dst_id],
                 )
 
                 target_top = slice_top_layers(
-                    past_key_values=context["target_full_past"],
-                    top_layers_to_translate=context["target_top_spec"].num_layers,
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    top_layers_to_translate=translated_model_specs[edge.dst_id].num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
                 mixed_target_past = replace_top_layers(
-                    base_past_key_values=context["target_full_past"],
+                    base_past_key_values=past_by_node_id[edge.dst_id],
                     translated_top_past_key_values=translated_top_past,
                 )
 
                 translated_scores = score_answer_choices(
-                    model=context["target_model"],
+                    model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
-                    model=context["target_model"],
-                    past_key_values=context["target_full_past"],
+                    model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
@@ -145,12 +129,14 @@ def evaluate_generation_dataset(
     translator_pool,
     model_specs,
     translated_model_specs,
-    model_a,
-    model_b,
+    models,
+    nodes,
+    edges,
     active_directions,
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
+    edge_map = build_edge_map(edges)
 
     path_metrics = {
         direction: GenerationRunningAverage()
@@ -173,7 +159,7 @@ def evaluate_generation_dataset(
                     context=context_text,
                     device=device,
                 )
-                context_input_ids = context_prefix["input_ids"]
+                cache_input_ids = context_prefix["input_ids"]
 
                 question_prefix = prepare_generation_question_prefix(
                     tokenizer=tokenizer,
@@ -182,9 +168,6 @@ def evaluate_generation_dataset(
                 )
                 question_cache_ids = question_prefix["cache_ids"]
                 seed_token = question_prefix["seed_token"]
-
-                past_a = extract_past_key_values(model_a, context_input_ids)
-                past_b = extract_past_key_values(model_b, context_input_ids)
             else:
                 prefix = prepare_generation_prefix(
                     tokenizer=tokenizer,
@@ -192,76 +175,58 @@ def evaluate_generation_dataset(
                     question=question,
                     device=device,
                 )
-                prefix_cache_ids = prefix["cache_ids"]
+                cache_input_ids = prefix["cache_ids"]
                 seed_token = prefix["seed_token"]
 
-                past_a = extract_past_key_values(model_a, prefix_cache_ids)
-                past_b = extract_past_key_values(model_b, prefix_cache_ids)
-
-            direction_contexts = {
-                "A_to_B": {
-                    "source_past": past_a,
-                    "source_name": "A",
-                    "target_name": "B",
-                    "target_top_spec": translated_model_specs["B"],
-                    "target_full_past": past_b,
-                    "target_model": model_b,
-                },
-                "B_to_A": {
-                    "source_past": past_b,
-                    "source_name": "B",
-                    "target_name": "A",
-                    "target_top_spec": translated_model_specs["A"],
-                    "target_full_past": past_a,
-                    "target_model": model_a,
-                },
+            past_by_node_id = {
+                node.id: extract_past_key_values(models[node.id], cache_input_ids)
+                for node in nodes
             }
 
             for direction in active_directions:
-                context = direction_contexts[direction]
-
+                edge = edge_map[direction]
                 translated_top_past = translator_pool.translate_top_layers(
-                    past_key_values=context["source_past"],
-                    src_name=context["source_name"],
-                    dst_name=context["target_name"],
-                    dst_spec=context["target_top_spec"],
+                    past_key_values=past_by_node_id[edge.src_id],
+                    src_name=edge.src_id,
+                    dst_name=edge.dst_id,
+                    dst_spec=translated_model_specs[edge.dst_id],
                 )
 
                 target_top = slice_top_layers(
-                    past_key_values=context["target_full_past"],
-                    top_layers_to_translate=context["target_top_spec"].num_layers,
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    top_layers_to_translate=translated_model_specs[edge.dst_id].num_layers,
                 )
                 cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
 
                 mixed_target_past = replace_top_layers(
-                    base_past_key_values=context["target_full_past"],
+                    base_past_key_values=past_by_node_id[edge.dst_id],
                     translated_top_past_key_values=translated_top_past,
                 )
 
                 if spec.answer_mode == "squad":
                     translated_generation_past = append_input_ids_to_past(
-                        model=context["target_model"],
+                        model=models[edge.dst_id],
                         past_key_values=mixed_target_past,
                         input_ids=question_cache_ids,
                     )
                     native_generation_past = append_input_ids_to_past(
-                        model=context["target_model"],
-                        past_key_values=context["target_full_past"],
+                        model=models[edge.dst_id],
+                        past_key_values=past_by_node_id[edge.dst_id],
                         input_ids=question_cache_ids,
                     )
                 else:
                     translated_generation_past = mixed_target_past
-                    native_generation_past = context["target_full_past"]
+                    native_generation_past = past_by_node_id[edge.dst_id]
 
                 translated_answer = generate_greedy_answer(
-                    model=context["target_model"],
+                    model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=translated_generation_past,
                     seed_token=seed_token,
                     max_new_tokens=eval_config.generation_max_new_tokens,
                 )
                 native_answer = generate_greedy_answer(
-                    model=context["target_model"],
+                    model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=native_generation_past,
                     seed_token=seed_token,
@@ -321,31 +286,35 @@ def run_eval(eval_config: EvalConfig) -> Path:
         translator_pool,
         model_specs,
         translated_model_specs,
-        model_a,
-        model_b,
+        models,
         tokenizer,
+        nodes,
+        edges,
     ) = load_translator_pool_from_checkpoint(
         checkpoint_path=str(checkpoint_path),
         device_override=eval_config.device,
     )
 
-    active_directions = parse_train_directions(train_config.train_directions)
+    active_directions = parse_model_directions(
+        train_config.model_directions,
+        allowed_directions=[edge.id for edge in edges],
+    )
 
     translator_pool.eval()
-    model_a.eval()
-    model_b.eval()
+    for model in models.values():
+        model.eval()
 
     logger.info("restored_train_config=%s", asdict(train_config))
-    logger.info("model_A=%s", train_config.model_a_id)
-    logger.info("model_B=%s", train_config.model_b_id)
+    logger.info("nodes=%s", [asdict(node) for node in nodes])
     logger.info("top_layers_ratio=%.6f", train_config.top_layers_ratio)
-    logger.info(
-        "translated_layers: A_top=%d/%d | B_top=%d/%d",
-        translated_model_specs["A"].num_layers,
-        model_specs["A"].num_layers,
-        translated_model_specs["B"].num_layers,
-        model_specs["B"].num_layers,
-    )
+    for node in nodes:
+        logger.info(
+            "translated_layers: %s_top=%d/%d (%s)",
+            node.id,
+            translated_model_specs[node.id].num_layers,
+            model_specs[node.id].num_layers,
+            node.model_id,
+        )
     logger.info("active_directions=%s", active_directions)
     logger.info("translation_mode=replace_top_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
@@ -416,8 +385,9 @@ def run_eval(eval_config: EvalConfig) -> Path:
             translator_pool=translator_pool,
             model_specs=model_specs,
             translated_model_specs=translated_model_specs,
-            model_a=model_a,
-            model_b=model_b,
+            models=models,
+            nodes=nodes,
+            edges=edges,
             active_directions=active_directions,
             logger=logger,
         )
@@ -427,8 +397,8 @@ def run_eval(eval_config: EvalConfig) -> Path:
             logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
-            model_a_id=train_config.model_a_id,
-            model_b_id=train_config.model_b_id,
+            nodes=nodes,
+            edges=edges,
             active_directions=active_directions,
         )
 
@@ -451,8 +421,9 @@ def run_eval(eval_config: EvalConfig) -> Path:
             translator_pool=translator_pool,
             model_specs=model_specs,
             translated_model_specs=translated_model_specs,
-            model_a=model_a,
-            model_b=model_b,
+            models=models,
+            nodes=nodes,
+            edges=edges,
             active_directions=active_directions,
             logger=logger,
         )
@@ -462,8 +433,8 @@ def run_eval(eval_config: EvalConfig) -> Path:
             logger=logger,
             dataset_name=spec.name_for_log,
             results=results,
-            model_a_id=train_config.model_a_id,
-            model_b_id=train_config.model_b_id,
+            nodes=nodes,
+            edges=edges,
             active_directions=active_directions,
         )
 
@@ -472,8 +443,8 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     final_summary_markdown = build_final_summary_markdown(
         alg=eval_config.alg,
-        model_a_id=train_config.model_a_id,
-        model_b_id=train_config.model_b_id,
+        nodes=nodes,
+        edges=edges,
         active_directions=active_directions,
         all_logit_results=all_logit_results,
         all_generation_results=all_generation_results,

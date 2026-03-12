@@ -778,26 +778,29 @@ def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningA
     return results
 
 
-def build_direction_pretty_name(direction: str, model_a_id: str, model_b_id: str) -> str:
-    if direction == "A_to_B":
-        return f"A_to_B ({model_a_id} -> {model_b_id})"
-    if direction == "B_to_A":
-        return f"B_to_A ({model_b_id} -> {model_a_id})"
-    return direction
+def build_direction_pretty_name(direction: str, nodes: List[Node], edges: List[Edge]) -> str:
+    node_map = build_node_map(nodes)
+    edge_map = build_edge_map(edges)
+    edge = edge_map.get(direction)
+    if edge is None:
+        return direction
+    src_model_id = node_map[edge.src_id].model_id
+    dst_model_id = node_map[edge.dst_id].model_id
+    return f"{edge.id} ({src_model_id} -> {dst_model_id})"
 
 
 def log_dataset_result(
     logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
-    model_a_id: str,
-    model_b_id: str,
+    nodes: List[Node],
+    edges: List[Edge],
     active_directions,
 ) -> None:
     logger.info("===== %s =====", dataset_name)
     for direction in active_directions:
         row = results[direction]
-        pretty_name = build_direction_pretty_name(direction, model_a_id, model_b_id)
+        pretty_name = build_direction_pretty_name(direction, nodes, edges)
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_name,
@@ -812,14 +815,14 @@ def log_generation_dataset_result(
     logger: logging.Logger,
     dataset_name: str,
     results: Dict[str, Dict[str, float]],
-    model_a_id: str,
-    model_b_id: str,
+    nodes: List[Node],
+    edges: List[Edge],
     active_directions,
 ) -> None:
     logger.info("===== %s =====", dataset_name)
     for direction in active_directions:
         row = results[direction]
-        pretty_name = build_direction_pretty_name(direction, model_a_id, model_b_id)
+        pretty_name = build_direction_pretty_name(direction, nodes, edges)
         logger.info(
             "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
@@ -858,11 +861,15 @@ def _format_summary_percent(value: float) -> str:
 def build_direction_summary_markdown_table(
     alg: str,
     direction: str,
-    model_a_id: str,
-    model_b_id: str,
+    nodes: List[Node],
+    edges: List[Edge],
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
 ) -> str:
+    node_map = build_node_map(nodes)
+    edge_map = build_edge_map(edges)
+    edge = edge_map.get(direction)
+
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
@@ -892,15 +899,13 @@ def build_direction_summary_markdown_table(
         logit_rows["MMLU"].get("native_accuracy", float("nan")),
     ])
 
-    if direction == "A_to_B":
-        target_model_id = model_b_id
-        direction_title = f"A_to_B 방향 ({model_a_id} -> {model_b_id})"
-    elif direction == "B_to_A":
-        target_model_id = model_a_id
-        direction_title = f"B_to_A 방향 ({model_b_id} -> {model_a_id})"
-    else:
+    if edge is None:
         target_model_id = "target"
         direction_title = direction
+    else:
+        src_model_id = node_map[edge.src_id].model_id
+        target_model_id = node_map[edge.dst_id].model_id
+        direction_title = f"{edge.id} 방향 ({src_model_id} -> {target_model_id})"
 
     lines = [
         f"### {direction_title}",
@@ -930,8 +935,8 @@ def build_direction_summary_markdown_table(
 
 def build_final_summary_markdown(
     alg: str,
-    model_a_id: str,
-    model_b_id: str,
+    nodes: List[Node],
+    edges: List[Edge],
     active_directions,
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
@@ -943,8 +948,8 @@ def build_final_summary_markdown(
             build_direction_summary_markdown_table(
                 alg=alg,
                 direction=direction,
-                model_a_id=model_a_id,
-                model_b_id=model_b_id,
+                nodes=nodes,
+                edges=edges,
                 all_logit_results=all_logit_results,
                 all_generation_results=all_generation_results,
             )
