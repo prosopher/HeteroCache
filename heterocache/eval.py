@@ -24,8 +24,6 @@ def evaluate_dataset(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
-    choice_labels = get_choice_labels(spec.answer_mode)
-    choice_token_ids = build_choice_token_ids(tokenizer, choice_labels)
 
     path_metrics = {
         direction: RunningAverage()
@@ -45,9 +43,17 @@ def evaluate_dataset(
                 device=device,
                 choices=example.get("choices"),
                 subject=example.get("subject"),
+                context=example.get("context"),
+                answer_mode=spec.answer_mode,
             )
             prefix_cache_ids = prefix["cache_ids"]
             seed_token = prefix["seed_token"]
+
+            candidate_token_ids = build_logit_answer_candidates(
+                tokenizer=tokenizer,
+                spec=spec,
+                example=example,
+            )
 
             past_a = extract_past_key_values(model_a, prefix_cache_ids)
             past_b = extract_past_key_values(model_b, prefix_cache_ids)
@@ -96,13 +102,15 @@ def evaluate_dataset(
                     model=context["target_model"],
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
-                    choice_token_ids=choice_token_ids,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
                     model=context["target_model"],
                     past_key_values=context["target_full_past"],
                     seed_token=seed_token,
-                    choice_token_ids=choice_token_ids,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
                 )
 
                 translated_pred = predict_answer_label(translated_scores)
@@ -299,11 +307,12 @@ def run_eval(eval_config: EvalConfig) -> Path:
     logit_dataset_specs = [
         HFDatasetSpec(
             name_for_log="BoolQ/validation",
-            dataset_path="boolq",
+            dataset_path="google/boolq",
             dataset_name=None,
             split="validation",
             answer_mode="boolq",
             question_field="question",
+            context_field="passage",
             streaming=False,
         ),
         HFDatasetSpec(
@@ -313,6 +322,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
             split="train",
             answer_mode="pubmed_qa",
             question_field="question",
+            context_field="context",
             streaming=False,
         ),
         HFDatasetSpec(

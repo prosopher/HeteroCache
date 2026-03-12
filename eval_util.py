@@ -251,22 +251,64 @@ def build_eval_dataloader(
     )
 
 
+def normalize_context_text(raw_value: Any) -> Optional[str]:
+    def _collect_strings(value: Any) -> List[str]:
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+
+        if isinstance(value, list):
+            parts: List[str] = []
+            for item in value:
+                parts.extend(_collect_strings(item))
+            return parts
+
+        if isinstance(value, dict):
+            for key in ("contexts", "context", "text", "abstract", "passage", "sentences"):
+                if key in value:
+                    parts = _collect_strings(value[key])
+                    if parts:
+                        return parts
+            return []
+
+        return []
+
+    parts = _collect_strings(raw_value)
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
 def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
         return None
 
     if spec.answer_mode == "boolq":
+        context_field = spec.context_field or "passage"
+        context = normalize_context_text(example.get(context_field, None))
+        if context is None:
+            return None
+
         answer_value = example.get("answer", None)
         if not isinstance(answer_value, bool):
             return None
 
         return {
             "question": question.strip(),
+            "context": context,
             "answer": "yes" if answer_value else "no",
         }
 
     if spec.answer_mode == "pubmed_qa":
+        context_field = spec.context_field or "context"
+        context = normalize_context_text(example.get(context_field, None))
+        if context is None:
+            return None
+
         answer_value = example.get("final_decision", None)
         if not isinstance(answer_value, str):
             return None
@@ -277,6 +319,7 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
 
         return {
             "question": question.strip(),
+            "context": context,
             "answer": normalized_answer,
         }
 
@@ -360,24 +403,59 @@ def format_question_prefix(
     question: str,
     choices: Optional[List[str]] = None,
     subject: Optional[str] = None,
+    context: Optional[str] = None,
+    answer_mode: Optional[str] = None,
 ) -> str:
-    if not choices:
-        return f"Question: {question.strip()}\nAnswer:"
+    question = question.strip()
 
-    prompt_lines = []
-    if isinstance(subject, str) and subject.strip():
-        prompt_lines.append(
-            "The following is a multiple choice question about "
-            f"{subject.strip().replace('_', ' ')}."
+    if answer_mode == "boolq":
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("BoolQ requires passage context.")
+        return (
+            "Read the passage and answer the question with yes or no only.\n\n"
+            f"Passage: {context.strip()}\n"
+            f"Question: {question}\n"
+            "Answer:"
         )
-        prompt_lines.append("")
 
-    prompt_lines.append(f"Question: {question.strip()}")
-    prompt_lines.append("Choices:")
+    if answer_mode == "pubmed_qa":
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("PubMedQA requires abstract context.")
+        return (
+            "Read the abstract and answer the biomedical research question with yes, no, or maybe only.\n\n"
+            f"Abstract: {context.strip()}\n"
+            f"Question: {question}\n"
+            "Answer:"
+        )
+
+    if answer_mode == "mmlu":
+        if not choices or len(choices) != 4:
+            raise ValueError("MMLU requires exactly 4 choices.")
+
+        prompt_lines = []
+        if isinstance(subject, str) and subject.strip():
+            prompt_lines.append(
+                "The following is a multiple choice question about "
+                f"{subject.strip().replace('_', ' ')}."
+            )
+            prompt_lines.append("")
+
+        prompt_lines.append(f"Question: {question}")
+        prompt_lines.append("Choices:")
+        for idx, choice in enumerate(choices):
+            label = chr(ord("A") + idx)
+            prompt_lines.append(f"{label}. {choice.strip()}")
+        prompt_lines.append("Answer with the exact option text only.")
+        prompt_lines.append("Answer:")
+        return "\n".join(prompt_lines)
+
+    if not choices:
+        return f"Question: {question}\nAnswer:"
+
+    prompt_lines = [f"Question: {question}", "Choices:"]
     for idx, choice in enumerate(choices):
         label = chr(ord("A") + idx)
         prompt_lines.append(f"{label}. {choice.strip()}")
-    prompt_lines.append("Answer with the option letter only.")
     prompt_lines.append("Answer:")
     return "\n".join(prompt_lines)
 
@@ -412,11 +490,15 @@ def prepare_question_prefix(
     device: str,
     choices: Optional[List[str]] = None,
     subject: Optional[str] = None,
+    context: Optional[str] = None,
+    answer_mode: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     prefix_text = format_question_prefix(
         question,
         choices=choices,
         subject=subject,
+        context=context,
+        answer_mode=answer_mode,
     )
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
@@ -426,24 +508,56 @@ def prepare_generation_prefix(tokenizer, context: str, question: str, device: st
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
-def get_choice_labels(answer_mode: str) -> List[str]:
-    if answer_mode == "boolq":
-        return ["yes", "no"]
-    if answer_mode == "pubmed_qa":
-        return ["yes", "no", "maybe"]
-    if answer_mode == "mmlu":
-        return ["A", "B", "C", "D"]
-    raise ValueError(f"Unsupported answer_mode: {answer_mode}")
+def build_text_candidate_token_ids(
+    tokenizer,
+    candidates: Dict[str, str],
+) -> Dict[str, torch.Tensor]:
+    token_ids_by_label: Dict[str, torch.Tensor] = {}
 
-
-def build_choice_token_ids(tokenizer, choice_labels: List[str]) -> Dict[str, torch.Tensor]:
-    choice_token_ids = {}
-    for label in choice_labels:
-        token_ids = tokenizer(f" {label}", add_special_tokens=False).input_ids
+    for label, text in candidates.items():
+        normalized_text = text.strip()
+        token_ids = tokenizer(
+            f" {normalized_text}",
+            add_special_tokens=False,
+        ).input_ids
         if len(token_ids) < 1:
-            raise ValueError(f"Failed to tokenize answer label: {label}")
-        choice_token_ids[label] = torch.tensor(token_ids, dtype=torch.long)
-    return choice_token_ids
+            raise ValueError(f"Failed to tokenize candidate text for label={label}: {text!r}")
+        token_ids_by_label[label] = torch.tensor(token_ids, dtype=torch.long)
+
+    return token_ids_by_label
+
+
+def build_logit_answer_candidates(
+    tokenizer,
+    spec: HFDatasetSpec,
+    example: Dict[str, Any],
+) -> Dict[str, torch.Tensor]:
+    if spec.answer_mode == "boolq":
+        return build_text_candidate_token_ids(
+            tokenizer,
+            {"yes": "yes", "no": "no"},
+        )
+
+    if spec.answer_mode == "pubmed_qa":
+        return build_text_candidate_token_ids(
+            tokenizer,
+            {"yes": "yes", "no": "no", "maybe": "maybe"},
+        )
+
+    if spec.answer_mode == "mmlu":
+        choices = example.get("choices", None)
+        if not isinstance(choices, list) or len(choices) != 4:
+            raise ValueError("MMLU example must contain exactly 4 choices.")
+
+        return build_text_candidate_token_ids(
+            tokenizer,
+            {
+                chr(ord("A") + idx): choice
+                for idx, choice in enumerate(choices)
+            },
+        )
+
+    raise ValueError(f"Unsupported answer_mode for logit scoring: {spec.answer_mode}")
 
 
 def score_candidate_logprob(
@@ -451,6 +565,7 @@ def score_candidate_logprob(
     past_key_values,
     seed_token: torch.Tensor,
     candidate_token_ids: torch.Tensor,
+    normalize_by_length: bool = True,
 ) -> float:
     device = seed_token.device
     candidate_ids = candidate_token_ids.to(device).unsqueeze(0)
@@ -467,7 +582,11 @@ def score_candidate_logprob(
     )
     log_probs = F.log_softmax(outputs.logits, dim=-1)
     token_log_probs = log_probs.gather(-1, candidate_ids.unsqueeze(-1)).squeeze(-1)
-    return token_log_probs.sum(dim=1).item()
+
+    score = token_log_probs.sum(dim=1).item()
+    if normalize_by_length:
+        score /= candidate_ids.shape[1]
+    return score
 
 
 def score_answer_choices(
@@ -475,6 +594,7 @@ def score_answer_choices(
     past_key_values,
     seed_token: torch.Tensor,
     choice_token_ids: Dict[str, torch.Tensor],
+    normalize_by_length: bool = True,
 ) -> Dict[str, float]:
     return {
         label: score_candidate_logprob(
@@ -482,6 +602,7 @@ def score_answer_choices(
             past_key_values=past_key_values,
             seed_token=seed_token,
             candidate_token_ids=choice_token_ids[label],
+            normalize_by_length=normalize_by_length,
         )
         for label in choice_token_ids
     }
