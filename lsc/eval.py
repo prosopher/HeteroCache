@@ -470,47 +470,11 @@ def run_eval(eval_config: EvalConfig) -> Path:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    logger.info("===== FINAL SUMMARY: LOGIT-SCORE QA =====")
-    for dataset_name, result in all_logit_results.items():
-        summary_parts = []
-        for direction in active_directions:
-            row = result[direction]
-            summary_parts.append(
-                f"{direction}(cos={row['cosine']:.6f}, acc={row['accuracy']:.6f}, native_acc={row['native_accuracy']:.6f})"
-            )
-        avg_row = result["AVG"]
-        summary_parts.append(
-            f"AVG(cos={avg_row['cosine']:.6f}, acc={avg_row['accuracy']:.6f}, native_acc={avg_row['native_accuracy']:.6f})"
-        )
-        logger.info("%s | %s", dataset_name, " | ".join(summary_parts))
-
-    logger.info("===== FINAL SUMMARY: GENERATION QA =====")
-    for dataset_name, result in all_generation_results.items():
-        summary_parts = []
-        for direction in active_directions:
-            row = result[direction]
-            summary_parts.append(
-                f"{direction}(cos={row['cosine']:.6f}, em={row['exact_match']:.6f}, f1={row['f1']:.6f}, native_em={row['native_exact_match']:.6f}, native_f1={row['native_f1']:.6f})"
-            )
-        avg_row = result["AVG"]
-        summary_parts.append(
-            f"AVG(cos={avg_row['cosine']:.6f}, em={avg_row['exact_match']:.6f}, f1={avg_row['f1']:.6f}, native_em={avg_row['native_exact_match']:.6f}, native_f1={avg_row['native_f1']:.6f})"
-        )
-        logger.info("%s | %s", dataset_name, " | ".join(summary_parts))
-
-    overall_logit_results = summarize_overall_results(all_logit_results, active_directions)
-    log_overall_result(
+    log_markdown_summary_tables(
         logger=logger,
-        results=overall_logit_results,
-        model_a_id=train_config.model_a_id,
-        model_b_id=train_config.model_b_id,
-        active_directions=active_directions,
-    )
-
-    overall_generation_results = summarize_generation_overall_results(all_generation_results, active_directions)
-    log_generation_overall_result(
-        logger=logger,
-        results=overall_generation_results,
+        alg_name=eval_config.alg,
+        all_logit_results=all_logit_results,
+        all_generation_results=all_generation_results,
         model_a_id=train_config.model_a_id,
         model_b_id=train_config.model_b_id,
         active_directions=active_directions,
