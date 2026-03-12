@@ -165,17 +165,38 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            prefix = prepare_generation_prefix(
-                tokenizer=tokenizer,
-                context=context_text,
-                question=question,
-                device=device,
-            )
-            prefix_cache_ids = prefix["cache_ids"]
-            seed_token = prefix["seed_token"]
+            question_cache_ids = None
 
-            past_a = extract_past_key_values(model_a, prefix_cache_ids)
-            past_b = extract_past_key_values(model_b, prefix_cache_ids)
+            if spec.answer_mode == "squad":
+                context_prefix = prepare_generation_context_inputs(
+                    tokenizer=tokenizer,
+                    context=context_text,
+                    device=device,
+                )
+                context_input_ids = context_prefix["input_ids"]
+
+                question_prefix = prepare_generation_question_prefix(
+                    tokenizer=tokenizer,
+                    question=question,
+                    device=device,
+                )
+                question_cache_ids = question_prefix["cache_ids"]
+                seed_token = question_prefix["seed_token"]
+
+                past_a = extract_past_key_values(model_a, context_input_ids)
+                past_b = extract_past_key_values(model_b, context_input_ids)
+            else:
+                prefix = prepare_generation_prefix(
+                    tokenizer=tokenizer,
+                    context=context_text,
+                    question=question,
+                    device=device,
+                )
+                prefix_cache_ids = prefix["cache_ids"]
+                seed_token = prefix["seed_token"]
+
+                past_a = extract_past_key_values(model_a, prefix_cache_ids)
+                past_b = extract_past_key_values(model_b, prefix_cache_ids)
 
             direction_contexts = {
                 "A_to_B": {
@@ -217,17 +238,32 @@ def evaluate_generation_dataset(
                     translated_top_past_key_values=translated_top_past,
                 )
 
+                if spec.answer_mode == "squad":
+                    translated_generation_past = append_input_ids_to_past(
+                        model=context["target_model"],
+                        past_key_values=mixed_target_past,
+                        input_ids=question_cache_ids,
+                    )
+                    native_generation_past = append_input_ids_to_past(
+                        model=context["target_model"],
+                        past_key_values=context["target_full_past"],
+                        input_ids=question_cache_ids,
+                    )
+                else:
+                    translated_generation_past = mixed_target_past
+                    native_generation_past = context["target_full_past"]
+
                 translated_answer = generate_greedy_answer(
                     model=context["target_model"],
                     tokenizer=tokenizer,
-                    past_key_values=mixed_target_past,
+                    past_key_values=translated_generation_past,
                     seed_token=seed_token,
                     max_new_tokens=eval_config.generation_max_new_tokens,
                 )
                 native_answer = generate_greedy_answer(
                     model=context["target_model"],
                     tokenizer=tokenizer,
-                    past_key_values=context["target_full_past"],
+                    past_key_values=native_generation_past,
                     seed_token=seed_token,
                     max_new_tokens=eval_config.generation_max_new_tokens,
                 )

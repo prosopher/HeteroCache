@@ -508,6 +508,58 @@ def prepare_generation_prefix(tokenizer, context: str, question: str, device: st
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
+def format_generation_context_prefix(context: str) -> str:
+    return (
+        "Read the passage and answer the question briefly.\n\n"
+        f"Context: {context.strip()}\n"
+    )
+
+
+def format_generation_question_prefix(question: str) -> str:
+    return (
+        f"Question: {question.strip()}\n"
+        "Answer:"
+    )
+
+
+def prepare_full_text_inputs(tokenizer, text: str, device: str) -> Dict[str, Any]:
+    tokenized = tokenizer(text, return_tensors="pt")
+    input_ids = tokenized.input_ids.to(device)
+    if input_ids.shape[1] < 1:
+        raise ValueError("Text must tokenize to at least 1 token.")
+    return {
+        "text": text,
+        "input_ids": input_ids,
+    }
+
+
+def prepare_generation_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_generation_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_generation_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
+@torch.inference_mode()
+def append_input_ids_to_past(
+    model,
+    past_key_values: PastKeyValues,
+    input_ids: torch.Tensor,
+) -> PastKeyValues:
+    if input_ids.shape[1] == 0:
+        return past_key_values
+
+    outputs = model(
+        input_ids=input_ids,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+    return outputs.past_key_values
+
+
 def build_text_candidate_token_ids(
     tokenizer,
     candidates: Dict[str, str],
