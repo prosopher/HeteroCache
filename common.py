@@ -120,6 +120,22 @@ def build_allowed_edge_ids(nodes: List[Node]) -> List[str]:
     return edge_ids
 
 
+def build_all_edges_from_nodes(nodes: List[Node]) -> List[Edge]:
+    edges = []
+    for src_node in nodes:
+        for dst_node in nodes:
+            if src_node.id == dst_node.id:
+                continue
+            edges.append(
+                Edge(
+                    id=f"{src_node.id}_to_{dst_node.id}",
+                    src_id=src_node.id,
+                    dst_id=dst_node.id,
+                )
+            )
+    return edges
+
+
 def parse_model_directions(model_directions: str, allowed_directions: Optional[Iterable[str]] = None) -> List[str]:
     parsed = [item.strip() for item in str(model_directions).split(",") if item.strip()]
     if not parsed:
@@ -184,33 +200,16 @@ def build_edges_from_nodes(nodes: List[Node], model_directions: str) -> List[Edg
     return edges
 
 
-def build_nodes_and_edges(model_ids: str, model_directions: str) -> Tuple[List[Node], List[Edge]]:
+def build_nodes_and_edges(
+    model_ids: str,
+    model_directions: Optional[str] = None,
+) -> Tuple[List[Node], List[Edge]]:
     nodes = build_nodes_from_model_ids(model_ids)
-    edges = build_edges_from_nodes(nodes, model_directions)
+    if model_directions is None:
+        edges = build_all_edges_from_nodes(nodes)
+    else:
+        edges = build_edges_from_nodes(nodes, model_directions)
     return nodes, edges
-
-
-def get_model_directions_value(config) -> str:
-    model_directions = getattr(config, "model_directions", None)
-    if model_directions is not None:
-        return model_directions
-
-    legacy_train_directions = getattr(config, "train_directions", None)
-    if legacy_train_directions is not None:
-        return legacy_train_directions
-
-    raise AttributeError("config must define model_directions")
-
-
-def normalize_train_config_dict(train_config: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = dict(train_config)
-    if "model_directions" not in normalized and "train_directions" in normalized:
-        normalized["model_directions"] = normalized.pop("train_directions")
-    return normalized
-
-
-def parse_train_directions(train_directions: str, allowed_directions: Optional[Iterable[str]] = None) -> List[str]:
-    return parse_model_directions(train_directions, allowed_directions=allowed_directions)
 
 
 def set_seed(seed: int) -> None:
@@ -553,8 +552,6 @@ def build_dataclass_kwargs_from_json_and_namespace(
     default_kwargs = read_json(default_config_path)
 
     valid_field_names = {field_info.name for field_info in fields(config_cls)}
-    if "model_directions" in valid_field_names and "model_directions" not in default_kwargs and "train_directions" in default_kwargs:
-        default_kwargs["model_directions"] = default_kwargs.pop("train_directions")
     unknown_keys = sorted(set(default_kwargs) - valid_field_names)
     if unknown_keys:
         raise ValueError(

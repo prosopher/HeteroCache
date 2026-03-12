@@ -125,7 +125,10 @@ class WarmupCosineScheduler:
 
 
 def build_models_and_tokenizer(config) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
-    nodes, edges = build_nodes_and_edges(config.model_ids, get_model_directions_value(config))
+    nodes, edges = build_nodes_and_edges(
+        config.model_ids,
+        getattr(config, "model_directions", None),
+    )
     tokenizer = load_tokenizer(nodes[0].model_id)
     models = {
         node.id: load_frozen_model(node.model_id, device=config.device, dtype=config.dtype)
@@ -159,7 +162,7 @@ def save_checkpoint(
 
 def load_train_config_from_checkpoint(checkpoint_path: str, config_cls):
     payload = torch.load(checkpoint_path, map_location="cpu")
-    return config_cls(**normalize_train_config_dict(payload["train_config"]))
+    return config_cls(**payload["train_config"])
 
 
 def get_train_config_path(output_path: Union[str, Path]) -> Path:

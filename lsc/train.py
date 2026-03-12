@@ -18,7 +18,6 @@ class TrainConfig:
     output_path: Optional[str]
 
     model_ids: str
-    model_directions: str
     max_steps: int
     batch_size: int
     grad_accum_steps: int
@@ -350,7 +349,7 @@ def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: TrainConfig,
 ) -> Tuple[SharedKVTranslatorPool, Dict[str, ModelSpec], Dict[str, ModelSpec], List[Node], List[Edge]]:
-    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
+    nodes, edges = build_nodes_and_edges(config.model_ids)
     full_model_specs = {
         node.id: get_model_spec(models[node.id])
         for node in nodes
@@ -385,7 +384,7 @@ def load_translator_pool_from_checkpoint(
     List[Edge],
 ]:
     payload = torch.load(checkpoint_path, map_location="cpu")
-    config = TrainConfig(**normalize_train_config_dict(payload["train_config"]))
+    config = TrainConfig(**payload["train_config"])
     if device_override is not None:
         config.device = device_override
     models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
@@ -404,7 +403,7 @@ def run_train(config: TrainConfig) -> Path:
     output_path = Path(config.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
+    nodes, edges = build_nodes_and_edges(config.model_ids)
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
 
@@ -416,10 +415,7 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("Starting training")
     logger.info("train_config=%s", asdict(config))
 
-    model_directions = parse_model_directions(
-        config.model_directions,
-        allowed_directions=[edge.id for edge in edges],
-    )
+    model_directions = [edge.id for edge in edges]
     logger.info("nodes=%s", [asdict(node) for node in nodes])
     logger.info("model_directions=%s", model_directions)
 
@@ -551,7 +547,6 @@ def run_train(config: TrainConfig) -> Path:
             "note": "Final checkpoint trained with suffix LM loss only.",
             "model_ids": config.model_ids,
             "top_layers_ratio": config.top_layers_ratio,
-            "model_directions": config.model_directions,
         },
     )
     final_gpu_memory = gpu_memory_tracker.summary()

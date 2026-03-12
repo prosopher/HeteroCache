@@ -295,10 +295,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
         device_override=eval_config.device,
     )
 
-    active_directions = parse_model_directions(
-        train_config.model_directions,
-        allowed_directions=[edge.id for edge in edges],
-    )
+    active_directions = [edge.id for edge in edges]
 
     translator_pool.eval()
     for model in models.values():

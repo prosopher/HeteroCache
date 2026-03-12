@@ -3,7 +3,6 @@
   "timestamp": null,
   "output_path": null,
   "model_ids": "gpt2,gpt2-medium",
-  "model_directions": "A_to_B,B_to_A",
   "max_steps": 10000,
   "batch_size": 1,
   "grad_accum_steps": 16,
