@@ -762,227 +762,20 @@ def compute_generation_f1(prediction: str, gold_answers: List[str]) -> float:
 
 def summarize_path_metrics(path_metrics: Dict[str, RunningAverage]) -> Dict[str, Dict[str, float]]:
     results = {}
-    total_cosine_sum = 0.0
-    total_accuracy_sum = 0.0
-    total_native_accuracy_sum = 0.0
-    total_count = 0
 
     for path_name, meter in path_metrics.items():
-        path_result = meter.summary()
-        results[path_name] = path_result
-
-        total_cosine_sum += meter.cosine_sum
-        total_accuracy_sum += meter.accuracy_sum
-        total_native_accuracy_sum += meter.native_accuracy_sum
-        total_count += meter.count
-
-    if total_count == 0:
-        results["AVG"] = {
-            "cosine": float("nan"),
-            "accuracy": float("nan"),
-            "native_accuracy": float("nan"),
-            "count": 0,
-        }
-    else:
-        results["AVG"] = {
-            "cosine": total_cosine_sum / total_count,
-            "accuracy": total_accuracy_sum / total_count,
-            "native_accuracy": total_native_accuracy_sum / total_count,
-            "count": total_count,
-        }
+        results[path_name] = meter.summary()
 
     return results
 
 
 def summarize_generation_path_metrics(path_metrics: Dict[str, GenerationRunningAverage]) -> Dict[str, Dict[str, float]]:
     results = {}
-    total_cosine_sum = 0.0
-    total_exact_match_sum = 0.0
-    total_f1_sum = 0.0
-    total_native_exact_match_sum = 0.0
-    total_native_f1_sum = 0.0
-    total_count = 0
 
     for path_name, meter in path_metrics.items():
-        path_result = meter.summary()
-        results[path_name] = path_result
-
-        total_cosine_sum += meter.cosine_sum
-        total_exact_match_sum += meter.exact_match_sum
-        total_f1_sum += meter.f1_sum
-        total_native_exact_match_sum += meter.native_exact_match_sum
-        total_native_f1_sum += meter.native_f1_sum
-        total_count += meter.count
-
-    if total_count == 0:
-        results["AVG"] = {
-            "cosine": float("nan"),
-            "exact_match": float("nan"),
-            "f1": float("nan"),
-            "native_exact_match": float("nan"),
-            "native_f1": float("nan"),
-            "count": 0,
-        }
-    else:
-        results["AVG"] = {
-            "cosine": total_cosine_sum / total_count,
-            "exact_match": total_exact_match_sum / total_count,
-            "f1": total_f1_sum / total_count,
-            "native_exact_match": total_native_exact_match_sum / total_count,
-            "native_f1": total_native_f1_sum / total_count,
-            "count": total_count,
-        }
+        results[path_name] = meter.summary()
 
     return results
-
-
-def summarize_overall_results(
-    all_results: Dict[str, Dict[str, Dict[str, float]]],
-    active_directions,
-) -> Dict[str, Dict[str, float]]:
-    overall = {
-        direction: {"cosine_sum": 0.0, "accuracy_sum": 0.0, "native_accuracy_sum": 0.0, "count": 0}
-        for direction in active_directions
-    }
-
-    for dataset_result in all_results.values():
-        for direction in active_directions:
-            row = dataset_result[direction]
-            count = int(row["count"])
-            overall[direction]["cosine_sum"] += float(row["cosine"]) * count
-            overall[direction]["accuracy_sum"] += float(row["accuracy"]) * count
-            overall[direction]["native_accuracy_sum"] += float(row["native_accuracy"]) * count
-            overall[direction]["count"] += count
-
-    summarized = {}
-    total_cosine_sum = 0.0
-    total_accuracy_sum = 0.0
-    total_native_accuracy_sum = 0.0
-    total_count = 0
-
-    for direction in active_directions:
-        count = overall[direction]["count"]
-        if count == 0:
-            summarized[direction] = {
-                "cosine": float("nan"),
-                "accuracy": float("nan"),
-                "native_accuracy": float("nan"),
-                "count": 0,
-            }
-        else:
-            summarized[direction] = {
-                "cosine": overall[direction]["cosine_sum"] / count,
-                "accuracy": overall[direction]["accuracy_sum"] / count,
-                "native_accuracy": overall[direction]["native_accuracy_sum"] / count,
-                "count": count,
-            }
-
-        total_cosine_sum += overall[direction]["cosine_sum"]
-        total_accuracy_sum += overall[direction]["accuracy_sum"]
-        total_native_accuracy_sum += overall[direction]["native_accuracy_sum"]
-        total_count += count
-
-    if total_count == 0:
-        summarized["AVG"] = {
-            "cosine": float("nan"),
-            "accuracy": float("nan"),
-            "native_accuracy": float("nan"),
-            "count": 0,
-        }
-    else:
-        summarized["AVG"] = {
-            "cosine": total_cosine_sum / total_count,
-            "accuracy": total_accuracy_sum / total_count,
-            "native_accuracy": total_native_accuracy_sum / total_count,
-            "count": total_count,
-        }
-
-    return summarized
-
-
-def summarize_generation_overall_results(
-    all_results: Dict[str, Dict[str, Dict[str, float]]],
-    active_directions,
-) -> Dict[str, Dict[str, float]]:
-    overall = {
-        direction: {
-            "cosine_sum": 0.0,
-            "exact_match_sum": 0.0,
-            "f1_sum": 0.0,
-            "native_exact_match_sum": 0.0,
-            "native_f1_sum": 0.0,
-            "count": 0,
-        }
-        for direction in active_directions
-    }
-
-    for dataset_result in all_results.values():
-        for direction in active_directions:
-            row = dataset_result[direction]
-            count = int(row["count"])
-            overall[direction]["cosine_sum"] += float(row["cosine"]) * count
-            overall[direction]["exact_match_sum"] += float(row["exact_match"]) * count
-            overall[direction]["f1_sum"] += float(row["f1"]) * count
-            overall[direction]["native_exact_match_sum"] += float(row["native_exact_match"]) * count
-            overall[direction]["native_f1_sum"] += float(row["native_f1"]) * count
-            overall[direction]["count"] += count
-
-    summarized = {}
-    total_cosine_sum = 0.0
-    total_exact_match_sum = 0.0
-    total_f1_sum = 0.0
-    total_native_exact_match_sum = 0.0
-    total_native_f1_sum = 0.0
-    total_count = 0
-
-    for direction in active_directions:
-        count = overall[direction]["count"]
-        if count == 0:
-            summarized[direction] = {
-                "cosine": float("nan"),
-                "exact_match": float("nan"),
-                "f1": float("nan"),
-                "native_exact_match": float("nan"),
-                "native_f1": float("nan"),
-                "count": 0,
-            }
-        else:
-            summarized[direction] = {
-                "cosine": overall[direction]["cosine_sum"] / count,
-                "exact_match": overall[direction]["exact_match_sum"] / count,
-                "f1": overall[direction]["f1_sum"] / count,
-                "native_exact_match": overall[direction]["native_exact_match_sum"] / count,
-                "native_f1": overall[direction]["native_f1_sum"] / count,
-                "count": count,
-            }
-
-        total_cosine_sum += overall[direction]["cosine_sum"]
-        total_exact_match_sum += overall[direction]["exact_match_sum"]
-        total_f1_sum += overall[direction]["f1_sum"]
-        total_native_exact_match_sum += overall[direction]["native_exact_match_sum"]
-        total_native_f1_sum += overall[direction]["native_f1_sum"]
-        total_count += count
-
-    if total_count == 0:
-        summarized["AVG"] = {
-            "cosine": float("nan"),
-            "exact_match": float("nan"),
-            "f1": float("nan"),
-            "native_exact_match": float("nan"),
-            "native_f1": float("nan"),
-            "count": 0,
-        }
-    else:
-        summarized["AVG"] = {
-            "cosine": total_cosine_sum / total_count,
-            "exact_match": total_exact_match_sum / total_count,
-            "f1": total_f1_sum / total_count,
-            "native_exact_match": total_native_exact_match_sum / total_count,
-            "native_f1": total_native_f1_sum / total_count,
-            "count": total_count,
-        }
-
-    return summarized
 
 
 def build_direction_pretty_name(direction: str, model_a_id: str, model_b_id: str) -> str:
@@ -1002,13 +795,9 @@ def log_dataset_result(
     active_directions,
 ) -> None:
     logger.info("===== %s =====", dataset_name)
-    for direction in list(active_directions) + ["AVG"]:
+    for direction in active_directions:
         row = results[direction]
-        pretty_name = (
-            "AVG (weighted over evaluated paths)"
-            if direction == "AVG"
-            else build_direction_pretty_name(direction, model_a_id, model_b_id)
-        )
+        pretty_name = build_direction_pretty_name(direction, model_a_id, model_b_id)
         logger.info(
             "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
             pretty_name,
@@ -1028,13 +817,9 @@ def log_generation_dataset_result(
     active_directions,
 ) -> None:
     logger.info("===== %s =====", dataset_name)
-    for direction in list(active_directions) + ["AVG"]:
+    for direction in active_directions:
         row = results[direction]
-        pretty_name = (
-            "AVG (weighted over evaluated paths)"
-            if direction == "AVG"
-            else build_direction_pretty_name(direction, model_a_id, model_b_id)
-        )
+        pretty_name = build_direction_pretty_name(direction, model_a_id, model_b_id)
         logger.info(
             "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
@@ -1047,53 +832,122 @@ def log_generation_dataset_result(
         )
 
 
-def log_overall_result(
-    logger: logging.Logger,
-    results: Dict[str, Dict[str, float]],
+def _is_valid_summary_value(value: Any) -> bool:
+    return isinstance(value, (int, float)) and value == value
+
+
+def _summary_mean(values: List[float]) -> float:
+    valid_values = [float(value) for value in values if _is_valid_summary_value(value)]
+    if not valid_values:
+        return float("nan")
+    return sum(valid_values) / len(valid_values)
+
+
+def _format_summary_float(value: float) -> str:
+    if not _is_valid_summary_value(value):
+        return "N/A"
+    return f"{float(value):.3f}"
+
+
+def _format_summary_percent(value: float) -> str:
+    if not _is_valid_summary_value(value):
+        return "N/A"
+    return f"{float(value) * 100.0:.1f}%"
+
+
+def build_direction_summary_markdown_table(
+    alg: str,
+    direction: str,
+    model_a_id: str,
+    model_b_id: str,
+    all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
+    all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
+) -> str:
+    logit_dataset_keys = [
+        ("BoolQ", "BoolQ/validation"),
+        ("PubMedQA", "PubMedQA/pqa_labeled/train"),
+        ("MMLU", "MMLU/all/validation"),
+    ]
+    squad_dataset_key = "SQuAD/validation"
+
+    logit_rows = {
+        display_name: all_logit_results.get(dataset_key, {}).get(direction, {})
+        for display_name, dataset_key in logit_dataset_keys
+    }
+    squad_row = all_generation_results.get(squad_dataset_key, {}).get(direction, {})
+
+    translated_cosine_avg = _summary_mean([
+        logit_rows["BoolQ"].get("cosine", float("nan")),
+        logit_rows["PubMedQA"].get("cosine", float("nan")),
+        logit_rows["MMLU"].get("cosine", float("nan")),
+    ])
+    translated_accuracy_avg = _summary_mean([
+        logit_rows["BoolQ"].get("accuracy", float("nan")),
+        logit_rows["PubMedQA"].get("accuracy", float("nan")),
+        logit_rows["MMLU"].get("accuracy", float("nan")),
+    ])
+    native_accuracy_avg = _summary_mean([
+        logit_rows["BoolQ"].get("native_accuracy", float("nan")),
+        logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
+        logit_rows["MMLU"].get("native_accuracy", float("nan")),
+    ])
+
+    if direction == "A_to_B":
+        target_model_id = model_b_id
+        direction_title = f"A_to_B 방향 ({model_a_id} -> {model_b_id})"
+    elif direction == "B_to_A":
+        target_model_id = model_a_id
+        direction_title = f"B_to_A 방향 ({model_b_id} -> {model_a_id})"
+    else:
+        target_model_id = "target"
+        direction_title = direction
+
+    lines = [
+        f"### {direction_title}",
+        "",
+        "| Method | Cosine Sim | BoolQ | PubMedQA | MMLU | Avg | SQuAD |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+        (
+            f"| {target_model_id} (target) | N/A | "
+            f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['MMLU'].get('native_accuracy', float('nan')))} | "
+            f"{_format_summary_percent(native_accuracy_avg)} | "
+            f"{_format_summary_float(squad_row.get('native_f1', float('nan')))} |"
+        ),
+        (
+            f"| {alg} | "
+            f"{_format_summary_float(translated_cosine_avg)} | "
+            f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
+            f"{_format_summary_percent(logit_rows['MMLU'].get('accuracy', float('nan')))} | "
+            f"{_format_summary_percent(translated_accuracy_avg)} | "
+            f"{_format_summary_float(squad_row.get('f1', float('nan')))} |"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def build_final_summary_markdown(
+    alg: str,
     model_a_id: str,
     model_b_id: str,
     active_directions,
-) -> None:
-    logger.info("===== OVERALL AVERAGE ACROSS LOGIT-SCORE QA DATASETS =====")
-    for direction in list(active_directions) + ["AVG"]:
-        row = results[direction]
-        pretty_name = (
-            "AVG (weighted over all logit-score QA datasets and evaluated paths)"
-            if direction == "AVG"
-            else build_direction_pretty_name(direction, model_a_id, model_b_id)
-        )
-        logger.info(
-            "%s | cosine=%.6f | accuracy=%.6f | native_accuracy=%.6f | count=%d",
-            pretty_name,
-            row["cosine"],
-            row["accuracy"],
-            row["native_accuracy"],
-            int(row["count"]),
+    all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
+    all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
+) -> str:
+    sections = []
+
+    for direction in active_directions:
+        sections.append(
+            build_direction_summary_markdown_table(
+                alg=alg,
+                direction=direction,
+                model_a_id=model_a_id,
+                model_b_id=model_b_id,
+                all_logit_results=all_logit_results,
+                all_generation_results=all_generation_results,
+            )
         )
 
-
-def log_generation_overall_result(
-    logger: logging.Logger,
-    results: Dict[str, Dict[str, float]],
-    model_a_id: str,
-    model_b_id: str,
-    active_directions,
-) -> None:
-    logger.info("===== OVERALL AVERAGE ACROSS GENERATION QA DATASETS =====")
-    for direction in list(active_directions) + ["AVG"]:
-        row = results[direction]
-        pretty_name = (
-            "AVG (weighted over all generation QA datasets and evaluated paths)"
-            if direction == "AVG"
-            else build_direction_pretty_name(direction, model_a_id, model_b_id)
-        )
-        logger.info(
-            "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
-            pretty_name,
-            row["cosine"],
-            row["exact_match"],
-            row["f1"],
-            row["native_exact_match"],
-            row["native_f1"],
-            int(row["count"]),
-        )
+    return "\n\n".join(sections)
