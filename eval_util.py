@@ -360,67 +360,26 @@ def format_question_prefix(
     question: str,
     choices: Optional[List[str]] = None,
     subject: Optional[str] = None,
-    answer_mode: Optional[str] = None,
 ) -> str:
-    question = question.strip()
+    if not choices:
+        return f"Question: {question.strip()}\nAnswer:"
 
-    if answer_mode == "boolq":
-        return (
-            "Read the question and answer with exactly one word: yes or no.\n\n"
-            f"Question: {question}\n"
-            "Answer: "
-        )
-
-    if answer_mode == "pubmed_qa":
-        return (
-            "Read the question and answer with exactly one word: yes, no, or maybe.\n\n"
-            f"Question: {question}\n"
-            "Answer: "
-        )
-
-    if answer_mode == "mmlu":
-        if not choices:
-            raise ValueError("MMLU requires choices.")
-
-        prompt_lines = []
-        if isinstance(subject, str) and subject.strip():
-            prompt_lines.append(
-                "The following is a multiple choice question about "
-                f"{subject.strip().replace('_', ' ')}."
-            )
-            prompt_lines.append("")
-
-        prompt_lines.append(f"Question: {question}")
-        prompt_lines.append("Choices:")
-        for idx, choice in enumerate(choices):
-            label = chr(ord("A") + idx)
-            prompt_lines.append(f"{label}. {choice.strip()}")
-
+    prompt_lines = []
+    if isinstance(subject, str) and subject.strip():
         prompt_lines.append(
-            "Answer with the correct option in the exact format '<letter>. <choice>'."
+            "The following is a multiple choice question about "
+            f"{subject.strip().replace('_', ' ')}."
         )
-        prompt_lines.append("Answer: ")
-        return "\n".join(prompt_lines)
+        prompt_lines.append("")
 
-    # fallback / legacy path
-    if choices:
-        prompt_lines = []
-        if isinstance(subject, str) and subject.strip():
-            prompt_lines.append(
-                "The following is a multiple choice question about "
-                f"{subject.strip().replace('_', ' ')}."
-            )
-            prompt_lines.append("")
-
-        prompt_lines.append(f"Question: {question}")
-        prompt_lines.append("Choices:")
-        for idx, choice in enumerate(choices):
-            label = chr(ord("A") + idx)
-            prompt_lines.append(f"{label}. {choice.strip()}")
-        prompt_lines.append("Answer: ")
-        return "\n".join(prompt_lines)
-
-    return f"Question: {question}\nAnswer: "
+    prompt_lines.append(f"Question: {question.strip()}")
+    prompt_lines.append("Choices:")
+    for idx, choice in enumerate(choices):
+        label = chr(ord("A") + idx)
+        prompt_lines.append(f"{label}. {choice.strip()}")
+    prompt_lines.append("Answer with the option letter only.")
+    prompt_lines.append("Answer:")
+    return "\n".join(prompt_lines)
 
 
 def format_generation_prompt(context: str, question: str) -> str:
@@ -453,13 +412,11 @@ def prepare_question_prefix(
     device: str,
     choices: Optional[List[str]] = None,
     subject: Optional[str] = None,
-    answer_mode: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     prefix_text = format_question_prefix(
         question,
         choices=choices,
         subject=subject,
-        answer_mode=answer_mode,
     )
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
@@ -469,58 +426,24 @@ def prepare_generation_prefix(tokenizer, context: str, question: str, device: st
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
-def build_answer_candidates(
-    spec: HFDatasetSpec,
-    example: Dict[str, Any],
-) -> Dict[str, List[str]]:
-    if spec.answer_mode == "boolq":
-        return {
-            "yes": ["yes"],
-            "no": ["no"],
-        }
-
-    if spec.answer_mode == "pubmed_qa":
-        return {
-            "yes": ["yes"],
-            "no": ["no"],
-            "maybe": ["maybe"],
-        }
-
-    if spec.answer_mode == "mmlu":
-        choices = example.get("choices", None)
-        if not isinstance(choices, list) or len(choices) != 4:
-            raise ValueError("MMLU example must contain exactly 4 choices.")
-
-        normalized_choices = []
-        for choice in choices:
-            if not isinstance(choice, str) or not choice.strip():
-                raise ValueError("Invalid MMLU choice.")
-            normalized_choices.append(choice.strip())
-
-        return {
-            chr(ord("A") + idx): [f"{chr(ord('A') + idx)}. {choice}"]
-            for idx, choice in enumerate(normalized_choices)
-        }
-
-    raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
+def get_choice_labels(answer_mode: str) -> List[str]:
+    if answer_mode == "boolq":
+        return ["yes", "no"]
+    if answer_mode == "pubmed_qa":
+        return ["yes", "no", "maybe"]
+    if answer_mode == "mmlu":
+        return ["A", "B", "C", "D"]
+    raise ValueError(f"Unsupported answer_mode: {answer_mode}")
 
 
-def build_candidate_token_ids(
-    tokenizer,
-    answer_candidates: Dict[str, List[str]],
-) -> Dict[str, List[torch.Tensor]]:
-    candidate_token_ids: Dict[str, List[torch.Tensor]] = {}
-
-    for label, candidate_texts in answer_candidates.items():
-        tokenized_variants: List[torch.Tensor] = []
-        for text in candidate_texts:
-            token_ids = tokenizer(text, add_special_tokens=False).input_ids
-            if len(token_ids) < 1:
-                raise ValueError(f"Failed to tokenize answer candidate: {label} -> {text!r}")
-            tokenized_variants.append(torch.tensor(token_ids, dtype=torch.long))
-        candidate_token_ids[label] = tokenized_variants
-
-    return candidate_token_ids
+def build_choice_token_ids(tokenizer, choice_labels: List[str]) -> Dict[str, torch.Tensor]:
+    choice_token_ids = {}
+    for label in choice_labels:
+        token_ids = tokenizer(f" {label}", add_special_tokens=False).input_ids
+        if len(token_ids) < 1:
+            raise ValueError(f"Failed to tokenize answer label: {label}")
+        choice_token_ids[label] = torch.tensor(token_ids, dtype=torch.long)
+    return choice_token_ids
 
 
 def score_candidate_logprob(
@@ -528,7 +451,6 @@ def score_candidate_logprob(
     past_key_values,
     seed_token: torch.Tensor,
     candidate_token_ids: torch.Tensor,
-    normalize_by_length: bool = True,
 ) -> float:
     device = seed_token.device
     candidate_ids = candidate_token_ids.to(device).unsqueeze(0)
@@ -545,36 +467,24 @@ def score_candidate_logprob(
     )
     log_probs = F.log_softmax(outputs.logits, dim=-1)
     token_log_probs = log_probs.gather(-1, candidate_ids.unsqueeze(-1)).squeeze(-1)
-    total_logprob = token_log_probs.sum(dim=1).item()
-
-    if normalize_by_length:
-        return total_logprob / candidate_ids.shape[1]
-    return total_logprob
+    return token_log_probs.sum(dim=1).item()
 
 
 def score_answer_choices(
     model,
     past_key_values,
     seed_token: torch.Tensor,
-    choice_token_ids: Dict[str, List[torch.Tensor]],
-    normalize_by_length: bool = True,
+    choice_token_ids: Dict[str, torch.Tensor],
 ) -> Dict[str, float]:
-    scores: Dict[str, float] = {}
-
-    for label, variants in choice_token_ids.items():
-        variant_scores = [
-            score_candidate_logprob(
-                model=model,
-                past_key_values=past_key_values,
-                seed_token=seed_token,
-                candidate_token_ids=variant,
-                normalize_by_length=normalize_by_length,
-            )
-            for variant in variants
-        ]
-        scores[label] = max(variant_scores)
-
-    return scores
+    return {
+        label: score_candidate_logprob(
+            model=model,
+            past_key_values=past_key_values,
+            seed_token=seed_token,
+            candidate_token_ids=choice_token_ids[label],
+        )
+        for label in choice_token_ids
+    }
 
 
 def predict_answer_label(choice_scores: Dict[str, float]) -> str:

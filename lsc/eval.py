@@ -25,6 +25,8 @@ def evaluate_dataset(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     device = train_config.device
+    choice_labels = get_choice_labels(spec.answer_mode)
+    choice_token_ids = build_choice_token_ids(tokenizer, choice_labels)
 
     path_metrics = {
         direction: RunningAverage()
@@ -44,13 +46,9 @@ def evaluate_dataset(
                 device=device,
                 choices=example.get("choices"),
                 subject=example.get("subject"),
-                answer_mode=spec.answer_mode,
             )
             prefix_cache_ids = prefix["cache_ids"]
             seed_token = prefix["seed_token"]
-
-            answer_candidates = build_answer_candidates(spec, example)
-            choice_token_ids = build_candidate_token_ids(tokenizer, answer_candidates)
 
             past_a = extract_past_key_values(model_a, prefix_cache_ids)
             past_b = extract_past_key_values(model_b, prefix_cache_ids)
@@ -100,14 +98,12 @@ def evaluate_dataset(
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
                     choice_token_ids=choice_token_ids,
-                    normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
                     model=context["target_model"],
                     past_key_values=context["target_full_past"],
                     seed_token=seed_token,
                     choice_token_ids=choice_token_ids,
-                    normalize_by_length=True,
                 )
 
                 translated_pred = predict_answer_label(translated_scores)
