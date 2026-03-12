@@ -905,10 +905,10 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim | BoolQ | PubMedQA | MMLU | Avg | SQuAD |",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU | Acc Avg | SQuAD |",
         "|---|---:|---:|---:|---:|---:|---:|",
         (
-            f"| {target_model_id} (target) | N/A | "
+            f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['MMLU'].get('native_accuracy', float('nan')))} | "
