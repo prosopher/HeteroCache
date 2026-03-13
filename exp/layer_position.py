@@ -846,16 +846,19 @@ def evaluate_logit_dataset(
     }
 
 
-def compute_average_accuracy(logit_results: Dict[str, Dict[str, Dict[str, float]]]) -> float:
-    accuracies = []
+def compute_average_metric(
+    logit_results: Dict[str, Dict[str, Dict[str, float]]],
+    metric_key: str,
+) -> float:
+    values = []
     for dataset_results in logit_results.values():
         for direction_results in dataset_results.values():
-            value = direction_results.get("accuracy")
+            value = direction_results.get(metric_key)
             if value is not None and value == value:
-                accuracies.append(float(value))
-    if not accuracies:
+                values.append(float(value))
+    if not values:
         return float("nan")
-    return sum(accuracies) / len(accuracies)
+    return sum(values) / len(values)
 
 
 
@@ -919,12 +922,18 @@ def run_eval(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    average_accuracy = compute_average_accuracy(logit_results)
-    logger.info("[Summary] average_accuracy=%.6f", average_accuracy)
+    average_accuracy = compute_average_metric(logit_results, "accuracy")
+    average_native_accuracy = compute_average_metric(logit_results, "native_accuracy")
+    logger.info(
+        "[Summary] average_accuracy=%.6f | average_native_accuracy=%.6f",
+        average_accuracy,
+        average_native_accuracy,
+    )
     return {
         "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
         "dataset_accuracies": logit_results,
         "average_accuracy": average_accuracy,
+        "average_native_accuracy": average_native_accuracy,
     }
 
 
@@ -934,6 +943,7 @@ def build_summary_markdown(metrics: Dict[str, Any]) -> str:
         "# Layer Position Result",
         "",
         f"- average_accuracy: {metrics['average_accuracy']:.6f}",
+        f"- average_native_accuracy: {metrics['average_native_accuracy']:.6f}",
         "",
         "## Dataset Accuracy",
         "",
@@ -960,6 +970,7 @@ def build_study_summary_row(
         "layer_to_translate": int(config.layer_to_translate),
         "relative_depth": float(reference_mapping["relative_depth"]),
         "average_accuracy": float(metrics["average_accuracy"]),
+        "average_native_accuracy": float(metrics["average_native_accuracy"]),
         "run_dir": str(run_dir),
     }
 
@@ -999,10 +1010,12 @@ def plot_study_summary(study_dir: Path) -> Path:
         raise FileNotFoundError(f"Study summary not found: {summary_path}")
 
     rows = []
+    native_values = []
     with summary_path.open("r", encoding="utf-8", newline="") as fp:
         for row in csv.DictReader(fp):
             try:
                 rows.append((int(row["layer_to_translate"]), float(row["average_accuracy"])))
+                native_values.append(float(row["average_native_accuracy"]))
             except (KeyError, ValueError):
                 continue
 
@@ -1012,17 +1025,26 @@ def plot_study_summary(study_dir: Path) -> Path:
     rows.sort(key=lambda item: item[0])
     x_values = [item[0] for item in rows]
     y_values = [item[1] for item in rows]
+    average_native_accuracy = sum(native_values) / len(native_values) if native_values else float("nan")
 
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(8, 4.5))
     ax = fig.add_subplot(111)
-    ax.plot(x_values, y_values, marker="o")
+    ax.plot(x_values, y_values, marker="o", label="Translated Accuracy")
+    if average_native_accuracy == average_native_accuracy:
+        ax.axhline(
+            average_native_accuracy,
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Native Accuracy Mean ({average_native_accuracy:.4f})",
+        )
     ax.set_xlabel("Layer Index")
     ax.set_ylabel("Accuracy")
     ax.set_title("Layer Position vs Accuracy")
     ax.set_xticks(x_values)
     ax.grid(True, alpha=0.3)
+    ax.legend()
     fig.tight_layout()
 
     chart_path = build_chart_path(study_dir)
@@ -1052,7 +1074,7 @@ def parse_args() -> argparse.Namespace:
         description="Train and evaluate a single translated layer by replaying target prefill before the layer, injecting it, and continuing above it."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2-medium")
-    parser.add_argument("--model-directions", default="A_to_B")
+    parser.add_argument("--model-directions", default="B_to_A")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--layer-to-translate", type=int, default=None)
     parser.add_argument("--print-target-num-layers", action="store_true")

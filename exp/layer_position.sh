@@ -24,7 +24,7 @@ echo "[LayerPosition] study_id=${STUDY_ID}"
 echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
 echo "[LayerPosition] target_num_layers=${NUM_LAYERS}"
 
-for ((layer_idx=0; layer_idx<NUM_LAYERS; layer_idx+=4)); do
+for ((layer_idx=0; layer_idx<NUM_LAYERS; layer_idx+=2)); do
   echo "[LayerPosition] ===== target layer ${layer_idx}/${NUM_LAYERS} ====="
   python exp/layer_position.py \
     --layer-to-translate "${layer_idx}" \
