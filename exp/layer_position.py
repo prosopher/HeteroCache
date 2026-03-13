@@ -1,75 +1,18 @@
 #!/usr/bin/env python3
-import argparse
 import csv
-import json
-import logging
-import math
-import re
 import sys
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-from transformers import AutoConfig, PreTrainedModel, PreTrainedTokenizerBase
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from common import (  # noqa: E402
-    Edge,
-    ModelSpec,
-    Node,
-    PastKeyValues,
-    build_edge_map,
-    build_nodes_and_edges,
-    cosine_similarity_between_past,
-    count_trainable_parameters,
-    extract_past_key_values,
-    get_model_spec,
-    move_past_to_device,
-    parse_model_directions,
-    resolve_device,
-    set_seed,
-    setup_logger,
-    write_json,
-)
-from eval_util import (  # noqa: E402
-    EvalConfig,
-    GenerationRunningAverage,
-    HFDatasetSpec,
-    RunningAverage,
-    append_input_ids_to_past,
-    build_eval_dataloader,
-    build_final_summary_markdown,
-    build_logit_answer_candidates,
-    compute_generation_exact_match,
-    compute_generation_f1,
-    generate_greedy_answer,
-    log_dataset_result,
-    log_generation_dataset_result,
-    predict_answer_label,
-    prepare_generation_context_inputs,
-    prepare_generation_prefix,
-    prepare_generation_question_prefix,
-    prepare_question_prefix,
-    score_answer_choices,
-    summarize_generation_path_metrics,
-    summarize_path_metrics,
-)
-from heterocache.train import PerLayerTranslator  # noqa: E402
-from train_util import (  # noqa: E402
-    GPUMemoryTracker,
-    WarmupCosineScheduler,
-    build_models_and_tokenizer,
-    build_training_dataloader,
-    compute_suffix_lm_loss,
-    split_prefix_and_suffix_for_exact_next_token_loss,
-)
+from common import *
+from eval_util import *
+from heterocache.train import *
+from train_util import *
+from transformers import AutoConfig
 
 
 LOGIT_DATASET_SPECS = [
@@ -105,20 +48,6 @@ LOGIT_DATASET_SPECS = [
     ),
 ]
 
-GENERATION_DATASET_SPECS = [
-    HFDatasetSpec(
-        name_for_log="SQuAD/validation",
-        dataset_path="rajpurkar/squad",
-        dataset_name=None,
-        split="validation",
-        answer_mode="squad",
-        question_field="question",
-        context_field="context",
-        answers_field="answers",
-        streaming=False,
-    ),
-]
-
 
 @dataclass(frozen=True)
 class LayerMapping:
@@ -138,7 +67,6 @@ class LayerPositionConfig:
     model_ids: str = "gpt2,gpt2-medium"
     model_directions: str = "B_to_A"
     reference_direction: Optional[str] = None
-    source_layer_strategy: str = "relative"
     layer_to_translate: Optional[int] = None
 
     output_root: str = "outputs/layer_position"
@@ -169,7 +97,6 @@ class LayerPositionConfig:
     eval_num_workers: int = 0
     eval_max_examples_per_dataset: int = 256
     eval_shuffle_stream: bool = False
-    generation_max_new_tokens: int = 32
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -181,11 +108,6 @@ class LayerPositionConfig:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
         if self.layer_to_translate is not None and self.layer_to_translate < 0:
             raise ValueError("layer_to_translate must be >= 0")
-        if self.source_layer_strategy != "relative":
-            raise ValueError(
-                "source_layer_strategy currently supports only 'relative' because the experiment "
-                "needs target-relative depth mapping across different model depths."
-            )
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
@@ -240,23 +162,19 @@ class SingleLayerTranslatorPool(nn.Module):
         self.active_directions = tuple(active_directions)
         self.edges_by_id = build_edge_map(edges)
 
-        adapters = {}
-        for direction in self.active_directions:
-            if direction not in self.layer_mappings:
-                raise ValueError(f"Missing layer mapping for direction {direction}")
-            edge = self.edges_by_id[direction]
-            src_spec = model_specs[edge.src_id]
-            dst_spec = model_specs[edge.dst_id]
-            adapters[direction] = SingleLayerDirectionalTranslator(
-                src_hidden_size=src_spec.hidden_size,
-                dst_hidden_size=dst_spec.hidden_size,
-                translator_dim=translator_dim,
-                translator_heads=translator_heads,
-                translator_depth=translator_depth,
-                mlp_ratio=mlp_ratio,
-            )
-
-        self.adapters = nn.ModuleDict(adapters)
+        self.adapters = nn.ModuleDict(
+            {
+                direction: SingleLayerDirectionalTranslator(
+                    src_hidden_size=model_specs[self.edges_by_id[direction].src_id].hidden_size,
+                    dst_hidden_size=model_specs[self.edges_by_id[direction].dst_id].hidden_size,
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                )
+                for direction in self.active_directions
+            }
+        )
 
     def translate_single_layer(
         self,
@@ -264,18 +182,37 @@ class SingleLayerTranslatorPool(nn.Module):
         src_name: str,
         dst_name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, LayerMapping]:
-        adapter_name = f"{src_name}_to_{dst_name}"
-        if adapter_name not in self.adapters:
-            raise ValueError(
-                f"Translator direction {adapter_name} is not available. Active directions: {list(self.active_directions)}"
-            )
-        mapping = self.layer_mappings[adapter_name]
-        key_layer, value_layer = extract_single_layer_block(
-            past_key_values=past_key_values,
-            layer_idx=mapping.src_layer_idx,
-        )
-        translated_key, translated_value = self.adapters[adapter_name](key_layer, value_layer)
+        direction = f"{src_name}_to_{dst_name}"
+        mapping = self.layer_mappings[direction]
+        key_layer, value_layer = extract_single_layer_block(past_key_values, mapping.src_layer_idx)
+        translated_key = self.adapters[direction].key_layer(key_layer)
+        translated_value = self.adapters[direction].value_layer(value_layer)
         return translated_key, translated_value, mapping
+
+
+class AccuracyMeter:
+    def __init__(self) -> None:
+        self.accuracy_sum = 0.0
+        self.native_accuracy_sum = 0.0
+        self.count = 0
+
+    def update(self, accuracy_value: float, native_accuracy_value: float, n: int = 1) -> None:
+        self.accuracy_sum += float(accuracy_value) * n
+        self.native_accuracy_sum += float(native_accuracy_value) * n
+        self.count += n
+
+    def summary(self) -> Dict[str, float]:
+        if self.count == 0:
+            return {
+                "accuracy": float("nan"),
+                "native_accuracy": float("nan"),
+                "count": 0,
+            }
+        return {
+            "accuracy": self.accuracy_sum / self.count,
+            "native_accuracy": self.native_accuracy_sum / self.count,
+            "count": self.count,
+        }
 
 
 class SimpleNamespaceConfig:
@@ -311,16 +248,14 @@ def resolve_reference_direction_metadata(
     reference_direction: Optional[str],
 ) -> Tuple[List[Node], List[Edge], List[str], Edge]:
     nodes, edges = build_nodes_and_edges(model_ids, model_directions)
-    active_directions = parse_model_directions(
-        model_directions,
-        allowed_directions=[edge.id for edge in edges],
-    )
+    active_directions = [edge.id for edge in edges]
+    if not active_directions:
+        raise ValueError("No active directions were resolved from model_directions")
     chosen_direction = reference_direction or active_directions[0]
     edge_map = build_edge_map(edges)
     if chosen_direction not in edge_map:
         raise ValueError(
-            f"reference_direction={chosen_direction!r} is not available. "
-            f"Choices: {sorted(edge_map)}"
+            f"reference_direction={chosen_direction!r} is not available. Choices: {sorted(edge_map)}"
         )
     return nodes, edges, active_directions, edge_map[chosen_direction]
 
@@ -354,7 +289,7 @@ def resolve_target_num_layers(
         model_directions=model_directions,
         reference_direction=reference_direction,
     )
-    node_map = {node.id: node for node in nodes}
+    node_map = build_node_map(nodes)
     target_model_id = node_map[reference_edge.dst_id].model_id
     return load_model_spec_from_pretrained_config(target_model_id).num_layers
 
@@ -371,33 +306,24 @@ def build_layer_mappings(
         raise ValueError("layer_to_translate must be set before building layer mappings")
     if not (0 <= config.layer_to_translate < reference_target_spec.num_layers):
         raise ValueError(
-            f"layer_to_translate={config.layer_to_translate} must be in "
-            f"[0, {reference_target_spec.num_layers - 1}] for target node {reference_edge.dst_id}."
+            f"layer_to_translate={config.layer_to_translate} must be in [0, {reference_target_spec.num_layers - 1}]"
         )
 
-    relative_depth = relative_depth_from_layer_index(
-        layer_idx=config.layer_to_translate,
-        num_layers=reference_target_spec.num_layers,
-    )
+    relative_depth = relative_depth_from_layer_index(config.layer_to_translate, reference_target_spec.num_layers)
     edge_map = build_edge_map(edges)
-
     mappings: Dict[str, LayerMapping] = {}
     for direction in active_directions:
         edge = edge_map[direction]
         src_spec = model_specs[edge.src_id]
         dst_spec = model_specs[edge.dst_id]
-
-        src_layer_idx = relative_depth_to_layer_index(relative_depth, src_spec.num_layers)
-        dst_layer_idx = relative_depth_to_layer_index(relative_depth, dst_spec.num_layers)
-
         mappings[direction] = LayerMapping(
             reference_direction=reference_edge.id,
             reference_target_node_id=reference_edge.dst_id,
             reference_target_num_layers=reference_target_spec.num_layers,
             reference_target_layer_idx=config.layer_to_translate,
             relative_depth=relative_depth,
-            src_layer_idx=src_layer_idx,
-            dst_layer_idx=dst_layer_idx,
+            src_layer_idx=relative_depth_to_layer_index(relative_depth, src_spec.num_layers),
+            dst_layer_idx=relative_depth_to_layer_index(relative_depth, dst_spec.num_layers),
             src_num_layers=src_spec.num_layers,
             dst_num_layers=dst_spec.num_layers,
         )
@@ -424,9 +350,9 @@ def single_layer_blocks_to_past(
     head_dim: int,
 ) -> PastKeyValues:
     batch_size, seq_len, hidden_size = key_layer.shape
-    expected_hidden = num_heads * head_dim
-    if hidden_size != expected_hidden:
-        raise ValueError(f"Hidden mismatch: got {hidden_size}, expected {expected_hidden}.")
+    expected_hidden_size = num_heads * head_dim
+    if hidden_size != expected_hidden_size:
+        raise ValueError(f"Hidden mismatch: got {hidden_size}, expected {expected_hidden_size}")
     key = key_layer.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
     value = value_layer.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
     return ((key, value),)
@@ -439,81 +365,23 @@ def replace_single_layer(
     translated_value_layer: torch.Tensor,
     dst_spec: ModelSpec,
 ) -> PastKeyValues:
-    if not (0 <= layer_idx < len(base_past_key_values)):
-        raise ValueError(f"layer_idx={layer_idx} must be in [0, {len(base_past_key_values) - 1}]")
-
-    translated_single = single_layer_blocks_to_past(
-        key_layer=translated_key_layer,
-        value_layer=translated_value_layer,
-        num_heads=dst_spec.num_heads,
-        head_dim=dst_spec.head_dim,
+    translated_key, translated_value = single_layer_blocks_to_past(
+        translated_key_layer,
+        translated_value_layer,
+        dst_spec.num_heads,
+        dst_spec.head_dim,
     )[0]
-
-    translated_key, translated_value = translated_single
-    base_list = list(base_past_key_values)
-    base_key, base_value = base_list[layer_idx]
-
-    if base_key.shape != translated_key.shape:
-        raise ValueError(
-            f"Key shape mismatch at layer {layer_idx}: base={tuple(base_key.shape)} vs translated={tuple(translated_key.shape)}"
-        )
-    if base_value.shape != translated_value.shape:
-        raise ValueError(
-            f"Value shape mismatch at layer {layer_idx}: base={tuple(base_value.shape)} vs translated={tuple(translated_value.shape)}"
-        )
-
-    base_list[layer_idx] = (translated_key, translated_value)
-    return tuple(base_list)
-
-
-def build_models_for_experiment(
-    config: LayerPositionConfig,
-) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
-    train_namespace = SimpleNamespaceConfig(
-        model_ids=config.model_ids,
-        model_directions=config.model_directions,
-        device=config.device,
-        dtype=config.dtype,
-    )
-    return build_models_and_tokenizer(train_namespace)
-
-
-def build_translator_pool(
-    models: Dict[str, PreTrainedModel],
-    config: LayerPositionConfig,
-    active_directions: List[str],
-    edges: List[Edge],
-    reference_edge: Edge,
-) -> Tuple[SingleLayerTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
-    model_specs = {
-        node_id: get_model_spec(model)
-        for node_id, model in models.items()
-    }
-    layer_mappings = build_layer_mappings(
-        config=config,
-        model_specs=model_specs,
-        edges=edges,
-        active_directions=active_directions,
-        reference_edge=reference_edge,
-    )
-    translator_pool = SingleLayerTranslatorPool(
-        model_specs=model_specs,
-        edges=edges,
-        layer_mappings=layer_mappings,
-        translator_dim=config.translator_dim,
-        translator_heads=config.translator_heads,
-        translator_depth=config.translator_depth,
-        mlp_ratio=config.translator_mlp_ratio,
-        active_directions=active_directions,
-    )
-    translator_pool.to(config.device)
-    return translator_pool, model_specs, layer_mappings
+    base = list(base_past_key_values)
+    base_key, base_value = base[layer_idx]
+    if base_key.shape != translated_key.shape or base_value.shape != translated_value.shape:
+        raise ValueError("Translated KV shape does not match target layer shape")
+    base[layer_idx] = (translated_key, translated_value)
+    return tuple(base)
 
 
 def build_run_output_dir(config: LayerPositionConfig) -> Path:
     study_id = config.study_id or f"run_{sanitize_slug(config.model_directions)}"
-    layer_tag = f"layer_{config.layer_to_translate:02d}"
-    return Path(config.output_root) / study_id / layer_tag
+    return Path(config.output_root) / study_id / f"layer_{config.layer_to_translate:02d}"
 
 
 def build_train_log_path(run_dir: Path) -> Path:
@@ -544,13 +412,17 @@ def build_summary_markdown_path(run_dir: Path) -> Path:
     return run_dir / "summary.md"
 
 
+def build_chart_path(study_dir: Path) -> Path:
+    return study_dir / "layer_position_accuracy.png"
+
+
 def log_layer_mappings(
     logger: logging.Logger,
     nodes: List[Node],
     model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, LayerMapping],
 ) -> None:
-    node_map = {node.id: node for node in nodes}
+    node_map = build_node_map(nodes)
     logger.info("[LayerMapping] reference direction = %s", next(iter(layer_mappings.values())).reference_direction)
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
@@ -585,17 +457,47 @@ def save_checkpoint(
         "scheduler_step": scheduler.step_id,
         "step": step,
         "experiment_config": asdict(config),
-        "layer_mappings": {
-            direction: asdict(mapping)
-            for direction, mapping in layer_mappings.items()
-        },
-        "model_specs": {
-            node_id: asdict(spec)
-            for node_id, spec in model_specs.items()
-        },
+        "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
+        "model_specs": {node_id: asdict(spec) for node_id, spec in model_specs.items()},
     }
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, checkpoint_path)
+
+
+def build_models_for_experiment(
+    config: LayerPositionConfig,
+) -> Tuple[Dict[str, PreTrainedModel], PreTrainedTokenizerBase, List[Node], List[Edge]]:
+    return build_models_and_tokenizer(
+        SimpleNamespaceConfig(
+            model_ids=config.model_ids,
+            model_directions=config.model_directions,
+            device=config.device,
+            dtype=config.dtype,
+        )
+    )
+
+
+def build_translator_pool(
+    models: Dict[str, PreTrainedModel],
+    config: LayerPositionConfig,
+    active_directions: List[str],
+    edges: List[Edge],
+    reference_edge: Edge,
+) -> Tuple[SingleLayerTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
+    model_specs = {node_id: get_model_spec(model) for node_id, model in models.items()}
+    layer_mappings = build_layer_mappings(config, model_specs, edges, active_directions, reference_edge)
+    translator_pool = SingleLayerTranslatorPool(
+        model_specs=model_specs,
+        edges=edges,
+        layer_mappings=layer_mappings,
+        translator_dim=config.translator_dim,
+        translator_heads=config.translator_heads,
+        translator_depth=config.translator_depth,
+        mlp_ratio=config.translator_mlp_ratio,
+        active_directions=active_directions,
+    )
+    translator_pool.to(config.device)
+    return translator_pool, model_specs, layer_mappings
 
 
 def run_train(
@@ -608,11 +510,9 @@ def run_train(
     active_directions: List[str],
     reference_edge: Edge,
 ) -> Tuple[SingleLayerTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
-    train_logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
-    train_logger.info("Starting single-layer position training")
-    train_logger.info("experiment_config=%s", asdict(config))
-    train_logger.info("nodes=%s", [asdict(node) for node in nodes])
-    train_logger.info("active_directions=%s", active_directions)
+    logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
+    logger.info("Starting single-layer position training")
+    logger.info("experiment_config=%s", asdict(config))
 
     translator_pool, model_specs, layer_mappings = build_translator_pool(
         models=models,
@@ -622,17 +522,8 @@ def run_train(
         reference_edge=reference_edge,
     )
     translator_pool.train()
-
-    log_layer_mappings(
-        logger=train_logger,
-        nodes=nodes,
-        model_specs=model_specs,
-        layer_mappings=layer_mappings,
-    )
-    train_logger.info(
-        "[Setup] translator trainable params = %s",
-        f"{count_trainable_parameters(translator_pool):,}",
-    )
+    log_layer_mappings(logger, nodes, model_specs, layer_mappings)
+    logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(
         tokenizer=tokenizer,
@@ -649,12 +540,7 @@ def run_train(
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    scheduler = WarmupCosineScheduler(
-        optimizer=optimizer,
-        warmup_steps=config.warmup_steps,
-        total_steps=config.max_steps,
-    )
-
+    scheduler = WarmupCosineScheduler(optimizer, config.warmup_steps, config.max_steps)
     edge_map = build_edge_map(edges)
     gpu_memory_tracker = GPUMemoryTracker(config.device)
     running_loss = 0.0
@@ -692,13 +578,12 @@ def run_train(
                     translated_value_layer=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
-                direction_loss = compute_suffix_lm_loss(
+                total_direction_loss = total_direction_loss + compute_suffix_lm_loss(
                     target_model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
                 )
-                total_direction_loss = total_direction_loss + direction_loss
 
             loss = total_direction_loss / config.grad_accum_steps
             loss.backward()
@@ -714,7 +599,7 @@ def run_train(
             avg_loss = running_loss / config.log_every
             progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.lr:.2e}")
             gpu_memory = gpu_memory_tracker.summary()
-            train_logger.info(
+            logger.info(
                 "[Step %04d] single_layer_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
@@ -724,9 +609,8 @@ def run_train(
             )
             running_loss = 0.0
 
-    checkpoint_path = build_checkpoint_path(run_dir)
     save_checkpoint(
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=build_checkpoint_path(run_dir),
         translator_pool=translator_pool,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -735,16 +619,7 @@ def run_train(
         layer_mappings=layer_mappings,
         model_specs=model_specs,
     )
-
-    final_gpu_memory = gpu_memory_tracker.summary()
-    train_logger.info(
-        "[Memory] avg_gpu_mem=%s | peak_gpu_mem=%s | samples=%d",
-        final_gpu_memory["avg_allocated_pretty"],
-        final_gpu_memory["peak_allocated_pretty"],
-        final_gpu_memory["num_samples"],
-    )
-    train_logger.info("[Done] checkpoint saved to %s", checkpoint_path)
-
+    logger.info("[Done] checkpoint saved to %s", build_checkpoint_path(run_dir))
     return translator_pool, model_specs, layer_mappings
 
 
@@ -763,36 +638,24 @@ def evaluate_logit_dataset(
     logger: logging.Logger,
 ) -> Dict[str, Dict[str, float]]:
     edge_map = build_edge_map(edges)
-    path_metrics = {
-        direction: RunningAverage()
-        for direction in active_directions
-    }
+    path_metrics = {direction: AccuracyMeter() for direction in active_directions}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
         for example in batch:
-            question = example["question"]
-            gold_answer = example["answer"]
-
             prefix = prepare_question_prefix(
                 tokenizer=tokenizer,
-                question=question,
+                question=example["question"],
                 device=config.device,
                 choices=example.get("choices"),
                 subject=example.get("subject"),
                 context=example.get("context"),
                 answer_mode=spec.answer_mode,
             )
-            prefix_cache_ids = prefix["cache_ids"]
-            seed_token = prefix["seed_token"]
-            candidate_token_ids = build_logit_answer_candidates(
-                tokenizer=tokenizer,
-                spec=spec,
-                example=example,
-            )
-
+            candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec, example=example)
+            gold_answer = example["answer"]
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                node.id: extract_past_key_values(models[node.id], prefix["cache_ids"])
                 for node in nodes
             }
 
@@ -803,25 +666,6 @@ def evaluate_logit_dataset(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-
-                target_key, target_value = extract_single_layer_block(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    layer_idx=mapping.dst_layer_idx,
-                )
-                translated_single_past = single_layer_blocks_to_past(
-                    key_layer=translated_key,
-                    value_layer=translated_value,
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
-                )
-                target_single_past = single_layer_blocks_to_past(
-                    key_layer=target_key,
-                    value_layer=target_value,
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
-                )
-                cosine_value = cosine_similarity_between_past(translated_single_past, target_single_past)
-
                 mixed_target_past = replace_single_layer(
                     base_past_key_values=past_by_node_id[edge.dst_id],
                     layer_idx=mapping.dst_layer_idx,
@@ -833,180 +677,53 @@ def evaluate_logit_dataset(
                 translated_scores = score_answer_choices(
                     model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
-                    seed_token=seed_token,
+                    seed_token=prefix["seed_token"],
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
                     model=models[edge.dst_id],
                     past_key_values=past_by_node_id[edge.dst_id],
-                    seed_token=seed_token,
+                    seed_token=prefix["seed_token"],
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
 
                 translated_pred = predict_answer_label(translated_scores)
                 native_pred = predict_answer_label(native_scores)
-
-                acc = 1.0 if translated_pred == gold_answer else 0.0
-                native_acc = 1.0 if native_pred == gold_answer else 0.0
-                path_metrics[direction].update(cosine_value, acc, native_acc, 1)
+                path_metrics[direction].update(
+                    accuracy_value=1.0 if translated_pred == gold_answer else 0.0,
+                    native_accuracy_value=1.0 if native_pred == gold_answer else 0.0,
+                    n=1,
+                )
 
             processed_examples += 1
 
         if batch_idx % 50 == 0:
             logger.info("[%s] progress: %d/%d examples", spec.name_for_log, processed_examples, config.eval_max_examples_per_dataset)
 
-    return summarize_path_metrics(path_metrics)
-
-
-@torch.inference_mode()
-def evaluate_generation_dataset(
-    spec: HFDatasetSpec,
-    dataloader: DataLoader,
-    tokenizer,
-    config: LayerPositionConfig,
-    translator_pool: SingleLayerTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
-    models: Dict[str, PreTrainedModel],
-    nodes: List[Node],
-    edges: List[Edge],
-    active_directions: List[str],
-    logger: logging.Logger,
-) -> Dict[str, Dict[str, float]]:
-    edge_map = build_edge_map(edges)
-    path_metrics = {
-        direction: GenerationRunningAverage()
-        for direction in active_directions
+    summarized = {direction: meter.summary() for direction, meter in path_metrics.items()}
+    return {
+        direction: {
+            "accuracy": row["accuracy"],
+            "native_accuracy": row["native_accuracy"],
+            "count": row["count"],
+        }
+        for direction, row in summarized.items()
     }
-    processed_examples = 0
 
-    for batch_idx, batch in enumerate(dataloader, start=1):
-        for example in batch:
-            question = example["question"]
-            context_text = example["context"]
-            gold_answers = example["answers"]
 
-            question_cache_ids = None
-            if spec.answer_mode == "squad":
-                context_prefix = prepare_generation_context_inputs(
-                    tokenizer=tokenizer,
-                    context=context_text,
-                    device=config.device,
-                )
-                cache_input_ids = context_prefix["input_ids"]
+def compute_average_accuracy(logit_results: Dict[str, Dict[str, Dict[str, float]]]) -> float:
+    accuracies = []
+    for dataset_results in logit_results.values():
+        for direction_results in dataset_results.values():
+            value = direction_results.get("accuracy")
+            if value is not None and value == value:
+                accuracies.append(float(value))
+    if not accuracies:
+        return float("nan")
+    return sum(accuracies) / len(accuracies)
 
-                question_prefix = prepare_generation_question_prefix(
-                    tokenizer=tokenizer,
-                    question=question,
-                    device=config.device,
-                )
-                question_cache_ids = question_prefix["cache_ids"]
-                seed_token = question_prefix["seed_token"]
-            else:
-                prefix = prepare_generation_prefix(
-                    tokenizer=tokenizer,
-                    context=context_text,
-                    question=question,
-                    device=config.device,
-                )
-                cache_input_ids = prefix["cache_ids"]
-                seed_token = prefix["seed_token"]
-
-            past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], cache_input_ids)
-                for node in nodes
-            }
-
-            for direction in active_directions:
-                edge = edge_map[direction]
-                translated_key, translated_value, mapping = translator_pool.translate_single_layer(
-                    past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                )
-
-                target_key, target_value = extract_single_layer_block(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    layer_idx=mapping.dst_layer_idx,
-                )
-                translated_single_past = single_layer_blocks_to_past(
-                    key_layer=translated_key,
-                    value_layer=translated_value,
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
-                )
-                target_single_past = single_layer_blocks_to_past(
-                    key_layer=target_key,
-                    value_layer=target_value,
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
-                )
-                cosine_value = cosine_similarity_between_past(translated_single_past, target_single_past)
-
-                mixed_target_past = replace_single_layer(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
-                    layer_idx=mapping.dst_layer_idx,
-                    translated_key_layer=translated_key,
-                    translated_value_layer=translated_value,
-                    dst_spec=model_specs[edge.dst_id],
-                )
-
-                if spec.answer_mode == "squad":
-                    translated_generation_past = append_input_ids_to_past(
-                        model=models[edge.dst_id],
-                        past_key_values=mixed_target_past,
-                        input_ids=question_cache_ids,
-                    )
-                    native_generation_past = append_input_ids_to_past(
-                        model=models[edge.dst_id],
-                        past_key_values=past_by_node_id[edge.dst_id],
-                        input_ids=question_cache_ids,
-                    )
-                else:
-                    translated_generation_past = mixed_target_past
-                    native_generation_past = past_by_node_id[edge.dst_id]
-
-                translated_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=translated_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
-                )
-                native_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=native_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
-                )
-
-                exact_match = compute_generation_exact_match(translated_answer, gold_answers)
-                f1 = compute_generation_f1(translated_answer, gold_answers)
-                native_exact_match = compute_generation_exact_match(native_answer, gold_answers)
-                native_f1 = compute_generation_f1(native_answer, gold_answers)
-
-                path_metrics[direction].update(
-                    cosine_value=cosine_value,
-                    exact_match_value=exact_match,
-                    f1_value=f1,
-                    native_exact_match_value=native_exact_match,
-                    native_f1_value=native_f1,
-                    n=1,
-                )
-
-            processed_examples += 1
-
-        if batch_idx % 25 == 0:
-            logger.info(
-                "[%s] generation progress: %d/%d examples",
-                spec.name_for_log,
-                processed_examples,
-                config.eval_max_examples_per_dataset,
-            )
-
-    return summarize_generation_path_metrics(path_metrics)
 
 
 def run_eval(
@@ -1021,45 +738,28 @@ def run_eval(
     edges: List[Edge],
     active_directions: List[str],
 ) -> Dict[str, Any]:
-    eval_logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
-    eval_logger.info("Starting single-layer position evaluation")
-    eval_logger.info("experiment_config=%s", asdict(config))
-    eval_logger.info("nodes=%s", [asdict(node) for node in nodes])
-    eval_logger.info("active_directions=%s", active_directions)
-    log_layer_mappings(
-        logger=eval_logger,
-        nodes=nodes,
-        model_specs=model_specs,
-        layer_mappings=layer_mappings,
-    )
+    logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
+    logger.info("Starting single-layer position evaluation")
+    logger.info("experiment_config=%s", asdict(config))
+    log_layer_mappings(logger, nodes, model_specs, layer_mappings)
 
     translator_pool.eval()
     for model in models.values():
         model.eval()
 
-    eval_config = EvalConfig(
-        alg="layer_position",
-        outputs_path=str(run_dir.parent),
-        timestamp=None,
-        output_path=str(run_dir),
-        checkpoint_path=str(build_checkpoint_path(run_dir)),
-        device=config.device,
+    eval_config = SimpleNamespaceConfig(
         batch_size=config.eval_batch_size,
         num_workers=config.eval_num_workers,
         max_examples_per_dataset=config.eval_max_examples_per_dataset,
         seed=config.seed,
         shuffle_eval_stream=config.eval_shuffle_stream,
         shuffle_buffer=config.shuffle_buffer,
-        generation_max_new_tokens=config.generation_max_new_tokens,
     )
 
-    all_logit_results: Dict[str, Dict[str, Dict[str, float]]] = {}
-    all_generation_results: Dict[str, Dict[str, Dict[str, float]]] = {}
-
+    logit_results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for spec in LOGIT_DATASET_SPECS:
-        eval_logger.info("Preparing dataloader for %s", spec.name_for_log)
         dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-        results = evaluate_logit_dataset(
+        dataset_results = evaluate_logit_dataset(
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
@@ -1070,83 +770,50 @@ def run_eval(
             nodes=nodes,
             edges=edges,
             active_directions=active_directions,
-            logger=eval_logger,
+            logger=logger,
         )
-        all_logit_results[spec.name_for_log] = results
-        log_dataset_result(
-            logger=eval_logger,
-            dataset_name=spec.name_for_log,
-            results=results,
-            nodes=nodes,
-            edges=edges,
-            active_directions=active_directions,
-        )
+        logit_results[spec.name_for_log] = dataset_results
+        for direction in active_directions:
+            row = dataset_results[direction]
+            logger.info(
+                "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | count=%d",
+                spec.name_for_log,
+                direction,
+                row["accuracy"],
+                row["native_accuracy"],
+                int(row["count"]),
+            )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    for spec in GENERATION_DATASET_SPECS:
-        eval_logger.info("Preparing generation dataloader for %s", spec.name_for_log)
-        dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-        results = evaluate_generation_dataset(
-            spec=spec,
-            dataloader=dataloader,
-            tokenizer=tokenizer,
-            config=config,
-            translator_pool=translator_pool,
-            model_specs=model_specs,
-            models=models,
-            nodes=nodes,
-            edges=edges,
-            active_directions=active_directions,
-            logger=eval_logger,
-        )
-        all_generation_results[spec.name_for_log] = results
-        log_generation_dataset_result(
-            logger=eval_logger,
-            dataset_name=spec.name_for_log,
-            results=results,
-            nodes=nodes,
-            edges=edges,
-            active_directions=active_directions,
-        )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    final_summary_markdown = build_final_summary_markdown(
-        alg="layer_position",
-        nodes=nodes,
-        edges=edges,
-        active_directions=active_directions,
-        all_logit_results=all_logit_results,
-        all_generation_results=all_generation_results,
-    )
-    eval_logger.info("===== FINAL MARKDOWN SUMMARY =====\n%s", final_summary_markdown)
-    metrics = {
-        "layer_mappings": {
-            direction: asdict(mapping)
-            for direction, mapping in layer_mappings.items()
-        },
-        "logit_results": all_logit_results,
-        "generation_results": all_generation_results,
-        "summary_markdown": final_summary_markdown,
+    average_accuracy = compute_average_accuracy(logit_results)
+    logger.info("[Summary] average_accuracy=%.6f", average_accuracy)
+    return {
+        "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
+        "dataset_accuracies": logit_results,
+        "average_accuracy": average_accuracy,
     }
-    return metrics
 
 
-def collect_scalar_metrics(metrics: Dict[str, Any], key: str) -> List[float]:
-    values: List[float] = []
-    for dataset_results in metrics.values():
-        for direction_results in dataset_results.values():
-            value = direction_results.get(key)
-            if value is not None:
-                values.append(float(value))
-    return values
 
+def build_summary_markdown(metrics: Dict[str, Any]) -> str:
+    lines = [
+        "# Layer Position Result",
+        "",
+        f"- average_accuracy: {metrics['average_accuracy']:.6f}",
+        "",
+        "## Dataset Accuracy",
+        "",
+        "| Dataset | Direction | Accuracy | Native Accuracy | Count |",
+        "|---|---|---:|---:|---:|",
+    ]
+    for dataset_name, dataset_results in metrics["dataset_accuracies"].items():
+        for direction, row in dataset_results.items():
+            lines.append(
+                f"| {dataset_name} | {direction} | {row['accuracy']:.6f} | {row['native_accuracy']:.6f} | {int(row['count'])} |"
+            )
+    return "\n".join(lines)
 
-def safe_mean(values: List[float]) -> Optional[float]:
-    if not values:
-        return None
-    return sum(values) / len(values)
 
 
 def build_study_summary_row(
@@ -1154,59 +821,82 @@ def build_study_summary_row(
     run_dir: Path,
     metrics: Dict[str, Any],
 ) -> Dict[str, Any]:
-    logit_results = metrics["logit_results"]
-    generation_results = metrics["generation_results"]
-    layer_mapping = next(iter(metrics["layer_mappings"].values()))
-
-    row = {
+    reference_mapping = next(iter(metrics["layer_mappings"].values()))
+    return {
         "study_id": config.study_id or "",
-        "layer_to_translate": config.layer_to_translate,
-        "relative_depth": layer_mapping["relative_depth"],
-        "reference_direction": layer_mapping["reference_direction"],
-        "reference_target_node_id": layer_mapping["reference_target_node_id"],
-        "reference_target_num_layers": layer_mapping["reference_target_num_layers"],
-        "avg_logit_translated_accuracy": safe_mean(collect_scalar_metrics(logit_results, "translated_accuracy")),
-        "avg_logit_native_accuracy": safe_mean(collect_scalar_metrics(logit_results, "native_accuracy")),
-        "avg_logit_delta_accuracy": safe_mean(collect_scalar_metrics(logit_results, "delta_accuracy")),
-        "avg_generation_translated_exact_match": safe_mean(
-            collect_scalar_metrics(generation_results, "translated_exact_match")
-        ),
-        "avg_generation_native_exact_match": safe_mean(
-            collect_scalar_metrics(generation_results, "native_exact_match")
-        ),
-        "avg_generation_delta_exact_match": safe_mean(
-            collect_scalar_metrics(generation_results, "delta_exact_match")
-        ),
-        "avg_generation_translated_f1": safe_mean(collect_scalar_metrics(generation_results, "translated_f1")),
-        "avg_generation_native_f1": safe_mean(collect_scalar_metrics(generation_results, "native_f1")),
-        "avg_generation_delta_f1": safe_mean(collect_scalar_metrics(generation_results, "delta_f1")),
+        "layer_to_translate": int(config.layer_to_translate),
+        "relative_depth": float(reference_mapping["relative_depth"]),
+        "average_accuracy": float(metrics["average_accuracy"]),
         "run_dir": str(run_dir),
     }
-    return row
+
 
 
 def update_study_summary(
     config: LayerPositionConfig,
     run_dir: Path,
     metrics: Dict[str, Any],
-) -> None:
+) -> Path:
     study_dir = run_dir.parent
     study_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = study_dir / "summary.csv"
+    row = build_study_summary_row(config, run_dir, metrics)
 
-    row = build_study_summary_row(config=config, run_dir=run_dir, metrics=metrics)
+    rows = []
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8", newline="") as fp:
+            rows = list(csv.DictReader(fp))
 
-    jsonl_path = study_dir / "summary.jsonl"
-    with jsonl_path.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    filtered_rows = [existing for existing in rows if int(existing["layer_to_translate"]) != row["layer_to_translate"]]
+    filtered_rows.append({key: str(value) for key, value in row.items()})
+    filtered_rows.sort(key=lambda item: int(item["layer_to_translate"]))
 
-    csv_path = study_dir / "summary.csv"
     fieldnames = list(row.keys())
-    write_header = not csv_path.exists()
-    with csv_path.open("a", encoding="utf-8", newline="") as fp:
+    with summary_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+        writer.writeheader()
+        writer.writerows(filtered_rows)
+    return summary_path
+
+
+
+def plot_study_summary(study_dir: Path) -> Path:
+    summary_path = study_dir / "summary.csv"
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Study summary not found: {summary_path}")
+
+    rows = []
+    with summary_path.open("r", encoding="utf-8", newline="") as fp:
+        for row in csv.DictReader(fp):
+            try:
+                rows.append((int(row["layer_to_translate"]), float(row["average_accuracy"])))
+            except (KeyError, ValueError):
+                continue
+
+    if not rows:
+        raise ValueError(f"No plottable rows found in {summary_path}")
+
+    rows.sort(key=lambda item: item[0])
+    x_values = [item[0] for item in rows]
+    y_values = [item[1] for item in rows]
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(8, 4.5))
+    ax = fig.add_subplot(111)
+    ax.plot(x_values, y_values, marker="o")
+    ax.set_xlabel("Layer Index")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Layer Position vs Accuracy")
+    ax.set_xticks(x_values)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    chart_path = build_chart_path(study_dir)
+    fig.savefig(chart_path, dpi=200)
+    plt.close(fig)
+    return chart_path
+
 
 
 def save_run_artifacts(
@@ -1214,30 +904,26 @@ def save_run_artifacts(
     run_dir: Path,
     layer_mappings: Dict[str, LayerMapping],
     metrics: Dict[str, Any],
-) -> None:
+) -> Tuple[Path, Path]:
     write_json(str(build_config_path(run_dir)), asdict(config))
-    write_json(
-        str(build_layer_mapping_path(run_dir)),
-        {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
-    )
+    write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
     write_json(str(build_metrics_path(run_dir)), metrics)
-    build_summary_markdown_path(run_dir).write_text(metrics["summary_markdown"], encoding="utf-8")
-    update_study_summary(config=config, run_dir=run_dir, metrics=metrics)
+    build_summary_markdown_path(run_dir).write_text(build_summary_markdown(metrics), encoding="utf-8")
+    summary_path = update_study_summary(config, run_dir, metrics)
+    return summary_path, build_metrics_path(run_dir)
+
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Train and evaluate a single-layer HeteroCache translation experiment at a target-relative "
-            "layer position."
-        )
+        description="Train and evaluate a single translated layer at each target-relative layer position."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2-medium")
     parser.add_argument("--model-directions", default="B_to_A")
     parser.add_argument("--reference-direction", default=None)
-    parser.add_argument("--source-layer-strategy", default="relative", choices=["relative"])
     parser.add_argument("--layer-to-translate", type=int, default=None)
     parser.add_argument("--print-target-num-layers", action="store_true")
+    parser.add_argument("--plot-study-summary", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/layer_position")
     parser.add_argument("--study-id", default=None)
@@ -1267,27 +953,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=256)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--generation-max-new-tokens", type=int, default=32)
     return parser.parse_args()
+
 
 
 def main() -> None:
     args = parse_args()
 
     if args.print_target_num_layers:
-        num_layers = resolve_target_num_layers(
-            model_ids=args.model_ids,
-            model_directions=args.model_directions,
-            reference_direction=args.reference_direction,
-        )
-        print(num_layers)
+        print(resolve_target_num_layers(args.model_ids, args.model_directions, args.reference_direction))
+        return
+
+    study_id = args.study_id or f"run_{sanitize_slug(args.model_directions)}"
+    study_dir = Path(args.output_root) / study_id
+    if args.plot_study_summary:
+        chart_path = plot_study_summary(study_dir)
+        print(chart_path)
         return
 
     config = LayerPositionConfig(
         model_ids=args.model_ids,
         model_directions=args.model_directions,
         reference_direction=args.reference_direction,
-        source_layer_strategy=args.source_layer_strategy,
         layer_to_translate=args.layer_to_translate,
         output_root=args.output_root,
         study_id=args.study_id,
@@ -1313,11 +1000,10 @@ def main() -> None:
         eval_num_workers=args.eval_num_workers,
         eval_max_examples_per_dataset=args.eval_max_examples_per_dataset,
         eval_shuffle_stream=args.eval_shuffle_stream,
-        generation_max_new_tokens=args.generation_max_new_tokens,
     )
 
     if config.layer_to_translate is None:
-        raise SystemExit("--layer-to-translate is required unless --print-target-num-layers is used.")
+        raise SystemExit("--layer-to-translate is required unless --print-target-num-layers or --plot-study-summary is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)
@@ -1328,7 +1014,6 @@ def main() -> None:
         model_directions=config.model_directions,
         reference_direction=config.reference_direction,
     )
-
     models, tokenizer, _, _ = build_models_for_experiment(config)
     translator_pool, model_specs, layer_mappings = run_train(
         config=config,
@@ -1352,17 +1037,11 @@ def main() -> None:
         edges=edges,
         active_directions=active_directions,
     )
-    save_run_artifacts(
-        config=config,
-        run_dir=run_dir,
-        layer_mappings=layer_mappings,
-        metrics=metrics,
-    )
+    summary_path, metrics_path = save_run_artifacts(config, run_dir, layer_mappings, metrics)
 
     print(f"Run directory: {run_dir}")
-    print(f"Checkpoint: {build_checkpoint_path(run_dir)}")
-    print(f"Metrics: {build_metrics_path(run_dir)}")
-    print(f"Study summary CSV: {run_dir.parent / 'summary.csv'}")
+    print(f"Metrics: {metrics_path}")
+    print(f"Study summary CSV: {summary_path}")
 
 
 if __name__ == "__main__":
