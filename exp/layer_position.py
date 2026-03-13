@@ -358,25 +358,167 @@ def single_layer_blocks_to_past(
     return ((key, value),)
 
 
-def replace_single_layer(
-    base_past_key_values: PastKeyValues,
-    layer_idx: int,
-    translated_key_layer: torch.Tensor,
-    translated_value_layer: torch.Tensor,
+def require_gpt2_transformer(model: PreTrainedModel):
+    transformer = getattr(model, "transformer", None)
+    if transformer is None or not hasattr(transformer, "h"):
+        raise ValueError(
+            "layer_position.py currently supports GPT-2 style decoder stacks only "
+            "(expected model.transformer.h to exist)."
+        )
+    return transformer
+
+
+def build_gpt2_input_hidden_states(model: PreTrainedModel, input_ids: torch.Tensor) -> torch.Tensor:
+    transformer = require_gpt2_transformer(model)
+    if input_ids.ndim != 2:
+        raise ValueError(f"input_ids must have shape [batch, seq], got {tuple(input_ids.shape)}")
+    batch_size, seq_len = input_ids.shape
+    position_ids = torch.arange(seq_len, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+    hidden_states = transformer.wte(input_ids) + transformer.wpe(position_ids)
+    drop = getattr(transformer, "drop", None)
+    if drop is not None:
+        hidden_states = drop(hidden_states)
+    return hidden_states
+
+
+def unpack_block_outputs(outputs: Any) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if isinstance(outputs, tuple):
+        if len(outputs) < 2:
+            raise ValueError("Expected GPT-2 block outputs to include present key/value cache.")
+        hidden_states = outputs[0]
+        present = outputs[1]
+    else:
+        hidden_states = getattr(outputs, "last_hidden_state", None)
+        if hidden_states is None:
+            hidden_states = getattr(outputs, "hidden_states", None)
+        present = getattr(outputs, "past_key_value", None)
+        if hidden_states is None or present is None:
+            raise ValueError("Unsupported block output type for GPT-2 layer replay.")
+    if not isinstance(present, tuple) or len(present) != 2:
+        raise ValueError("Expected present cache to be a (key, value) tuple.")
+    return hidden_states, present
+
+
+def run_gpt2_block_with_cache(block: nn.Module, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    outputs = block(
+        hidden_states,
+        layer_past=None,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        use_cache=True,
+        output_attentions=False,
+    )
+    return unpack_block_outputs(outputs)
+
+
+def run_gpt2_block_with_injected_layer(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    injected_key: torch.Tensor,
+    injected_value: torch.Tensor,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if injected_key.shape != injected_value.shape:
+        raise ValueError(
+            "Injected key/value must have identical shapes, "
+            f"got {tuple(injected_key.shape)} vs {tuple(injected_value.shape)}"
+        )
+
+    attn = block.attn
+    residual = hidden_states
+    attn_input = block.ln_1(hidden_states)
+
+    qkv = attn.c_attn(attn_input)
+    split_size = getattr(attn, "split_size", qkv.shape[-1] // 3)
+    query, _, _ = qkv.split(split_size, dim=2)
+
+    batch_size, seq_len, _ = query.shape
+    num_heads = attn.num_heads
+    head_dim = attn.head_dim
+    expected_cache_shape = (batch_size, num_heads, seq_len, head_dim)
+    if tuple(injected_key.shape) != expected_cache_shape:
+        raise ValueError(
+            "Injected cache shape mismatch for GPT-2 layer replay: "
+            f"expected {expected_cache_shape}, got {tuple(injected_key.shape)}"
+        )
+
+    query = query.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+
+    if getattr(attn, "reorder_and_upcast_attn", False) and hasattr(attn, "_upcast_and_reordered_attn"):
+        attn_output, _ = attn._upcast_and_reordered_attn(
+            query,
+            injected_key,
+            injected_value,
+            attention_mask=None,
+            head_mask=None,
+        )
+    else:
+        attn_output, _ = attn._attn(
+            query,
+            injected_key,
+            injected_value,
+            attention_mask=None,
+            head_mask=None,
+        )
+
+    attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
+    attn_output = attn.c_proj(attn_output)
+    attn_output = attn.resid_dropout(attn_output)
+    hidden_states = residual + attn_output
+
+    residual = hidden_states
+    hidden_states = hidden_states + block.mlp(block.ln_2(hidden_states))
+    return hidden_states, (injected_key, injected_value)
+
+
+def replay_target_prefill_with_single_layer(
+    target_model: PreTrainedModel,
+    prefix_input_ids: torch.Tensor,
+    target_layer_idx: int,
+    injected_key_layer: torch.Tensor,
+    injected_value_layer: torch.Tensor,
     dst_spec: ModelSpec,
 ) -> PastKeyValues:
     translated_key, translated_value = single_layer_blocks_to_past(
-        translated_key_layer,
-        translated_value_layer,
+        injected_key_layer,
+        injected_value_layer,
         dst_spec.num_heads,
         dst_spec.head_dim,
     )[0]
-    base = list(base_past_key_values)
-    base_key, base_value = base[layer_idx]
-    if base_key.shape != translated_key.shape or base_value.shape != translated_value.shape:
-        raise ValueError("Translated KV shape does not match target layer shape")
-    base[layer_idx] = (translated_key, translated_value)
-    return tuple(base)
+
+    transformer = require_gpt2_transformer(target_model)
+    if not (0 <= target_layer_idx < len(transformer.h)):
+        raise ValueError(f"target_layer_idx={target_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+
+    rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    if torch.is_grad_enabled():
+        with torch.no_grad():
+            hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
+            for lower_idx in range(target_layer_idx):
+                hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
+                rebuilt_past.append((present[0].detach(), present[1].detach()))
+        hidden_states = hidden_states.detach()
+    else:
+        hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
+        for lower_idx in range(target_layer_idx):
+            hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
+            rebuilt_past.append(present)
+
+    hidden_states, present = run_gpt2_block_with_injected_layer(
+        transformer.h[target_layer_idx],
+        hidden_states,
+        translated_key,
+        translated_value,
+    )
+    rebuilt_past.append(present)
+
+    for upper_idx in range(target_layer_idx + 1, len(transformer.h)):
+        hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
+        rebuilt_past.append(present)
+
+    return tuple(rebuilt_past)
 
 
 def build_run_output_dir(config: LayerPositionConfig) -> Path:
@@ -511,7 +653,7 @@ def run_train(
     reference_edge: Edge,
 ) -> Tuple[SingleLayerTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
-    logger.info("Starting single-layer position training")
+    logger.info("Starting single-layer position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
 
     translator_pool, model_specs, layer_mappings = build_translator_pool(
@@ -571,11 +713,12 @@ def run_train(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replace_single_layer(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
-                    layer_idx=mapping.dst_layer_idx,
-                    translated_key_layer=translated_key,
-                    translated_value_layer=translated_value,
+                mixed_target_past = replay_target_prefill_with_single_layer(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=prefix_cache_ids,
+                    target_layer_idx=mapping.dst_layer_idx,
+                    injected_key_layer=translated_key,
+                    injected_value_layer=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
                 total_direction_loss = total_direction_loss + compute_suffix_lm_loss(
@@ -666,11 +809,24 @@ def evaluate_logit_dataset(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replace_single_layer(
-                    base_past_key_values=past_by_node_id[edge.dst_id],
-                    layer_idx=mapping.dst_layer_idx,
-                    translated_key_layer=translated_key,
-                    translated_value_layer=translated_value,
+                mixed_target_past = replay_target_prefill_with_single_layer(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=prefix["cache_ids"],
+                    target_layer_idx=mapping.dst_layer_idx,
+                    injected_key_layer=translated_key,
+                    injected_value_layer=translated_value,
+                    dst_spec=model_specs[edge.dst_id],
+                )
+                native_key_layer, native_value_layer = extract_single_layer_block(
+                    past_by_node_id[edge.dst_id],
+                    mapping.dst_layer_idx,
+                )
+                replayed_native_past = replay_target_prefill_with_single_layer(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=prefix["cache_ids"],
+                    target_layer_idx=mapping.dst_layer_idx,
+                    injected_key_layer=native_key_layer,
+                    injected_value_layer=native_value_layer,
                     dst_spec=model_specs[edge.dst_id],
                 )
 
@@ -683,7 +839,7 @@ def evaluate_logit_dataset(
                 )
                 native_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    past_key_values=replayed_native_past,
                     seed_token=prefix["seed_token"],
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
@@ -739,7 +895,7 @@ def run_eval(
     active_directions: List[str],
 ) -> Dict[str, Any]:
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
-    logger.info("Starting single-layer position evaluation")
+    logger.info("Starting single-layer position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
     log_layer_mappings(logger, nodes, model_specs, layer_mappings)
 
@@ -916,7 +1072,7 @@ def save_run_artifacts(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a single translated layer at each target-relative layer position."
+        description="Train and evaluate a single translated layer by replaying target prefill before the layer, injecting it, and continuing above it."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="B_to_A")
