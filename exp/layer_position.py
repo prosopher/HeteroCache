@@ -36,16 +36,6 @@ LOGIT_DATASET_SPECS = [
         context_field="context",
         streaming=False,
     ),
-    HFDatasetSpec(
-        name_for_log="MMLU/all/validation",
-        dataset_path="cais/mmlu",
-        dataset_name="all",
-        split="validation",
-        answer_mode="mmlu",
-        question_field="question",
-        subject_field="subject",
-        streaming=False,
-    ),
 ]
 
 
@@ -64,8 +54,8 @@ class LayerMapping:
 
 @dataclass
 class LayerPositionConfig:
-    model_ids: str = "gpt2,gpt2-medium"
-    model_directions: str = "B_to_A"
+    model_ids: str = "gpt2,gpt2"
+    model_directions: str = "A_to_B"
     reference_direction: Optional[str] = None
     layer_to_translate: Optional[int] = None
 
@@ -817,19 +807,6 @@ def evaluate_logit_dataset(
                     injected_value_layer=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
-                native_key_layer, native_value_layer = extract_single_layer_block(
-                    past_by_node_id[edge.dst_id],
-                    mapping.dst_layer_idx,
-                )
-                replayed_native_past = replay_target_prefill_with_single_layer(
-                    target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix["cache_ids"],
-                    target_layer_idx=mapping.dst_layer_idx,
-                    injected_key_layer=native_key_layer,
-                    injected_value_layer=native_value_layer,
-                    dst_spec=model_specs[edge.dst_id],
-                )
-
                 translated_scores = score_answer_choices(
                     model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
@@ -839,7 +816,7 @@ def evaluate_logit_dataset(
                 )
                 native_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=replayed_native_past,
+                    past_key_values=past_by_node_id[edge.dst_id],
                     seed_token=prefix["seed_token"],
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
@@ -1107,7 +1084,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--eval-num-workers", type=int, default=0)
-    parser.add_argument("--eval-max-examples-per-dataset", type=int, default=500)
+    parser.add_argument("--eval-max-examples-per-dataset", type=int, default=256)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     return parser.parse_args()
 
