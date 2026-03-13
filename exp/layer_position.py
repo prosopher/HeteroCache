@@ -1137,7 +1137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-ids", default="gpt2,gpt2-medium")
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
-    parser.add_argument("--layer-to-translate", type=int, default=None)
+    parser.add_argument("--position-ratio", type=float, default=None)
     parser.add_argument("--print-target-num-layers", action="store_true")
     parser.add_argument("--plot-study-summary", action="store_true")
 
