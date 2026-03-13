@@ -929,8 +929,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--study-id", default=None)
 
     parser.add_argument("--max-steps", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--grad-accum-steps", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--total-tokens", type=int, default=128)
     parser.add_argument("--prefix-tokens", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -941,15 +941,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=50_000)
 
-    parser.add_argument("--translator-dim", type=int, default=1024)
-    parser.add_argument("--translator-heads", type=int, default=16)
+    parser.add_argument("--translator-dim", type=int, default=256)
+    parser.add_argument("--translator-heads", type=int, default=4)
     parser.add_argument("--translator-depth", type=int, default=2)
-    parser.add_argument("--translator-mlp-ratio", type=int, default=2)
+    parser.add_argument("--translator-mlp-ratio", type=int, default=1)
 
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="float32")
 
-    parser.add_argument("--eval-batch-size", type=int, default=1)
+    parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=500)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
