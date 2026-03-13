@@ -24,10 +24,11 @@ echo "[LayerPosition] study_id=${STUDY_ID}"
 echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
 echo "[LayerPosition] target_num_layers=${NUM_LAYERS}"
 
-for ((layer_idx=0; layer_idx<NUM_LAYERS; layer_idx+=2)); do
-  echo "[LayerPosition] ===== target layer ${layer_idx}/${NUM_LAYERS} ====="
+POSITION_RATIOS=(0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0)
+for ratio in "${POSITION_RATIOS[@]}"; do
+  echo "[LayerPosition] ===== position ratio ${ratio} ====="
   python exp/layer_position.py \
-    --layer-to-translate "${layer_idx}" \
+    --position-ratio "${ratio}" \
     --output-root "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
     "${COMMON_ARGS[@]}"
