@@ -918,7 +918,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train and evaluate a single translated layer at each target-relative layer position."
     )
-    parser.add_argument("--model-ids", default="gpt2,gpt2-medium")
+    parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="B_to_A")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--layer-to-translate", type=int, default=None)
