@@ -96,10 +96,6 @@ def parse_model_ids_csv(model_ids: str) -> List[str]:
     parsed = [item.strip() for item in str(model_ids).split(",") if item.strip()]
     if len(parsed) < 2:
         raise ValueError("model_ids must contain at least two comma-separated model ids.")
-
-    duplicates = [item for item, count in Counter(parsed).items() if count > 1]
-    if duplicates:
-        raise ValueError(f"Duplicate model_ids are not allowed: {sorted(duplicates)}")
     return parsed
 
 
