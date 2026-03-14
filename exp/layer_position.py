@@ -1329,7 +1329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=200)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="squad_f1")
+    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=32)
     return parser.parse_args()
 
