@@ -15,6 +15,29 @@ from train_util import *
 from transformers import AutoConfig
 
 
+LOGIT_QA_DATASET_SPECS = [
+    HFDatasetSpec(
+        name_for_log="BoolQ/validation",
+        dataset_path="google/boolq",
+        dataset_name=None,
+        split="validation",
+        answer_mode="boolq",
+        question_field="question",
+        context_field="passage",
+        streaming=False,
+    ),
+    HFDatasetSpec(
+        name_for_log="PubMedQA/pqa_labeled/train",
+        dataset_path="qiaojin/PubMedQA",
+        dataset_name="pqa_labeled",
+        split="train",
+        answer_mode="pubmed_qa",
+        question_field="question",
+        context_field="context",
+        streaming=False,
+    ),
+]
+
 GENERATION_DATASET_SPECS = [
     HFDatasetSpec(
         name_for_log="SQuAD/validation",
@@ -78,6 +101,7 @@ class LayerPositionConfig:
     eval_num_workers: int = 0
     eval_max_examples_per_dataset: int = 256
     eval_shuffle_stream: bool = False
+    benchmark_mode: str = "squad_f1"
     generation_max_new_tokens: int = 32
 
     def __post_init__(self) -> None:
@@ -90,6 +114,8 @@ class LayerPositionConfig:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
         if self.position_ratio is not None and not (0.0 <= self.position_ratio <= 1.0):
             raise ValueError("position_ratio must be in [0.0, 1.0]")
+        if self.benchmark_mode not in {"qa_accuracy", "squad_f1"}:
+            raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
@@ -170,6 +196,31 @@ class SingleLayerTranslatorPool(nn.Module):
         translated_key = self.adapters[direction].key_layer(key_layer)
         translated_value = self.adapters[direction].value_layer(value_layer)
         return translated_key, translated_value, mapping
+
+
+class AccuracyMeter:
+    def __init__(self) -> None:
+        self.accuracy_sum = 0.0
+        self.native_accuracy_sum = 0.0
+        self.count = 0
+
+    def update(self, accuracy_value: float, native_accuracy_value: float, n: int = 1) -> None:
+        self.accuracy_sum += float(accuracy_value) * n
+        self.native_accuracy_sum += float(native_accuracy_value) * n
+        self.count += n
+
+    def summary(self) -> Dict[str, float]:
+        if self.count == 0:
+            return {
+                "accuracy": float("nan"),
+                "native_accuracy": float("nan"),
+                "count": 0,
+            }
+        return {
+            "accuracy": self.accuracy_sum / self.count,
+            "native_accuracy": self.native_accuracy_sum / self.count,
+            "count": self.count,
+        }
 
 
 class F1Meter:
@@ -538,7 +589,7 @@ def build_summary_markdown_path(run_dir: Path) -> Path:
 
 
 def build_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_position_f1.png"
+    return study_dir / "layer_position_metric.png"
 
 
 def log_layer_mappings(
@@ -750,6 +801,96 @@ def run_train(
 
 
 @torch.inference_mode()
+def evaluate_logit_dataset(
+    spec: HFDatasetSpec,
+    dataloader: DataLoader,
+    tokenizer,
+    config: LayerPositionConfig,
+    translator_pool: SingleLayerTranslatorPool,
+    model_specs: Dict[str, ModelSpec],
+    models: Dict[str, PreTrainedModel],
+    nodes: List[Node],
+    edges: List[Edge],
+    active_directions: List[str],
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, float]]:
+    edge_map = build_edge_map(edges)
+    path_metrics = {direction: AccuracyMeter() for direction in active_directions}
+    processed_examples = 0
+
+    for batch_idx, batch in enumerate(dataloader, start=1):
+        for example in batch:
+            prefix = prepare_question_prefix(
+                tokenizer=tokenizer,
+                question=example["question"],
+                device=config.device,
+                choices=example.get("choices"),
+                subject=example.get("subject"),
+                context=example.get("context"),
+                answer_mode=spec.answer_mode,
+            )
+            candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec, example=example)
+            gold_answer = example["answer"]
+            past_by_node_id = {
+                node.id: extract_past_key_values(models[node.id], prefix["cache_ids"])
+                for node in nodes
+            }
+
+            for direction in active_directions:
+                edge = edge_map[direction]
+                translated_key, translated_value, mapping = translator_pool.translate_single_layer(
+                    past_key_values=past_by_node_id[edge.src_id],
+                    src_name=edge.src_id,
+                    dst_name=edge.dst_id,
+                )
+                mixed_target_past = replay_target_prefill_with_single_layer(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=prefix["cache_ids"],
+                    target_layer_idx=mapping.dst_layer_idx,
+                    injected_key_layer=translated_key,
+                    injected_value_layer=translated_value,
+                    dst_spec=model_specs[edge.dst_id],
+                )
+                translated_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=mixed_target_past,
+                    seed_token=prefix["seed_token"],
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+                native_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    seed_token=prefix["seed_token"],
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+
+                translated_pred = predict_answer_label(translated_scores)
+                native_pred = predict_answer_label(native_scores)
+                path_metrics[direction].update(
+                    accuracy_value=1.0 if translated_pred == gold_answer else 0.0,
+                    native_accuracy_value=1.0 if native_pred == gold_answer else 0.0,
+                    n=1,
+                )
+
+            processed_examples += 1
+
+        if batch_idx % 50 == 0:
+            logger.info("[%s] progress: %d/%d examples", spec.name_for_log, processed_examples, config.eval_max_examples_per_dataset)
+
+    summarized = {direction: meter.summary() for direction, meter in path_metrics.items()}
+    return {
+        direction: {
+            "accuracy": row["accuracy"],
+            "native_accuracy": row["native_accuracy"],
+            "count": row["count"],
+        }
+        for direction, row in summarized.items()
+    }
+
+
+@torch.inference_mode()
 def evaluate_generation_dataset(
     spec: HFDatasetSpec,
     dataloader: DataLoader,
@@ -905,68 +1046,122 @@ def run_eval(
         shuffle_buffer=config.shuffle_buffer,
     )
 
-    generation_results: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for spec in GENERATION_DATASET_SPECS:
-        dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-        dataset_results = evaluate_generation_dataset(
-            spec=spec,
-            dataloader=dataloader,
-            tokenizer=tokenizer,
-            config=config,
-            translator_pool=translator_pool,
-            model_specs=model_specs,
-            models=models,
-            nodes=nodes,
-            edges=edges,
-            active_directions=active_directions,
-            logger=logger,
-        )
-        generation_results[spec.name_for_log] = dataset_results
-        for direction in active_directions:
-            row = dataset_results[direction]
-            logger.info(
-                "[%s] %s | f1=%.6f | native_f1=%.6f | count=%d",
-                spec.name_for_log,
-                direction,
-                row["f1"],
-                row["native_f1"],
-                int(row["count"]),
+    if config.benchmark_mode == "qa_accuracy":
+        dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for spec in LOGIT_QA_DATASET_SPECS:
+            dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
+            dataset_results = evaluate_logit_dataset(
+                spec=spec,
+                dataloader=dataloader,
+                tokenizer=tokenizer,
+                config=config,
+                translator_pool=translator_pool,
+                model_specs=model_specs,
+                models=models,
+                nodes=nodes,
+                edges=edges,
+                active_directions=active_directions,
+                logger=logger,
             )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            dataset_results_by_name[spec.name_for_log] = dataset_results
+            for direction in active_directions:
+                row = dataset_results[direction]
+                logger.info(
+                    "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | count=%d",
+                    spec.name_for_log,
+                    direction,
+                    row["accuracy"],
+                    row["native_accuracy"],
+                    int(row["count"]),
+                )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    average_f1 = compute_average_metric(generation_results, "f1")
-    average_native_f1 = compute_average_metric(generation_results, "native_f1")
+        average_metric = compute_average_metric(dataset_results_by_name, "accuracy")
+        average_native_metric = compute_average_metric(dataset_results_by_name, "native_accuracy")
+        metric_name = "accuracy"
+        dataset_results_key = "dataset_accuracies"
+    elif config.benchmark_mode == "squad_f1":
+        dataset_results_by_name = {}
+        for spec in GENERATION_DATASET_SPECS:
+            dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
+            dataset_results = evaluate_generation_dataset(
+                spec=spec,
+                dataloader=dataloader,
+                tokenizer=tokenizer,
+                config=config,
+                translator_pool=translator_pool,
+                model_specs=model_specs,
+                models=models,
+                nodes=nodes,
+                edges=edges,
+                active_directions=active_directions,
+                logger=logger,
+            )
+            dataset_results_by_name[spec.name_for_log] = dataset_results
+            for direction in active_directions:
+                row = dataset_results[direction]
+                logger.info(
+                    "[%s] %s | f1=%.6f | native_f1=%.6f | count=%d",
+                    spec.name_for_log,
+                    direction,
+                    row["f1"],
+                    row["native_f1"],
+                    int(row["count"]),
+                )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        average_metric = compute_average_metric(dataset_results_by_name, "f1")
+        average_native_metric = compute_average_metric(dataset_results_by_name, "native_f1")
+        metric_name = "f1"
+        dataset_results_key = "dataset_f1"
+    else:
+        raise ValueError(f"Unsupported benchmark_mode: {config.benchmark_mode}")
+
     logger.info(
-        "[Summary] average_f1=%.6f | average_native_f1=%.6f",
-        average_f1,
-        average_native_f1,
+        "[Summary] metric=%s | average_metric=%.6f | average_native_metric=%.6f",
+        metric_name,
+        average_metric,
+        average_native_metric,
     )
     return {
+        "benchmark_mode": config.benchmark_mode,
+        "metric_name": metric_name,
         "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
-        "dataset_f1": generation_results,
-        "average_f1": average_f1,
-        "average_native_f1": average_native_f1,
+        dataset_results_key: dataset_results_by_name,
+        "average_metric": average_metric,
+        "average_native_metric": average_native_metric,
+        f"average_{metric_name}": average_metric,
+        f"average_native_{metric_name}": average_native_metric,
     }
 
 
 
 def build_summary_markdown(metrics: Dict[str, Any]) -> str:
+    metric_name = str(metrics["metric_name"])
+    native_metric_name = f"native_{metric_name}"
+    dataset_results_key = "dataset_accuracies" if metric_name == "accuracy" else "dataset_f1"
+    metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
+    native_metric_label = f"Native {metric_label}"
+
     lines = [
         "# Layer Position Result",
         "",
-        f"- average_f1: {metrics['average_f1']:.6f}",
-        f"- average_native_f1: {metrics['average_native_f1']:.6f}",
+        f"- benchmark_mode: {metrics['benchmark_mode']}",
+        f"- metric_name: {metric_name}",
+        f"- average_metric: {metrics['average_metric']:.6f}",
+        f"- average_native_metric: {metrics['average_native_metric']:.6f}",
         "",
-        "## Dataset F1",
+        f"## Dataset {metric_label}",
         "",
-        "| Dataset | Direction | F1 | Native F1 | Count |",
+        f"| Dataset | Direction | {metric_label} | {native_metric_label} | Count |",
         "|---|---|---:|---:|---:|",
     ]
-    for dataset_name, dataset_results in metrics["dataset_f1"].items():
+    for dataset_name, dataset_results in metrics[dataset_results_key].items():
         for direction, row in dataset_results.items():
             lines.append(
-                f"| {dataset_name} | {direction} | {row['f1']:.6f} | {row['native_f1']:.6f} | {int(row['count'])} |"
+                f"| {dataset_name} | {direction} | {row[metric_name]:.6f} | {row[native_metric_name]:.6f} | {int(row['count'])} |"
             )
     return "\n".join(lines)
 
@@ -980,11 +1175,13 @@ def build_study_summary_row(
     reference_mapping = next(iter(metrics["layer_mappings"].values()))
     return {
         "study_id": config.study_id or "",
+        "benchmark_mode": str(metrics["benchmark_mode"]),
+        "metric_name": str(metrics["metric_name"]),
         "position_ratio": float(reference_mapping["relative_depth"]),
         "source_layer_idx": int(reference_mapping["src_layer_idx"]),
         "target_layer_idx": int(reference_mapping["dst_layer_idx"]),
-        "average_f1": float(metrics["average_f1"]),
-        "average_native_f1": float(metrics["average_native_f1"]),
+        "average_metric": float(metrics["average_metric"]),
+        "average_native_metric": float(metrics["average_native_metric"]),
         "run_dir": str(run_dir),
     }
 
@@ -1029,11 +1226,14 @@ def plot_study_summary(study_dir: Path) -> Path:
 
     rows = []
     native_values = []
+    metric_name = None
     with summary_path.open("r", encoding="utf-8", newline="") as fp:
         for row in csv.DictReader(fp):
             try:
-                rows.append((int(row["target_layer_idx"]), float(row["average_f1"])))
-                native_values.append(float(row["average_native_f1"]))
+                rows.append((float(row["position_ratio"]), float(row["average_metric"])))
+                native_values.append(float(row["average_native_metric"]))
+                if metric_name is None:
+                    metric_name = row.get("metric_name", "metric")
             except (KeyError, ValueError):
                 continue
 
@@ -1043,24 +1243,27 @@ def plot_study_summary(study_dir: Path) -> Path:
     rows.sort(key=lambda item: item[0])
     x_values = [item[0] for item in rows]
     y_values = [item[1] for item in rows]
-    average_native_f1 = sum(native_values) / len(native_values) if native_values else float("nan")
+    average_native_metric = sum(native_values) / len(native_values) if native_values else float("nan")
+    metric_name = metric_name or "metric"
+    metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
 
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(8, 4.5))
     ax = fig.add_subplot(111)
-    ax.plot(x_values, y_values, marker="o", label="Translated F1")
-    if average_native_f1 == average_native_f1:
+    ax.plot(x_values, y_values, marker="o", label=f"Translated {metric_label}")
+    if average_native_metric == average_native_metric:
         ax.axhline(
-            average_native_f1,
+            average_native_metric,
             linestyle="--",
             linewidth=1.5,
-            label=f"Native F1 Mean ({average_native_f1:.4f})",
+            label=f"Native {metric_label} Mean ({average_native_metric:.4f})",
         )
-    ax.set_xlabel("Layer Index")
-    ax.set_ylabel("F1")
-    ax.set_title("Layer Position vs F1")
+    ax.set_xlabel("Layer Index Ratio")
+    ax.set_ylabel(metric_label)
+    ax.set_title(f"Layer Position Ratio vs {metric_label}")
     ax.set_xticks(x_values)
+    ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -1126,6 +1329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=200)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
+    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=32)
     return parser.parse_args()
 
@@ -1174,6 +1378,7 @@ def main() -> None:
         eval_num_workers=args.eval_num_workers,
         eval_max_examples_per_dataset=args.eval_max_examples_per_dataset,
         eval_shuffle_stream=args.eval_shuffle_stream,
+        benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
     )
 
