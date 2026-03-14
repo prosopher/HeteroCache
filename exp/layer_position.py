@@ -1294,7 +1294,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train and evaluate a single translated layer by replaying target prefill before the layer, injecting it, and continuing above it."
     )
-    parser.add_argument("--model-ids", default="gpt2-xl,gpt2-xl")
+    parser.add_argument("--model-ids", default="gpt2-large,gpt2-large")
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--position-ratio", type=float, default=None)
