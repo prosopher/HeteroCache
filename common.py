@@ -301,44 +301,35 @@ def past_key_values_to_blocks(past_key_values: PastKeyValues) -> Tuple[torch.Ten
     return key_block, value_block
 
 
-def slice_bottom_layers(
+def slice_top_layers(
     past_key_values: PastKeyValues,
-    bottom_layers_to_translate: int,
+    top_layers_to_translate: int,
 ) -> PastKeyValues:
-    if bottom_layers_to_translate < 1:
-        raise ValueError("bottom_layers_to_translate must be >= 1")
-
-    max_replaceable_layers = len(past_key_values) - 1
-    if bottom_layers_to_translate > max_replaceable_layers:
+    if top_layers_to_translate < 1:
+        raise ValueError("top_layers_to_translate must be >= 1")
+    if top_layers_to_translate > len(past_key_values):
         raise ValueError(
-            f"Cannot slice {bottom_layers_to_translate} bottom layers above layer 0 from cache with only "
-            f"{len(past_key_values)} layers."
+            f"Cannot slice {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
         )
-
-    start_idx = 1
-    end_idx = start_idx + bottom_layers_to_translate
-    return tuple(past_key_values[start_idx:end_idx])
+    return tuple(past_key_values[-top_layers_to_translate:])
 
 
-def replace_bottom_layers(
+def replace_top_layers(
     base_past_key_values: PastKeyValues,
-    translated_bottom_past_key_values: PastKeyValues,
+    translated_top_past_key_values: PastKeyValues,
 ) -> PastKeyValues:
-    num_replace = len(translated_bottom_past_key_values)
+    num_replace = len(translated_top_past_key_values)
     if num_replace < 1:
-        raise ValueError("translated_bottom_past_key_values must contain at least one layer.")
-
-    max_replaceable_layers = len(base_past_key_values) - 1
-    if num_replace > max_replaceable_layers:
+        raise ValueError("translated_top_past_key_values must contain at least one layer.")
+    if num_replace > len(base_past_key_values):
         raise ValueError(
-            f"Cannot replace {num_replace} bottom layers above layer 0 in cache with only "
-            f"{len(base_past_key_values)} layers."
+            f"Cannot replace {num_replace} layers in cache with only {len(base_past_key_values)} layers."
         )
 
     base_list = list(base_past_key_values)
-    start_idx = 1
+    start_idx = len(base_list) - num_replace
 
-    for offset, translated_layer in enumerate(translated_bottom_past_key_values):
+    for offset, translated_layer in enumerate(translated_top_past_key_values):
         base_key, base_value = base_list[start_idx + offset]
         translated_key, translated_value = translated_layer
 
