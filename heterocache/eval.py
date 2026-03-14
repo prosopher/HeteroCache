@@ -64,22 +64,22 @@ def evaluate_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_top_past = translator_pool.translate_top_layers(
+                translated_bottom_past = translator_pool.translate_bottom_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
 
-                target_top = slice_top_layers(
+                target_bottom = slice_bottom_layers(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=train_config.top_layers_to_translate,
+                    bottom_layers_to_translate=train_config.bottom_layers_to_translate,
                 )
-                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
+                cosine_value = cosine_similarity_between_past(translated_bottom_past, target_bottom)
 
-                mixed_target_past = replace_top_layers(
+                mixed_target_past = replace_bottom_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=translated_top_past,
+                    translated_bottom_past_key_values=translated_bottom_past,
                 )
 
                 translated_scores = score_answer_choices(
@@ -183,22 +183,22 @@ def evaluate_generation_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_top_past = translator_pool.translate_top_layers(
+                translated_bottom_past = translator_pool.translate_bottom_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
 
-                target_top = slice_top_layers(
+                target_bottom = slice_bottom_layers(
                     past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_translate=train_config.top_layers_to_translate,
+                    bottom_layers_to_translate=train_config.bottom_layers_to_translate,
                 )
-                cosine_value = cosine_similarity_between_past(translated_top_past, target_top)
+                cosine_value = cosine_similarity_between_past(translated_bottom_past, target_bottom)
 
-                mixed_target_past = replace_top_layers(
+                mixed_target_past = replace_bottom_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=translated_top_past,
+                    translated_bottom_past_key_values=translated_bottom_past,
                 )
 
                 if spec.answer_mode == "squad":
@@ -303,9 +303,9 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     logger.info("restored_train_config=%s", asdict(train_config))
     logger.info("nodes=%s", [asdict(node) for node in nodes])
-    logger.info("top_layers_to_translate=%d", train_config.top_layers_to_translate)
+    logger.info("bottom_layers_to_translate=%d", train_config.bottom_layers_to_translate)
     logger.info("active_directions=%s", active_directions)
-    logger.info("translation_mode=replace_top_layers_after_target_forward")
+    logger.info("translation_mode=replace_bottom_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
 
     logit_dataset_specs = [

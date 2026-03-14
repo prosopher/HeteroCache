@@ -31,7 +31,7 @@ class TrainConfig:
     log_every: int
     seed: int
     shuffle_buffer: int
-    top_layers_to_translate: int
+    bottom_layers_to_translate: int
     translator_dim: int
     translator_heads: int
     translator_depth: int
@@ -98,19 +98,19 @@ class PerLayerTranslator(nn.Module):
         return self.output_proj(self.output_norm(hidden))
 
 
-class TopLayerDirectionalTranslator(nn.Module):
+class BottomLayerDirectionalTranslator(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
         dst_hidden_size: int,
-        top_layers_to_translate: int,
+        bottom_layers_to_translate: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.top_layers_to_translate = top_layers_to_translate
+        self.bottom_layers_to_translate = bottom_layers_to_translate
         self.key_layers = nn.ModuleList(
             [
                 PerLayerTranslator(
@@ -121,7 +121,7 @@ class TopLayerDirectionalTranslator(nn.Module):
                     translator_depth=translator_depth,
                     mlp_ratio=mlp_ratio,
                 )
-                for _ in range(top_layers_to_translate)
+                for _ in range(bottom_layers_to_translate)
             ]
         )
         self.value_layers = nn.ModuleList(
@@ -134,14 +134,14 @@ class TopLayerDirectionalTranslator(nn.Module):
                     translator_depth=translator_depth,
                     mlp_ratio=mlp_ratio,
                 )
-                for _ in range(top_layers_to_translate)
+                for _ in range(bottom_layers_to_translate)
             ]
         )
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         key_outputs = []
         value_outputs = []
-        for layer_idx in range(self.top_layers_to_translate):
+        for layer_idx in range(self.bottom_layers_to_translate):
             key_outputs.append(self.key_layers[layer_idx](key_block[:, :, layer_idx, :]).unsqueeze(2))
             value_outputs.append(self.value_layers[layer_idx](value_block[:, :, layer_idx, :]).unsqueeze(2))
         translated_key = torch.cat(key_outputs, dim=2)
@@ -149,12 +149,12 @@ class TopLayerDirectionalTranslator(nn.Module):
         return translated_key, translated_value
 
 
-class TopLayerTranslatorPool(nn.Module):
+class BottomLayerTranslatorPool(nn.Module):
     def __init__(
         self,
         model_specs: Dict[str, ModelSpec],
         edges: List[Edge],
-        top_layers_to_translate: int,
+        bottom_layers_to_translate: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
@@ -162,13 +162,13 @@ class TopLayerTranslatorPool(nn.Module):
         active_directions: List[str],
     ) -> None:
         super().__init__()
-        if top_layers_to_translate < 1:
-            raise ValueError("top_layers_to_translate must be >= 1")
+        if bottom_layers_to_translate < 1:
+            raise ValueError("bottom_layers_to_translate must be >= 1")
         if not active_directions:
             raise ValueError("active_directions must contain at least one direction.")
 
         self.model_specs = model_specs
-        self.top_layers_to_translate = top_layers_to_translate
+        self.bottom_layers_to_translate = bottom_layers_to_translate
         self.active_directions = tuple(active_directions)
         self.edges_by_id = build_edge_map(edges)
 
@@ -179,16 +179,16 @@ class TopLayerTranslatorPool(nn.Module):
             edge = self.edges_by_id[direction]
             src_spec = model_specs[edge.src_id]
             dst_spec = model_specs[edge.dst_id]
-            max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
-            if top_layers_to_translate > max_allowed:
+            max_allowed = min(src_spec.num_layers, dst_spec.num_layers) - 1
+            if bottom_layers_to_translate > max_allowed:
                 raise ValueError(
-                    f"top_layers_to_translate={top_layers_to_translate} exceeds min layer count {max_allowed} "
-                    f"for direction {direction}."
+                    f"bottom_layers_to_translate={bottom_layers_to_translate} exceeds replaceable layer count "
+                    f"{max_allowed} above layer 0 for direction {direction}."
                 )
-            adapters[direction] = TopLayerDirectionalTranslator(
+            adapters[direction] = BottomLayerDirectionalTranslator(
                 src_hidden_size=src_spec.hidden_size,
                 dst_hidden_size=dst_spec.hidden_size,
-                top_layers_to_translate=top_layers_to_translate,
+                bottom_layers_to_translate=bottom_layers_to_translate,
                 translator_dim=translator_dim,
                 translator_heads=translator_heads,
                 translator_depth=translator_depth,
@@ -197,7 +197,7 @@ class TopLayerTranslatorPool(nn.Module):
 
         self.adapters = nn.ModuleDict(adapters)
 
-    def translate_top_layer_blocks(
+    def translate_bottom_layer_blocks(
         self,
         key_block: torch.Tensor,
         value_block: torch.Tensor,
@@ -212,18 +212,18 @@ class TopLayerTranslatorPool(nn.Module):
             )
         return self.adapters[adapter_name](key_block, value_block)
 
-    def translate_top_layers(
+    def translate_bottom_layers(
         self,
         past_key_values: PastKeyValues,
         src_name: str,
         dst_name: str,
         dst_spec: ModelSpec,
     ) -> PastKeyValues:
-        key_block, value_block = extract_top_layer_blocks(
+        key_block, value_block = extract_bottom_layer_blocks(
             past_key_values=past_key_values,
-            top_layers_to_translate=self.top_layers_to_translate,
+            bottom_layers_to_translate=self.bottom_layers_to_translate,
         )
-        translated_key, translated_value = self.translate_top_layer_blocks(
+        translated_key, translated_value = self.translate_bottom_layer_blocks(
             key_block=key_block,
             value_block=value_block,
             src_name=src_name,
@@ -237,17 +237,23 @@ class TopLayerTranslatorPool(nn.Module):
         )
 
 
-def extract_top_layer_blocks(
+def extract_bottom_layer_blocks(
     past_key_values: PastKeyValues,
-    top_layers_to_translate: int,
+    bottom_layers_to_translate: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if top_layers_to_translate < 1:
-        raise ValueError("top_layers_to_translate must be >= 1")
-    if top_layers_to_translate > len(past_key_values):
+    if bottom_layers_to_translate < 1:
+        raise ValueError("bottom_layers_to_translate must be >= 1")
+
+    max_replaceable_layers = len(past_key_values) - 1
+    if bottom_layers_to_translate > max_replaceable_layers:
         raise ValueError(
-            f"Cannot extract {top_layers_to_translate} layers from cache with only {len(past_key_values)} layers."
+            f"Cannot extract {bottom_layers_to_translate} bottom layers above layer 0 from cache with only "
+            f"{len(past_key_values)} layers."
         )
-    return past_key_values_to_blocks(past_key_values[-top_layers_to_translate:])
+
+    start_idx = 1
+    end_idx = start_idx + bottom_layers_to_translate
+    return past_key_values_to_blocks(past_key_values[start_idx:end_idx])
 
 
 def blocks_to_partial_past_key_values(
@@ -276,7 +282,7 @@ def blocks_to_partial_past_key_values(
 def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: TrainConfig,
-) -> Tuple[TopLayerTranslatorPool, Dict[str, ModelSpec], List[Node], List[Edge]]:
+) -> Tuple[BottomLayerTranslatorPool, Dict[str, ModelSpec], List[Node], List[Edge]]:
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
     model_specs = {
         node.id: get_model_spec(models[node.id])
@@ -286,10 +292,10 @@ def build_translator_pool(
         config.model_directions,
         allowed_directions=[edge.id for edge in edges],
     )
-    translator_pool = TopLayerTranslatorPool(
+    translator_pool = BottomLayerTranslatorPool(
         model_specs=model_specs,
         edges=edges,
-        top_layers_to_translate=config.top_layers_to_translate,
+        bottom_layers_to_translate=config.bottom_layers_to_translate,
         translator_dim=config.translator_dim,
         translator_heads=config.translator_heads,
         translator_depth=config.translator_depth,
@@ -305,7 +311,7 @@ def load_translator_pool_from_checkpoint(
     device_override: Optional[str] = None,
 ) -> Tuple[
     TrainConfig,
-    TopLayerTranslatorPool,
+    BottomLayerTranslatorPool,
     Dict[str, ModelSpec],
     Dict[str, PreTrainedModel],
     PreTrainedTokenizerBase,
@@ -313,7 +319,10 @@ def load_translator_pool_from_checkpoint(
     List[Edge],
 ]:
     payload = torch.load(checkpoint_path, map_location="cpu")
-    config = TrainConfig(**payload["train_config"])
+    train_config_payload = dict(payload["train_config"])
+    if "bottom_layers_to_translate" not in train_config_payload and "top_layers_to_translate" in train_config_payload:
+        train_config_payload["bottom_layers_to_translate"] = train_config_payload.pop("top_layers_to_translate")
+    config = TrainConfig(**train_config_payload)
     if device_override is not None:
         config.device = device_override
     models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
@@ -367,7 +376,7 @@ def run_train(config: TrainConfig) -> Path:
             spec.hidden_size,
             spec.num_heads,
         )
-    logger.info("[Setup] top_layers_to_translate = %d", config.top_layers_to_translate)
+    logger.info("[Setup] bottom_layers_to_translate = %d", config.bottom_layers_to_translate)
     logger.info("[Setup] trainable translator params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, config)
@@ -408,15 +417,15 @@ def run_train(config: TrainConfig) -> Path:
             total_direction_loss = 0.0
             for direction in model_directions:
                 edge = edge_map[direction]
-                translated_top_past = translator_pool.translate_top_layers(
+                translated_bottom_past = translator_pool.translate_bottom_layers(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                     dst_spec=model_specs[edge.dst_id],
                 )
-                mixed_target_past = replace_top_layers(
+                mixed_target_past = replace_bottom_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
-                    translated_top_past_key_values=translated_top_past,
+                    translated_bottom_past_key_values=translated_bottom_past,
                 )
                 direction_loss = compute_suffix_lm_loss(
                     target_model=models[edge.dst_id],
@@ -464,7 +473,7 @@ def run_train(config: TrainConfig) -> Path:
         extra={
             "note": "Final checkpoint trained with suffix LM loss only.",
             "model_ids": config.model_ids,
-            "top_layers_to_translate": config.top_layers_to_translate,
+            "bottom_layers_to_translate": config.bottom_layers_to_translate,
             "model_directions": config.model_directions,
         },
     )
