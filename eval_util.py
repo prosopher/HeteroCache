@@ -494,6 +494,15 @@ def prepare_extractive_question_prefix(tokenizer, question: str, device: str) ->
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
+def format_extractive_prompt(context: str, question: str) -> str:
+    return format_extractive_context_prefix(context=context) + format_extractive_question_prefix(question=question)
+
+
+def prepare_extractive_prefix(tokenizer, context: str, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_extractive_prompt(context=context, question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
 @dataclass
 class ExtractiveSpanTrieNode:
     children: Dict[int, "ExtractiveSpanTrieNode"]

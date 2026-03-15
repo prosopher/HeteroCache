@@ -1068,20 +1068,14 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            context_prefix = prepare_extractive_context_inputs(
+            prefix = prepare_extractive_prefix(
                 tokenizer=tokenizer,
                 context=context_text,
-                device=config.device,
-            )
-            cache_input_ids = context_prefix["input_ids"]
-
-            question_prefix = prepare_extractive_question_prefix(
-                tokenizer=tokenizer,
                 question=question,
                 device=config.device,
             )
-            question_cache_ids = question_prefix["cache_ids"]
-            seed_token = question_prefix["seed_token"]
+            cache_input_ids = prefix["cache_ids"]
+            seed_token = prefix["seed_token"]
 
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
@@ -1116,21 +1110,10 @@ def evaluate_generation_dataset(
                     )
                     native_capture_by_target[native_capture_key] = native_capture
 
-                translated_answer_past = append_input_ids_to_past(
-                    model=models[edge.dst_id],
-                    past_key_values=mixed_target_past,
-                    input_ids=question_cache_ids,
-                )
-                native_answer_past = append_input_ids_to_past(
-                    model=models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    input_ids=question_cache_ids,
-                )
-
                 translated_answer = predict_extractive_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
-                    past_key_values=translated_answer_past,
+                    past_key_values=mixed_target_past,
                     seed_token=seed_token,
                     context=context_text,
                     max_answer_tokens=config.extractive_max_answer_tokens,
@@ -1139,7 +1122,7 @@ def evaluate_generation_dataset(
                 native_answer = predict_extractive_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
-                    past_key_values=native_answer_past,
+                    past_key_values=past_by_node_id[edge.dst_id],
                     seed_token=seed_token,
                     context=context_text,
                     max_answer_tokens=config.extractive_max_answer_tokens,
