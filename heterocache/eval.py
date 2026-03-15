@@ -1,6 +1,6 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 from torch.utils.data import DataLoader
@@ -149,37 +149,23 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            question_cache_ids = None
+            if spec.answer_mode != "squad":
+                raise ValueError(f"Unsupported generation answer_mode: {spec.answer_mode}")
 
-            if spec.answer_mode == "squad":
-                context_prefix = prepare_generation_context_inputs(
-                    tokenizer=tokenizer,
-                    context=context_text,
-                    device=device,
-                )
-                cache_input_ids = context_prefix["input_ids"]
-
-                question_prefix = prepare_generation_question_prefix(
-                    tokenizer=tokenizer,
-                    question=question,
-                    device=device,
-                )
-                question_cache_ids = question_prefix["cache_ids"]
-                seed_token = question_prefix["seed_token"]
-            else:
-                prefix = prepare_generation_prefix(
-                    tokenizer=tokenizer,
-                    context=context_text,
-                    question=question,
-                    device=device,
-                )
-                cache_input_ids = prefix["cache_ids"]
-                seed_token = prefix["seed_token"]
+            squad_inputs = prepare_squad_extractive_inputs(
+                tokenizer=tokenizer,
+                context=context_text,
+                question=question,
+                device=device,
+            )
+            cache_input_ids = squad_inputs["context_prefill"]["input_ids"]
 
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
                 for node in nodes
             }
+
+            native_prediction_by_target: Dict[str, Dict[str, Any]] = {}
 
             for direction in active_directions:
                 edge = edge_map[direction]
@@ -201,40 +187,33 @@ def evaluate_generation_dataset(
                     translated_top_past_key_values=translated_top_past,
                 )
 
-                if spec.answer_mode == "squad":
-                    translated_generation_past = append_input_ids_to_past(
-                        model=models[edge.dst_id],
-                        past_key_values=mixed_target_past,
-                        input_ids=question_cache_ids,
-                    )
-                    native_generation_past = append_input_ids_to_past(
+                translated_prediction = predict_squad_extractive_answer(
+                    model=models[edge.dst_id],
+                    past_key_values=mixed_target_past,
+                    question_input_ids=squad_inputs["question_prefill"]["input_ids"],
+                    scoring_context_input_ids=squad_inputs["scoring_context"]["input_ids"],
+                    scoring_context_offset_mapping=squad_inputs["scoring_context"]["offset_mapping"],
+                    context_text=squad_inputs["context_text"],
+                    max_answer_tokens=eval_config.squad_max_answer_tokens,
+                )
+
+                native_prediction = native_prediction_by_target.get(edge.dst_id)
+                if native_prediction is None:
+                    native_prediction = predict_squad_extractive_answer(
                         model=models[edge.dst_id],
                         past_key_values=past_by_node_id[edge.dst_id],
-                        input_ids=question_cache_ids,
+                        question_input_ids=squad_inputs["question_prefill"]["input_ids"],
+                        scoring_context_input_ids=squad_inputs["scoring_context"]["input_ids"],
+                        scoring_context_offset_mapping=squad_inputs["scoring_context"]["offset_mapping"],
+                        context_text=squad_inputs["context_text"],
+                        max_answer_tokens=eval_config.squad_max_answer_tokens,
                     )
-                else:
-                    translated_generation_past = mixed_target_past
-                    native_generation_past = past_by_node_id[edge.dst_id]
+                    native_prediction_by_target[edge.dst_id] = native_prediction
 
-                translated_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=translated_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=eval_config.generation_max_new_tokens,
-                )
-                native_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=native_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=eval_config.generation_max_new_tokens,
-                )
-
-                exact_match = compute_generation_exact_match(translated_answer, gold_answers)
-                f1 = compute_generation_f1(translated_answer, gold_answers)
-                native_exact_match = compute_generation_exact_match(native_answer, gold_answers)
-                native_f1 = compute_generation_f1(native_answer, gold_answers)
+                exact_match = compute_generation_exact_match(translated_prediction["text"], gold_answers)
+                f1 = compute_generation_f1(translated_prediction["text"], gold_answers)
+                native_exact_match = compute_generation_exact_match(native_prediction["text"], gold_answers)
+                native_f1 = compute_generation_f1(native_prediction["text"], gold_answers)
 
                 path_metrics[direction].update(
                     cosine_value=cosine_value,
@@ -249,7 +228,7 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logger.info(
-                "[%s] generation progress: %d/%d examples",
+                "[%s] extractive progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
                 eval_config.max_examples_per_dataset,
