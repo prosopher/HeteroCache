@@ -13,6 +13,7 @@ from eval_util import *
 from heterocache.train import *
 from train_util import *
 from transformers import AutoConfig
+from typing import Callable, Sequence
 
 
 LOGIT_QA_DATASET_SPECS = [
