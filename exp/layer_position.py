@@ -13,7 +13,6 @@ from eval_util import *
 from heterocache.train import *
 from train_util import *
 from transformers import AutoConfig
-from typing import Callable, Sequence
 
 
 LOGIT_QA_DATASET_SPECS = [
@@ -77,7 +76,7 @@ class LayerPositionConfig:
     model_ids: str = "gpt2,gpt2-medium"
     model_directions: str = "A_to_B"
     reference_direction: Optional[str] = None
-    position_ratio: Optional[float] = None
+    position_layer_idx: Optional[int] = None
     injection_window_size: int = 1
 
     output_root: str = "outputs/layer_position"
@@ -119,8 +118,8 @@ class LayerPositionConfig:
             raise ValueError("grad_accum_steps must be >= 1")
         if self.prefix_tokens < 2 or self.prefix_tokens >= self.total_tokens:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
-        if self.position_ratio is not None and not (0.0 <= self.position_ratio <= 1.0):
-            raise ValueError("position_ratio must be in [0.0, 1.0]")
+        if self.position_layer_idx is not None and self.position_layer_idx < 0:
+            raise ValueError("position_layer_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
         if self.benchmark_mode not in {"qa_accuracy", "squad_f1"}:
@@ -358,6 +357,21 @@ def relative_depth_to_layer_index(relative_depth: float, num_layers: int) -> int
     return int(round(clamped * (num_layers - 1)))
 
 
+def resolve_reference_target_layer_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
+    if reference_target_num_layers < 1:
+        raise ValueError("reference_target_num_layers must be >= 1")
+    layer_idx = int(config.position_layer_idx)
+    if not (0 <= layer_idx < reference_target_num_layers):
+        raise ValueError(
+            f"position_layer_idx={layer_idx} must be in [0, {reference_target_num_layers - 1}] for the reference target"
+        )
+    return layer_idx
+
+
+def resolve_run_position_label(config: LayerPositionConfig) -> str:
+    return f"layer_idx_{int(config.position_layer_idx):03d}"
+
+
 def resolve_target_num_layers(
     model_ids: str,
     model_directions: str,
@@ -381,16 +395,19 @@ def build_layer_mappings(
     reference_edge: Edge,
 ) -> Dict[str, LayerMapping]:
     reference_target_spec = model_specs[reference_edge.dst_id]
-
-    if config.position_ratio is None:
-        raise ValueError("position_ratio must be set before building layer mappings")
-    relative_depth = float(config.position_ratio)
-
-    reference_target_layer_idx = relative_depth_to_layer_index(relative_depth, reference_target_spec.num_layers)
-    reference_available_upper = reference_target_spec.num_layers - 1 - reference_target_layer_idx
     requested_window_size = int(config.injection_window_size)
-    reference_translated_num_layers = min(requested_window_size, 1 + reference_available_upper)
-    reference_target_layer_end_idx = reference_target_layer_idx + reference_translated_num_layers - 1
+
+    reference_target_layer_idx = resolve_reference_target_layer_idx(config, reference_target_spec.num_layers)
+    reference_target_layer_end_idx = reference_target_layer_idx + requested_window_size - 1
+    if reference_target_layer_end_idx >= reference_target_spec.num_layers:
+        raise ValueError(
+            "position_layer_idx with the requested injection_window_size would exceed the reference target stack: "
+            f"start={reference_target_layer_idx}, end={reference_target_layer_end_idx}, "
+            f"last_layer={reference_target_spec.num_layers - 1}"
+        )
+    reference_translated_num_layers = requested_window_size
+
+    relative_depth = relative_depth_from_layer_index(reference_target_layer_idx, reference_target_spec.num_layers)
 
     edge_map = build_edge_map(edges)
     mappings: Dict[str, LayerMapping] = {}
@@ -632,10 +649,7 @@ def build_study_dir(config: LayerPositionConfig) -> Path:
 
 
 def build_run_output_dir(config: LayerPositionConfig) -> Path:
-    if config.position_ratio is None:
-        raise ValueError("position_ratio must be set before building the run directory")
-    position_label = f"position_ratio_{int(round(config.position_ratio * 100)):03d}"
-    return build_study_dir(config) / position_label
+    return build_study_dir(config) / resolve_run_position_label(config)
 
 
 def format_layer_range(start_idx: int, end_idx: int) -> str:
@@ -679,13 +693,8 @@ def build_layer_mapping_path(run_dir: Path) -> Path:
 def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
 
-
-def build_summary_markdown_path(run_dir: Path) -> Path:
-    return run_dir / "eval_summary.md"
-
-
 def build_chart_path(study_dir: Path, metric_name: str, injection_window_size: int) -> Path:
-    return study_dir / f"ratio_vs_{sanitize_slug(metric_name)}__{format_window_slug(injection_window_size)}.png"
+    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}__{format_window_slug(injection_window_size)}.png"
 
 
 def log_layer_mappings(
@@ -699,8 +708,11 @@ def log_layer_mappings(
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
         logger.info(
-            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | relative_depth=%.4f",
+            "[LayerMapping] %s | ref_target=L%d-%d/%d | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | relative_depth=%.4f",
             direction,
+            mapping.reference_target_layer_idx,
+            mapping.reference_target_layer_end_idx,
+            mapping.reference_target_num_layers - 1,
             src_id,
             node_map[src_id].model_id,
             mapping.src_layer_idx,
@@ -912,9 +924,10 @@ def evaluate_logit_dataset(
     edges: List[Edge],
     active_directions: List[str],
     logger: logging.Logger,
-) -> Dict[str, Dict[str, float]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     edge_map = build_edge_map(edges)
     path_metrics = {direction: AccuracyMeter() for direction in active_directions}
+    path_drift = {direction: DriftMeter() for direction in active_directions}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
@@ -930,10 +943,12 @@ def evaluate_logit_dataset(
             )
             candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec, example=example)
             gold_answer = example["answer"]
+            prefix_input_ids = prefix["cache_ids"]
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], prefix["cache_ids"])
+                node.id: extract_past_key_values(models[node.id], prefix_input_ids)
                 for node in nodes
             }
+            native_capture_by_target: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
 
             for direction in active_directions:
                 edge = edge_map[direction]
@@ -942,14 +957,26 @@ def evaluate_logit_dataset(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replay_target_prefill_with_injected_window(
+                translated_capture = replay_target_prefill_with_capture(
                     target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix["cache_ids"],
+                    prefix_input_ids=prefix_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
                     injected_key_block=translated_key,
                     injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
+                mixed_target_past = translated_capture["past_key_values"]
+
+                native_capture_key = (edge.dst_id, mapping.dst_layer_end_idx)
+                native_capture = native_capture_by_target.get(native_capture_key)
+                if native_capture is None:
+                    native_capture = run_native_prefill_capture(
+                        target_model=models[edge.dst_id],
+                        prefix_input_ids=prefix_input_ids,
+                        capture_layer_idx=mapping.dst_layer_end_idx,
+                    )
+                    native_capture_by_target[native_capture_key] = native_capture
+
                 translated_scores = score_answer_choices(
                     model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
@@ -972,21 +999,50 @@ def evaluate_logit_dataset(
                     native_accuracy_value=1.0 if native_pred == gold_answer else 0.0,
                     n=1,
                 )
+                path_drift[direction].update(
+                    injected_cosine=compute_hidden_cosine(
+                        translated_capture["after_injected_window_hidden"],
+                        native_capture["after_injected_window_hidden"],
+                    ),
+                    injected_l2=compute_hidden_l2(
+                        translated_capture["after_injected_window_hidden"],
+                        native_capture["after_injected_window_hidden"],
+                    ),
+                    final_cosine=compute_hidden_cosine(
+                        translated_capture["final_hidden"],
+                        native_capture["final_hidden"],
+                    ),
+                    final_l2=compute_hidden_l2(
+                        translated_capture["final_hidden"],
+                        native_capture["final_hidden"],
+                    ),
+                    n=1,
+                )
 
             processed_examples += 1
 
         if batch_idx % 50 == 0:
-            logger.info("[%s] progress: %d/%d examples", spec.name_for_log, processed_examples, config.eval_max_examples_per_dataset)
+            logger.info(
+                "[%s] progress: %d/%d examples",
+                spec.name_for_log,
+                processed_examples,
+                config.eval_max_examples_per_dataset,
+            )
 
-    summarized = {direction: meter.summary() for direction, meter in path_metrics.items()}
-    return {
-        direction: {
-            "accuracy": row["accuracy"],
-            "native_accuracy": row["native_accuracy"],
-            "count": row["count"],
-        }
-        for direction, row in summarized.items()
-    }
+    summarized_metrics = {direction: meter.summary() for direction, meter in path_metrics.items()}
+    summarized_drift = {direction: meter.summary() for direction, meter in path_drift.items()}
+    return (
+        {
+            direction: {
+                "accuracy": row["accuracy"],
+                "native_accuracy": row["native_accuracy"],
+                "count": row["count"],
+            }
+            for direction, row in summarized_metrics.items()
+        },
+        {direction: row for direction, row in summarized_drift.items()},
+    )
+
 
 
 @torch.inference_mode()
@@ -1002,9 +1058,10 @@ def evaluate_generation_dataset(
     edges: List[Edge],
     active_directions: List[str],
     logger: logging.Logger,
-) -> Dict[str, Dict[str, float]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     edge_map = build_edge_map(edges)
     path_metrics = {direction: F1Meter() for direction in active_directions}
+    path_drift = {direction: DriftMeter() for direction in active_directions}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
@@ -1032,6 +1089,7 @@ def evaluate_generation_dataset(
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
                 for node in nodes
             }
+            native_capture_by_target: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
 
             for direction in active_directions:
                 edge = edge_map[direction]
@@ -1040,7 +1098,7 @@ def evaluate_generation_dataset(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replay_target_prefill_with_injected_window(
+                translated_capture = replay_target_prefill_with_capture(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=cache_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
@@ -1048,6 +1106,17 @@ def evaluate_generation_dataset(
                     injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
+                mixed_target_past = translated_capture["past_key_values"]
+
+                native_capture_key = (edge.dst_id, mapping.dst_layer_end_idx)
+                native_capture = native_capture_by_target.get(native_capture_key)
+                if native_capture is None:
+                    native_capture = run_native_prefill_capture(
+                        target_model=models[edge.dst_id],
+                        prefix_input_ids=cache_input_ids,
+                        capture_layer_idx=mapping.dst_layer_end_idx,
+                    )
+                    native_capture_by_target[native_capture_key] = native_capture
 
                 translated_generation_past = append_input_ids_to_past(
                     model=models[edge.dst_id],
@@ -1082,21 +1151,49 @@ def evaluate_generation_dataset(
                     native_f1_value=native_f1,
                     n=1,
                 )
+                path_drift[direction].update(
+                    injected_cosine=compute_hidden_cosine(
+                        translated_capture["after_injected_window_hidden"],
+                        native_capture["after_injected_window_hidden"],
+                    ),
+                    injected_l2=compute_hidden_l2(
+                        translated_capture["after_injected_window_hidden"],
+                        native_capture["after_injected_window_hidden"],
+                    ),
+                    final_cosine=compute_hidden_cosine(
+                        translated_capture["final_hidden"],
+                        native_capture["final_hidden"],
+                    ),
+                    final_l2=compute_hidden_l2(
+                        translated_capture["final_hidden"],
+                        native_capture["final_hidden"],
+                    ),
+                    n=1,
+                )
 
             processed_examples += 1
 
         if batch_idx % 25 == 0:
-            logger.info("[%s] progress: %d/%d examples", spec.name_for_log, processed_examples, config.eval_max_examples_per_dataset)
+            logger.info(
+                "[%s] progress: %d/%d examples",
+                spec.name_for_log,
+                processed_examples,
+                config.eval_max_examples_per_dataset,
+            )
 
-    summarized = {direction: meter.summary() for direction, meter in path_metrics.items()}
-    return {
-        direction: {
-            "f1": row["f1"],
-            "native_f1": row["native_f1"],
-            "count": row["count"],
-        }
-        for direction, row in summarized.items()
-    }
+    summarized_metrics = {direction: meter.summary() for direction, meter in path_metrics.items()}
+    summarized_drift = {direction: meter.summary() for direction, meter in path_drift.items()}
+    return (
+        {
+            direction: {
+                "f1": row["f1"],
+                "native_f1": row["native_f1"],
+                "count": row["count"],
+            }
+            for direction, row in summarized_metrics.items()
+        },
+        {direction: row for direction, row in summarized_drift.items()},
+    )
 
 
 def compute_average_metric(
@@ -1118,7 +1215,7 @@ def compute_average_metric(
 class DriftSummaryRow:
     study_id: str
     benchmark_mode: str
-    position_ratio: float
+    position_layer_idx: int
     injection_window_size: int
     translated_num_layers: int
     source_layer_idx: int
@@ -1171,22 +1268,12 @@ class DriftMeter:
             "count": self.count,
         }
 
-
-def build_drift_log_path(run_dir: Path) -> Path:
-    return run_dir / "drift.log"
-
-
 def build_drift_metrics_path(run_dir: Path) -> Path:
     return run_dir / "drift_metrics.json"
 
 
 def build_drift_summary_csv_path(study_dir: Path) -> Path:
     return study_dir / "drift_summary.csv"
-
-
-def build_drift_summary_md_path(study_dir: Path) -> Path:
-    return study_dir / "drift_summary.md"
-
 
 def build_drift_cosine_chart_path(study_dir: Path, injection_window_size: int) -> Path:
     return study_dir / f"drift_cosine__{format_window_slug(injection_window_size)}.png"
@@ -1208,42 +1295,27 @@ def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
 def run_native_prefill_capture(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    capture_start_layer_idx: int,
-    capture_end_layer_idx: int,
-) -> Dict[str, Any]:
+    capture_layer_idx: int,
+) -> Dict[str, torch.Tensor]:
     transformer = require_gpt2_transformer(target_model)
-    if not (0 <= capture_start_layer_idx < len(transformer.h)):
-        raise ValueError(
-            f"capture_start_layer_idx={capture_start_layer_idx} must be in [0, {len(transformer.h) - 1}]"
-        )
-    if not (capture_start_layer_idx <= capture_end_layer_idx < len(transformer.h)):
-        raise ValueError(
-            "capture_end_layer_idx must satisfy "
-            f"{capture_start_layer_idx} <= capture_end_layer_idx < {len(transformer.h)}"
-        )
+    if not (0 <= capture_layer_idx < len(transformer.h)):
+        raise ValueError(f"capture_layer_idx={capture_layer_idx} must be in [0, {len(transformer.h) - 1}]")
 
     hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-    captured_window_hiddens: List[torch.Tensor] = []
     after_capture_hidden = None
     for layer_idx, block in enumerate(transformer.h):
         hidden_states, _ = run_gpt2_block_with_cache(block, hidden_states)
-        if capture_start_layer_idx <= layer_idx <= capture_end_layer_idx:
-            captured_hidden = hidden_states.detach().clone()
-            captured_window_hiddens.append(captured_hidden)
-            if layer_idx == capture_end_layer_idx:
-                after_capture_hidden = captured_hidden
+        if layer_idx == capture_layer_idx:
+            after_capture_hidden = hidden_states.detach().clone()
 
-    if len(captured_window_hiddens) != (capture_end_layer_idx - capture_start_layer_idx + 1):
-        raise RuntimeError("Failed to capture native hidden states across the requested layer window")
     if after_capture_hidden is None:
-        raise RuntimeError("Failed to capture native hidden states at the requested layer window end")
+        raise RuntimeError("Failed to capture native hidden states at the requested layer")
 
     final_hidden = hidden_states
     if getattr(transformer, "ln_f", None) is not None:
         final_hidden = transformer.ln_f(final_hidden)
 
     return {
-        "window_hidden_states": tuple(captured_window_hiddens),
         "after_injected_window_hidden": after_capture_hidden,
         "final_hidden": final_hidden.detach().clone(),
     }
@@ -1282,7 +1354,6 @@ def replay_target_prefill_with_capture(
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
         rebuilt_past.append((present[0].detach(), present[1].detach()))
 
-    captured_window_hiddens: List[torch.Tensor] = []
     after_injected_window_hidden = None
     for offset, injected_present in enumerate(injected_window):
         layer_idx = target_start_layer_idx + offset
@@ -1293,13 +1364,9 @@ def replay_target_prefill_with_capture(
             injected_present[1],
         )
         rebuilt_past.append((present[0].detach(), present[1].detach()))
-        captured_hidden = hidden_states.detach().clone()
-        captured_window_hiddens.append(captured_hidden)
         if layer_idx == target_end_layer_idx:
-            after_injected_window_hidden = captured_hidden
+            after_injected_window_hidden = hidden_states.detach().clone()
 
-    if len(captured_window_hiddens) != translated_num_layers:
-        raise RuntimeError("Failed to capture hidden states across the injected layer window")
     if after_injected_window_hidden is None:
         raise RuntimeError("Failed to capture hidden states after the injected layer window")
 
@@ -1313,7 +1380,6 @@ def replay_target_prefill_with_capture(
 
     return {
         "past_key_values": tuple(rebuilt_past),
-        "window_hidden_states": tuple(captured_window_hiddens),
         "after_injected_window_hidden": after_injected_window_hidden,
         "final_hidden": final_hidden.detach().clone(),
     }
@@ -1339,210 +1405,33 @@ def compute_hidden_l2(hidden_a: torch.Tensor, hidden_b: torch.Tensor) -> float:
     return float(l2.mean().item())
 
 
-def compute_window_hidden_metric_average(
-    hidden_list_a: Sequence[torch.Tensor],
-    hidden_list_b: Sequence[torch.Tensor],
-    metric_fn: Callable[[torch.Tensor, torch.Tensor], float],
-) -> float:
-    if len(hidden_list_a) != len(hidden_list_b):
-        raise ValueError(
-            f"Window hidden lists must have the same length, got {len(hidden_list_a)} vs {len(hidden_list_b)}"
-        )
-    if not hidden_list_a:
-        raise ValueError("Window hidden lists must be non-empty")
-    return float(
-        sum(metric_fn(hidden_a, hidden_b) for hidden_a, hidden_b in zip(hidden_list_a, hidden_list_b))
-        / len(hidden_list_a)
-    )
 
 
-@torch.inference_mode()
-def evaluate_drift_on_dataset(
-    spec: HFDatasetSpec,
-    dataloader: DataLoader,
-    benchmark_mode: str,
-    tokenizer: PreTrainedTokenizerBase,
-    config: LayerPositionConfig,
-    translator_pool: LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
-    models: Dict[str, PreTrainedModel],
-    nodes: List[Node],
-    edges: List[Edge],
-    active_directions: List[str],
-    logger: logging.Logger,
-) -> Dict[str, Dict[str, float]]:
-    edge_map = build_edge_map(edges)
-    path_metrics = {direction: DriftMeter() for direction in active_directions}
-    processed_examples = 0
-
-    for batch_idx, batch in enumerate(dataloader, start=1):
-        for example in batch:
-            if benchmark_mode == "qa_accuracy":
-                prefix = prepare_question_prefix(
-                    tokenizer=tokenizer,
-                    question=example["question"],
-                    device=config.device,
-                    choices=example.get("choices"),
-                    subject=example.get("subject"),
-                    context=example.get("context"),
-                    answer_mode=spec.answer_mode,
-                )
-                prefix_input_ids = prefix["cache_ids"]
-            elif benchmark_mode == "squad_f1":
-                prefix = prepare_generation_context_inputs(
-                    tokenizer=tokenizer,
-                    context=example["context"],
-                    device=config.device,
-                )
-                prefix_input_ids = prefix["input_ids"]
-            else:
-                raise ValueError(f"Unsupported benchmark_mode: {benchmark_mode}")
-
-            past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], prefix_input_ids)
-                for node in nodes
-            }
-
-            for direction in active_directions:
-                edge = edge_map[direction]
-                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
-                    past_key_values=past_by_node_id[edge.src_id],
-                    src_name=edge.src_id,
-                    dst_name=edge.dst_id,
-                )
-
-                translated_capture = replay_target_prefill_with_capture(
-                    target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix_input_ids,
-                    target_start_layer_idx=mapping.dst_layer_idx,
-                    injected_key_block=translated_key,
-                    injected_value_block=translated_value,
-                    dst_spec=model_specs[edge.dst_id],
-                )
-                native_capture = run_native_prefill_capture(
-                    target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix_input_ids,
-                    capture_start_layer_idx=mapping.dst_layer_idx,
-                    capture_end_layer_idx=mapping.dst_layer_end_idx,
-                )
-
-                path_metrics[direction].update(
-                    injected_cosine=compute_window_hidden_metric_average(
-                        translated_capture["window_hidden_states"],
-                        native_capture["window_hidden_states"],
-                        compute_hidden_cosine,
-                    ),
-                    injected_l2=compute_window_hidden_metric_average(
-                        translated_capture["window_hidden_states"],
-                        native_capture["window_hidden_states"],
-                        compute_hidden_l2,
-                    ),
-                    final_cosine=compute_hidden_cosine(
-                        translated_capture["final_hidden"],
-                        native_capture["final_hidden"],
-                    ),
-                    final_l2=compute_hidden_l2(
-                        translated_capture["final_hidden"],
-                        native_capture["final_hidden"],
-                    ),
-                    n=1,
-                )
-
-            processed_examples += 1
-
-        if batch_idx % 25 == 0:
-            logger.info(
-                "[%s] drift progress: %d/%d examples",
-                spec.name_for_log,
-                processed_examples,
-                config.eval_max_examples_per_dataset,
-            )
-
-    return {direction: meter.summary() for direction, meter in path_metrics.items()}
-
-
-@torch.inference_mode()
-def run_drift_eval(
-    config: LayerPositionConfig,
-    run_dir: Path,
-    translator_pool: LayerWindowTranslatorPool,
-    model_specs: Dict[str, ModelSpec],
-    layer_mappings: Dict[str, LayerMapping],
-    models: Dict[str, PreTrainedModel],
-    tokenizer: PreTrainedTokenizerBase,
-    nodes: List[Node],
-    edges: List[Edge],
-    active_directions: List[str],
-) -> Dict[str, Any]:
-    logger = setup_logger(f"layer_position_drift_{run_dir.name}", build_drift_log_path(run_dir))
-    logger.info("Starting hidden-state drift evaluation")
-    logger.info("experiment_config=%s", asdict(config))
-    log_layer_mappings(logger, nodes, model_specs, layer_mappings)
-
-    translator_pool.eval()
-    for model in models.values():
-        model.eval()
-
-    eval_config = SimpleNamespaceConfig(
-        batch_size=config.eval_batch_size,
-        num_workers=config.eval_num_workers,
-        max_examples_per_dataset=config.eval_max_examples_per_dataset,
-        seed=config.seed,
-        shuffle_eval_stream=config.eval_shuffle_stream,
-        shuffle_buffer=config.shuffle_buffer,
-    )
-
-    dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for spec in resolve_dataset_specs(config.benchmark_mode):
-        dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-        dataset_results = evaluate_drift_on_dataset(
-            spec=spec,
-            dataloader=dataloader,
-            benchmark_mode=config.benchmark_mode,
-            tokenizer=tokenizer,
-            config=config,
-            translator_pool=translator_pool,
-            model_specs=model_specs,
-            models=models,
-            nodes=nodes,
-            edges=edges,
-            active_directions=active_directions,
-            logger=logger,
-        )
-        dataset_results_by_name[spec.name_for_log] = dataset_results
-        for direction in active_directions:
-            row = dataset_results[direction]
-            logger.info(
-                "[%s] %s | injected_window_avg_cosine=%.6f | injected_window_avg_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d",
-                spec.name_for_log,
-                direction,
-                row["injected_cosine"],
-                row["injected_l2"],
-                row["final_cosine"],
-                row["final_l2"],
-                int(row["count"]),
-            )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    metrics = {
-        "benchmark_mode": config.benchmark_mode,
-        "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
-        "dataset_drift": dataset_results_by_name,
-        "average_injected_cosine": compute_average_metric(dataset_results_by_name, "injected_cosine"),
-        "average_injected_l2": compute_average_metric(dataset_results_by_name, "injected_l2"),
-        "average_final_cosine": compute_average_metric(dataset_results_by_name, "final_cosine"),
-        "average_final_l2": compute_average_metric(dataset_results_by_name, "final_l2"),
+def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    metric_name = str(combined_metrics["metric_name"])
+    dataset_results_key = "dataset_accuracies" if metric_name == "accuracy" else "dataset_f1"
+    return {
+        "benchmark_mode": combined_metrics["benchmark_mode"],
+        "metric_name": metric_name,
+        "layer_mappings": combined_metrics["layer_mappings"],
+        dataset_results_key: combined_metrics[dataset_results_key],
+        "average_metric": combined_metrics["average_metric"],
+        "average_native_metric": combined_metrics["average_native_metric"],
+        f"average_{metric_name}": combined_metrics[f"average_{metric_name}"],
+        f"average_native_{metric_name}": combined_metrics[f"average_native_{metric_name}"],
     }
-    write_json(str(build_drift_metrics_path(run_dir)), metrics)
-    logger.info(
-        "[Summary] avg_injected_window_cosine=%.6f | avg_injected_window_l2=%.6f | avg_final_cosine=%.6f | avg_final_l2=%.6f",
-        metrics["average_injected_cosine"],
-        metrics["average_injected_l2"],
-        metrics["average_final_cosine"],
-        metrics["average_final_l2"],
-    )
-    return metrics
+
+
+def extract_drift_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "benchmark_mode": combined_metrics["benchmark_mode"],
+        "layer_mappings": combined_metrics["layer_mappings"],
+        "dataset_drift": combined_metrics["dataset_drift"],
+        "average_injected_cosine": combined_metrics["average_injected_cosine"],
+        "average_injected_l2": combined_metrics["average_injected_l2"],
+        "average_final_cosine": combined_metrics["average_final_cosine"],
+        "average_final_l2": combined_metrics["average_final_l2"],
+    }
 
 
 def build_drift_summary_row(
@@ -1555,7 +1444,7 @@ def build_drift_summary_row(
     return DriftSummaryRow(
         study_id=config.study_id or "",
         benchmark_mode=str(metrics["benchmark_mode"]),
-        position_ratio=float(reference_mapping.relative_depth),
+        position_layer_idx=int(reference_mapping.reference_target_layer_idx),
         injection_window_size=int(reference_mapping.injection_window_size),
         translated_num_layers=int(reference_mapping.translated_num_layers),
         source_layer_idx=int(reference_mapping.src_layer_idx),
@@ -1569,27 +1458,9 @@ def build_drift_summary_row(
         run_dir=str(run_dir),
     )
 
-
-def build_drift_summary_markdown(rows: List[DriftSummaryRow]) -> str:
-    lines = [
-        "# Hidden-State Drift Summary for Injection Window Study",
-        "",
-        "| Ratio | Window Size | Translated Layers | Src Layers | Injected Tgt Layers | Injected Cosine | Injected L2 | Final Cosine | Final L2 |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ]
-    for row in sorted(rows, key=lambda item: item.position_ratio):
-        lines.append(
-            f"| {row.position_ratio:.1f} | {row.injection_window_size} | {row.translated_num_layers} | "
-            f"{format_layer_range(row.source_layer_idx, row.source_layer_end_idx)} | "
-            f"{format_layer_range(row.target_layer_idx, row.target_layer_end_idx)} | "
-            f"{row.injected_cosine:.6f} | {row.injected_l2:.6f} | {row.final_cosine:.6f} | {row.final_l2:.6f} |"
-        )
-    return "\n".join(lines)
-
-
 def write_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Path:
     summary_path = build_drift_summary_csv_path(study_dir)
-    rows = sorted(rows, key=lambda row: row.position_ratio)
+    rows = sorted(rows, key=lambda row: row.position_layer_idx)
     fieldnames = list(DriftSummaryRow.__dataclass_fields__.keys())
     with summary_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
@@ -1598,18 +1469,12 @@ def write_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Path:
             writer.writerow({key: getattr(row, key) for key in fieldnames})
     return summary_path
 
-
-def save_drift_summary_markdown(study_dir: Path, rows: List[DriftSummaryRow]) -> Path:
-    markdown_path = build_drift_summary_md_path(study_dir)
-    markdown_path.write_text(build_drift_summary_markdown(rows), encoding="utf-8")
-    return markdown_path
-
-
 def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
     for row in rows:
+        x_value = float(row.position_layer_idx)
         ax.annotate(
             format_layer_range(int(row.target_layer_idx), int(row.target_layer_end_idx)),
-            (float(row.position_ratio), float(y_getter(row))),
+            (x_value, float(y_getter(row))),
             textcoords="offset points",
             xytext=(0, 7),
             ha="center",
@@ -1618,8 +1483,8 @@ def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
 
 
 def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Path, Path]:
-    rows = sorted(rows, key=lambda row: row.position_ratio)
-    x_values = [row.position_ratio for row in rows]
+    rows = sorted(rows, key=lambda row: row.position_layer_idx)
+    x_values = [row.position_layer_idx for row in rows]
     injection_window_size = rows[0].injection_window_size if rows else 1
     window_title = format_window_title(injection_window_size)
 
@@ -1627,14 +1492,13 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
     cosine_fig = plt.figure(figsize=(9, 5.2))
     cosine_ax = cosine_fig.add_subplot(111)
-    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected window avg")
+    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected window end")
     cosine_ax.plot(x_values, [row.final_cosine for row in rows], marker="s", label="Final layer")
     annotate_injected_layer_ranges(cosine_ax, rows, lambda row: row.injected_cosine)
-    cosine_ax.set_xlabel("Injection position ratio")
+    cosine_ax.set_xlabel("Reference target layer index")
     cosine_ax.set_ylabel("Cosine similarity")
-    cosine_ax.set_title(f"Drift cosine vs position ratio ({window_title})")
+    cosine_ax.set_title(f"Drift cosine vs layer index ({window_title})")
     cosine_ax.set_xticks(x_values)
-    cosine_ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     cosine_ax.grid(True, alpha=0.3)
     cosine_ax.legend()
     cosine_fig.tight_layout()
@@ -1644,14 +1508,13 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
     l2_fig = plt.figure(figsize=(9, 5.2))
     l2_ax = l2_fig.add_subplot(111)
-    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected window avg")
+    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected window end")
     l2_ax.plot(x_values, [row.final_l2 for row in rows], marker="s", label="Final layer")
     annotate_injected_layer_ranges(l2_ax, rows, lambda row: row.injected_l2)
-    l2_ax.set_xlabel("Injection position ratio")
+    l2_ax.set_xlabel("Reference target layer index")
     l2_ax.set_ylabel("L2 distance")
-    l2_ax.set_title(f"Drift L2 vs position ratio ({window_title})")
+    l2_ax.set_title(f"Drift L2 vs layer index ({window_title})")
     l2_ax.set_xticks(x_values)
-    l2_ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     l2_ax.grid(True, alpha=0.3)
     l2_ax.legend()
     l2_fig.tight_layout()
@@ -1663,14 +1526,17 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
 
 def save_drift_artifacts(
-
     config: LayerPositionConfig,
     run_dir: Path,
     layer_mappings: Dict[str, LayerMapping],
     metrics: Dict[str, Any],
-) -> Tuple[Path, Path, Path, Path]:
+) -> Tuple[Path, Path, Path]:
     study_dir = run_dir.parent
     study_dir.mkdir(parents=True, exist_ok=True)
+    stale_markdown_path = study_dir / "drift_summary.md"
+    if stale_markdown_path.exists():
+        stale_markdown_path.unlink()
+    write_json(str(build_drift_metrics_path(run_dir)), metrics)
     summary_path = build_drift_summary_csv_path(study_dir)
     row = build_drift_summary_row(config, run_dir, layer_mappings, metrics)
 
@@ -1683,13 +1549,13 @@ def save_drift_artifacts(
                         DriftSummaryRow(
                             study_id=existing.get("study_id", ""),
                             benchmark_mode=existing["benchmark_mode"],
-                            position_ratio=float(existing["position_ratio"]),
-                            injection_window_size=int(existing.get("injection_window_size", int(existing.get("requested_num_upper_layers", 0)) + 1)),
-                            translated_num_layers=int(existing.get("translated_num_layers", 1)),
+                            position_layer_idx=int(existing["position_layer_idx"]),
+                            injection_window_size=int(existing["injection_window_size"]),
+                            translated_num_layers=int(existing["translated_num_layers"]),
                             source_layer_idx=int(existing["source_layer_idx"]),
-                            source_layer_end_idx=int(existing.get("source_layer_end_idx", existing["source_layer_idx"])),
+                            source_layer_end_idx=int(existing["source_layer_end_idx"]),
                             target_layer_idx=int(existing["target_layer_idx"]),
-                            target_layer_end_idx=int(existing.get("target_layer_end_idx", existing["target_layer_idx"])),
+                            target_layer_end_idx=int(existing["target_layer_end_idx"]),
                             injected_cosine=float(existing["injected_cosine"]),
                             injected_l2=float(existing["injected_l2"]),
                             final_cosine=float(existing["final_cosine"]),
@@ -1700,14 +1566,13 @@ def save_drift_artifacts(
                 except (KeyError, ValueError):
                     continue
 
-    rows = [existing for existing in rows if existing.position_ratio != row.position_ratio]
+    rows = [existing for existing in rows if existing.position_layer_idx != row.position_layer_idx]
     rows.append(row)
-    rows.sort(key=lambda item: item.position_ratio)
+    rows.sort(key=lambda item: item.position_layer_idx)
 
     summary_csv_path = write_drift_summary(study_dir, rows)
-    summary_md_path = save_drift_summary_markdown(study_dir, rows)
     cosine_chart_path, l2_chart_path = plot_drift_summary(study_dir, rows)
-    return summary_csv_path, summary_md_path, cosine_chart_path, l2_chart_path
+    return summary_csv_path, cosine_chart_path, l2_chart_path
 
 
 
@@ -1741,84 +1606,84 @@ def run_eval(
         shuffle_buffer=config.shuffle_buffer,
     )
 
-    if config.benchmark_mode == "qa_accuracy":
-        dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
-        for spec in LOGIT_QA_DATASET_SPECS:
-            dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-            dataset_results = evaluate_logit_dataset(
-                spec=spec,
-                dataloader=dataloader,
-                tokenizer=tokenizer,
-                config=config,
-                translator_pool=translator_pool,
-                model_specs=model_specs,
-                models=models,
-                nodes=nodes,
-                edges=edges,
-                active_directions=active_directions,
-                logger=logger,
-            )
-            dataset_results_by_name[spec.name_for_log] = dataset_results
-            for direction in active_directions:
-                row = dataset_results[direction]
-                logger.info(
-                    "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | count=%d",
-                    spec.name_for_log,
-                    direction,
-                    row["accuracy"],
-                    row["native_accuracy"],
-                    int(row["count"]),
-                )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
+    dataset_drift_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-        average_metric = compute_average_metric(dataset_results_by_name, "accuracy")
-        average_native_metric = compute_average_metric(dataset_results_by_name, "native_accuracy")
+    if config.benchmark_mode == "qa_accuracy":
         metric_name = "accuracy"
         dataset_results_key = "dataset_accuracies"
+        dataset_specs = LOGIT_QA_DATASET_SPECS
+        dataset_evaluator = evaluate_logit_dataset
+        progress_log_template = (
+            "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | injected_cosine=%.6f | "
+            "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
+        )
     elif config.benchmark_mode == "squad_f1":
-        dataset_results_by_name = {}
-        for spec in GENERATION_DATASET_SPECS:
-            dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-            dataset_results = evaluate_generation_dataset(
-                spec=spec,
-                dataloader=dataloader,
-                tokenizer=tokenizer,
-                config=config,
-                translator_pool=translator_pool,
-                model_specs=model_specs,
-                models=models,
-                nodes=nodes,
-                edges=edges,
-                active_directions=active_directions,
-                logger=logger,
-            )
-            dataset_results_by_name[spec.name_for_log] = dataset_results
-            for direction in active_directions:
-                row = dataset_results[direction]
-                logger.info(
-                    "[%s] %s | f1=%.6f | native_f1=%.6f | count=%d",
-                    spec.name_for_log,
-                    direction,
-                    row["f1"],
-                    row["native_f1"],
-                    int(row["count"]),
-                )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        average_metric = compute_average_metric(dataset_results_by_name, "f1")
-        average_native_metric = compute_average_metric(dataset_results_by_name, "native_f1")
         metric_name = "f1"
         dataset_results_key = "dataset_f1"
+        dataset_specs = GENERATION_DATASET_SPECS
+        dataset_evaluator = evaluate_generation_dataset
+        progress_log_template = (
+            "[%s] %s | f1=%.6f | native_f1=%.6f | injected_cosine=%.6f | "
+            "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
+        )
     else:
         raise ValueError(f"Unsupported benchmark_mode: {config.benchmark_mode}")
+
+    for spec in dataset_specs:
+        dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
+        dataset_results, dataset_drift = dataset_evaluator(
+            spec=spec,
+            dataloader=dataloader,
+            tokenizer=tokenizer,
+            config=config,
+            translator_pool=translator_pool,
+            model_specs=model_specs,
+            models=models,
+            nodes=nodes,
+            edges=edges,
+            active_directions=active_directions,
+            logger=logger,
+        )
+        dataset_results_by_name[spec.name_for_log] = dataset_results
+        dataset_drift_by_name[spec.name_for_log] = dataset_drift
+        for direction in active_directions:
+            metric_row = dataset_results[direction]
+            drift_row = dataset_drift[direction]
+            logger.info(
+                progress_log_template,
+                spec.name_for_log,
+                direction,
+                metric_row[metric_name],
+                metric_row[f"native_{metric_name}"],
+                drift_row["injected_cosine"],
+                drift_row["injected_l2"],
+                drift_row["final_cosine"],
+                drift_row["final_l2"],
+                int(metric_row["count"]),
+            )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    average_metric = compute_average_metric(dataset_results_by_name, metric_name)
+    average_native_metric = compute_average_metric(dataset_results_by_name, f"native_{metric_name}")
+    average_injected_cosine = compute_average_metric(dataset_drift_by_name, "injected_cosine")
+    average_injected_l2 = compute_average_metric(dataset_drift_by_name, "injected_l2")
+    average_final_cosine = compute_average_metric(dataset_drift_by_name, "final_cosine")
+    average_final_l2 = compute_average_metric(dataset_drift_by_name, "final_l2")
 
     logger.info(
         "[Summary] metric=%s | average_metric=%.6f | average_native_metric=%.6f",
         metric_name,
         average_metric,
         average_native_metric,
+    )
+    logger.info(
+        "[Summary] avg_injected_cosine=%.6f | avg_injected_l2=%.6f | avg_final_cosine=%.6f | avg_final_l2=%.6f",
+        average_injected_cosine,
+        average_injected_l2,
+        average_final_cosine,
+        average_final_l2,
     )
     return {
         "benchmark_mode": config.benchmark_mode,
@@ -1829,42 +1694,13 @@ def run_eval(
         "average_native_metric": average_native_metric,
         f"average_{metric_name}": average_metric,
         f"average_native_{metric_name}": average_native_metric,
+        "dataset_drift": dataset_drift_by_name,
+        "average_injected_cosine": average_injected_cosine,
+        "average_injected_l2": average_injected_l2,
+        "average_final_cosine": average_final_cosine,
+        "average_final_l2": average_final_l2,
     }
 
-
-
-def build_summary_markdown(metrics: Dict[str, Any]) -> str:
-    metric_name = str(metrics["metric_name"])
-    native_metric_name = f"native_{metric_name}"
-    dataset_results_key = "dataset_accuracies" if metric_name == "accuracy" else "dataset_f1"
-    metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
-    native_metric_label = f"Native {metric_label}"
-    reference_mapping = next(iter(metrics["layer_mappings"].values()))
-
-    lines = [
-        "# Injection Window Evaluation Result",
-        "",
-        f"- benchmark_mode: {metrics['benchmark_mode']}",
-        f"- metric_name: {metric_name}",
-        f"- average_metric: {metrics['average_metric']:.6f}",
-        f"- average_native_metric: {metrics['average_native_metric']:.6f}",
-        f"- injection_window: {format_window_title(int(reference_mapping['injection_window_size']))}",
-        f"- injection_window_size: {int(reference_mapping['injection_window_size'])}",
-        f"- translated_num_layers: {int(reference_mapping['translated_num_layers'])}",
-        f"- source_translation_layers: {format_layer_range(int(reference_mapping['src_layer_idx']), int(reference_mapping['src_layer_end_idx']))}",
-        f"- target_injection_layers: {format_layer_range(int(reference_mapping['dst_layer_idx']), int(reference_mapping['dst_layer_end_idx']))}",
-        "",
-        f"## Dataset {metric_label}",
-        "",
-        f"| Dataset | Direction | {metric_label} | {native_metric_label} | Count |",
-        "|---|---|---:|---:|---:|",
-    ]
-    for dataset_name, dataset_results in metrics[dataset_results_key].items():
-        for direction, row in dataset_results.items():
-            lines.append(
-                f"| {dataset_name} | {direction} | {row[metric_name]:.6f} | {row[native_metric_name]:.6f} | {int(row['count'])} |"
-            )
-    return "\n".join(lines)
 
 
 
@@ -1878,7 +1714,7 @@ def build_study_summary_row(
         "study_id": config.study_id or "",
         "benchmark_mode": str(metrics["benchmark_mode"]),
         "metric_name": str(metrics["metric_name"]),
-        "position_ratio": float(reference_mapping["relative_depth"]),
+        "position_layer_idx": int(reference_mapping["reference_target_layer_idx"]),
         "injection_window_size": int(reference_mapping["injection_window_size"]),
         "translated_num_layers": int(reference_mapping["translated_num_layers"]),
         "source_layer_idx": int(reference_mapping["src_layer_idx"]),
@@ -1910,10 +1746,10 @@ def update_study_summary(
     filtered_rows = [
         existing
         for existing in rows
-        if float(existing.get("position_ratio", "nan")) != row["position_ratio"]
+        if int(existing["position_layer_idx"]) != row["position_layer_idx"]
     ]
     filtered_rows.append({key: str(value) for key, value in row.items()})
-    filtered_rows.sort(key=lambda item: float(item["position_ratio"]))
+    filtered_rows.sort(key=lambda item: int(item["position_layer_idx"]))
 
     fieldnames = list(row.keys())
     with summary_path.open("w", encoding="utf-8", newline="") as fp:
@@ -1921,7 +1757,6 @@ def update_study_summary(
         writer.writeheader()
         writer.writerows(filtered_rows)
     return summary_path
-
 
 
 def plot_study_summary(summary_path: Path) -> Path:
@@ -1940,15 +1775,15 @@ def plot_study_summary(summary_path: Path) -> Path:
                 if metric_name is None:
                     metric_name = row.get("metric_name", "metric")
                 if injection_window_size is None:
-                    injection_window_size = int(row.get("injection_window_size", int(row.get("requested_num_upper_layers", 0)) + 1))
+                    injection_window_size = int(row["injection_window_size"])
             except (KeyError, ValueError):
                 continue
 
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
 
-    rows.sort(key=lambda item: float(item["position_ratio"]))
-    x_values = [float(item["position_ratio"]) for item in rows]
+    rows.sort(key=lambda item: int(item["position_layer_idx"]))
+    x_values = [int(item["position_layer_idx"]) for item in rows]
     y_values = [float(item["average_metric"]) for item in rows]
     average_native_metric = sum(native_values) / len(native_values) if native_values else float("nan")
     metric_name = metric_name or "metric"
@@ -1969,20 +1804,19 @@ def plot_study_summary(summary_path: Path) -> Path:
             linewidth=1.5,
             label=f"Native {metric_label} Mean ({average_native_metric:.4f})",
         )
-    for row, y_value in zip(rows, y_values):
+    for row, x_value, y_value in zip(rows, x_values, y_values):
         ax.annotate(
             format_layer_range(int(row["target_layer_idx"]), int(row["target_layer_end_idx"])),
-            (float(row["position_ratio"]), y_value),
+            (x_value, y_value),
             textcoords="offset points",
             xytext=(0, 7),
             ha="center",
             fontsize=8,
         )
-    ax.set_xlabel("Injection position ratio")
+    ax.set_xlabel("Reference target layer index")
     ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} vs position ratio ({window_title})")
+    ax.set_title(f"{metric_label} vs layer index ({window_title})")
     ax.set_xticks(x_values)
-    ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -1993,17 +1827,18 @@ def plot_study_summary(summary_path: Path) -> Path:
     return chart_path
 
 
-
 def save_run_artifacts(
     config: LayerPositionConfig,
     run_dir: Path,
     layer_mappings: Dict[str, LayerMapping],
     metrics: Dict[str, Any],
 ) -> Tuple[Path, Path, Path]:
+    stale_markdown_path = run_dir / "eval_summary.md"
+    if stale_markdown_path.exists():
+        stale_markdown_path.unlink()
     write_json(str(build_config_path(run_dir)), asdict(config))
     write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
     write_json(str(build_metrics_path(run_dir)), metrics)
-    build_summary_markdown_path(run_dir).write_text(build_summary_markdown(metrics), encoding="utf-8")
     summary_path = update_study_summary(config, run_dir, metrics)
     chart_path = plot_study_summary(summary_path)
     return summary_path, build_metrics_path(run_dir), chart_path
@@ -2013,13 +1848,13 @@ def save_run_artifacts(
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a translated layer window anchored at the chosen position ratio by replaying target prefill below the window, injecting the translated window, and continuing above it. Hidden-state drift evaluation is run automatically as part of the same execution."
+        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Hidden-state drift evaluation is run automatically as part of the same execution."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
-    parser.add_argument("--position-ratio", type=float, default=None)
-    parser.add_argument("--injection-window-size", type=int, default=1, help="Total number of consecutive layers to translate and inject, starting from the anchor layer selected by --position-ratio. For example, 1 injects only the anchor layer, and 3 injects the anchor layer plus the next two upper layers.")
+    parser.add_argument("--position-layer-idx", type=int, default=None, help="Reference target layer index to use as the anchor layer for translation/injection sweeps.")
+    parser.add_argument("--injection-window-size", type=int, default=1, help="Total number of consecutive layers to translate and inject, starting from the anchor layer selected by --position-layer-idx. For example, 1 injects only the anchor layer, and 3 injects the anchor layer plus the next two upper layers.")
     parser.add_argument("--print-target-num-layers", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/layer_position")
@@ -2067,7 +1902,7 @@ def main() -> None:
         model_ids=args.model_ids,
         model_directions=args.model_directions,
         reference_direction=args.reference_direction,
-        position_ratio=args.position_ratio,
+        position_layer_idx=args.position_layer_idx,
         injection_window_size=args.injection_window_size,
         output_root=args.output_root,
         study_id=args.study_id,
@@ -2097,8 +1932,8 @@ def main() -> None:
         generation_max_new_tokens=args.generation_max_new_tokens,
     )
 
-    if config.position_ratio is None:
-        raise SystemExit("--position-ratio is required unless --print-target-num-layers is used.")
+    if config.position_layer_idx is None:
+        raise SystemExit("--position-layer-idx is required unless --print-target-num-layers is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)
@@ -2120,7 +1955,7 @@ def main() -> None:
         active_directions=active_directions,
         reference_edge=reference_edge,
     )
-    metrics = run_eval(
+    combined_metrics = run_eval(
         config=config,
         run_dir=run_dir,
         translator_pool=translator_pool,
@@ -2132,21 +1967,11 @@ def main() -> None:
         edges=edges,
         active_directions=active_directions,
     )
-    summary_path, metrics_path, chart_path = save_run_artifacts(config, run_dir, layer_mappings, metrics)
+    eval_metrics = extract_eval_metrics(combined_metrics)
+    drift_metrics = extract_drift_metrics(combined_metrics)
 
-    drift_metrics = run_drift_eval(
-        config=config,
-        run_dir=run_dir,
-        translator_pool=translator_pool,
-        model_specs=model_specs,
-        layer_mappings=layer_mappings,
-        models=models,
-        tokenizer=tokenizer,
-        nodes=nodes,
-        edges=edges,
-        active_directions=active_directions,
-    )
-    drift_summary_csv_path, drift_summary_md_path, drift_cosine_chart_path, drift_l2_chart_path = save_drift_artifacts(
+    summary_path, metrics_path, chart_path = save_run_artifacts(config, run_dir, layer_mappings, eval_metrics)
+    drift_summary_csv_path, drift_cosine_chart_path, drift_l2_chart_path = save_drift_artifacts(
         config=config,
         run_dir=run_dir,
         layer_mappings=layer_mappings,
@@ -2159,7 +1984,6 @@ def main() -> None:
     print(f"Study chart: {chart_path}")
     print(f"Drift metrics: {build_drift_metrics_path(run_dir)}")
     print(f"Drift summary CSV: {drift_summary_csv_path}")
-    print(f"Drift summary Markdown: {drift_summary_md_path}")
     print(f"Drift cosine chart: {drift_cosine_chart_path}")
     print(f"Drift L2 chart: {drift_l2_chart_path}")
 

@@ -31,8 +31,8 @@ for ((i=1; i<=$#; i++)); do
     BENCHMARK_MODE="${!next_index}"
   elif [[ "${arg}" == --benchmark-mode=* ]]; then
     BENCHMARK_MODE="${arg#*=}"
-  elif [[ "${arg}" == --num-upper-layers || "${arg}" == --num-upper-layers=* ]]; then
-    echo "--num-upper-layers has been renamed to --injection-window-size" >&2
+  elif [[ "${arg}" == --position-layer-idx || "${arg}" == --position-layer-idx=* ]]; then
+    echo "layer_position.sh sweeps positions automatically; do not pass --position-layer-idx" >&2
     exit 1
   fi
 done
@@ -71,11 +71,17 @@ echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
 echo "[LayerPosition] injection_window_size=${INJECTION_WINDOW_SIZE}"
 echo "[LayerPosition] target_num_layers=${NUM_LAYERS}"
 
-POSITION_RATIOS=(0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0)
-for ratio in "${POSITION_RATIOS[@]}"; do
-  echo "[LayerPosition] ===== position ratio ${ratio} ====="
+MAX_START_LAYER_IDX=$((NUM_LAYERS - INJECTION_WINDOW_SIZE))
+if (( MAX_START_LAYER_IDX < 0 )); then
+  echo "--injection-window-size (${INJECTION_WINDOW_SIZE}) exceeds target_num_layers (${NUM_LAYERS})" >&2
+  exit 1
+fi
+
+echo "[LayerPosition] sweeping reference target layer indices 0..${MAX_START_LAYER_IDX}"
+for ((layer_idx=0; layer_idx<=MAX_START_LAYER_IDX; layer_idx++)); do
+  echo "[LayerPosition] ===== reference target layer idx ${layer_idx} ====="
   python exp/layer_position.py \
-    --position-ratio "${ratio}" \
+    --position-layer-idx "${layer_idx}" \
     --output-root "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
     --injection-window-size "${INJECTION_WINDOW_SIZE}" \
@@ -84,7 +90,7 @@ done
 
 SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}/${WINDOW_DIR}"
 SUMMARY_PATH="${SUMMARY_ROOT}/study_summary.csv"
-CHART_PATH="${SUMMARY_ROOT}/ratio_vs_${METRIC_NAME}__${WINDOW_SLUG}.png"
+CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}__${WINDOW_SLUG}.png"
 DRIFT_SUMMARY_PATH="${SUMMARY_ROOT}/drift_summary.csv"
 DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/drift_cosine__${WINDOW_SLUG}.png"
 DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/drift_l2__${WINDOW_SLUG}.png"
