@@ -59,9 +59,14 @@ class LayerMapping:
     reference_target_node_id: str
     reference_target_num_layers: int
     reference_target_layer_idx: int
+    reference_target_layer_end_idx: int
     relative_depth: float
     src_layer_idx: int
+    src_layer_end_idx: int
     dst_layer_idx: int
+    dst_layer_end_idx: int
+    translated_num_layers: int
+    requested_num_upper_layers: int
     src_num_layers: int
     dst_num_layers: int
 
@@ -72,6 +77,7 @@ class LayerPositionConfig:
     model_directions: str = "A_to_B"
     reference_direction: Optional[str] = None
     position_ratio: Optional[float] = None
+    num_upper_layers: int = 0
 
     output_root: str = "outputs/layer_position"
     study_id: Optional[str] = None
@@ -114,45 +120,81 @@ class LayerPositionConfig:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
         if self.position_ratio is not None and not (0.0 <= self.position_ratio <= 1.0):
             raise ValueError("position_ratio must be in [0.0, 1.0]")
+        if self.num_upper_layers < 0:
+            raise ValueError("num_upper_layers must be >= 0")
         if self.benchmark_mode not in {"qa_accuracy", "squad_f1"}:
             raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
 
-class SingleLayerDirectionalTranslator(nn.Module):
+class LayerWindowDirectionalTranslator(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
         dst_hidden_size: int,
+        translated_num_layers: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
-        self.key_layer = PerLayerTranslator(
-            src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            translator_depth=translator_depth,
-            mlp_ratio=mlp_ratio,
+        if translated_num_layers < 1:
+            raise ValueError("translated_num_layers must be >= 1")
+        self.translated_num_layers = translated_num_layers
+        self.key_layers = nn.ModuleList(
+            [
+                PerLayerTranslator(
+                    src_hidden_size=src_hidden_size,
+                    dst_hidden_size=dst_hidden_size,
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(translated_num_layers)
+            ]
         )
-        self.value_layer = PerLayerTranslator(
-            src_hidden_size=src_hidden_size,
-            dst_hidden_size=dst_hidden_size,
-            translator_dim=translator_dim,
-            translator_heads=translator_heads,
-            translator_depth=translator_depth,
-            mlp_ratio=mlp_ratio,
+        self.value_layers = nn.ModuleList(
+            [
+                PerLayerTranslator(
+                    src_hidden_size=src_hidden_size,
+                    dst_hidden_size=dst_hidden_size,
+                    translator_dim=translator_dim,
+                    translator_heads=translator_heads,
+                    translator_depth=translator_depth,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(translated_num_layers)
+            ]
         )
 
-    def forward(self, key_layer: torch.Tensor, value_layer: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.key_layer(key_layer), self.value_layer(value_layer)
+    def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if key_block.shape != value_block.shape:
+            raise ValueError(
+                "Layer-window key/value shapes must match, "
+                f"got {tuple(key_block.shape)} vs {tuple(value_block.shape)}"
+            )
+        if key_block.ndim != 4:
+            raise ValueError(
+                "Layer-window tensors must have shape [batch, seq, num_layers, hidden], "
+                f"got {tuple(key_block.shape)}"
+            )
+        if key_block.shape[2] != self.translated_num_layers:
+            raise ValueError(
+                f"Expected {self.translated_num_layers} layers in the translation window, got {key_block.shape[2]}"
+            )
+
+        translated_key_layers = []
+        translated_value_layers = []
+        for offset in range(self.translated_num_layers):
+            translated_key_layers.append(self.key_layers[offset](key_block[:, :, offset, :]).unsqueeze(2))
+            translated_value_layers.append(self.value_layers[offset](value_block[:, :, offset, :]).unsqueeze(2))
+        return torch.cat(translated_key_layers, dim=2), torch.cat(translated_value_layers, dim=2)
 
 
-class SingleLayerTranslatorPool(nn.Module):
+class LayerWindowTranslatorPool(nn.Module):
     def __init__(
         self,
         model_specs: Dict[str, ModelSpec],
@@ -170,21 +212,21 @@ class SingleLayerTranslatorPool(nn.Module):
         self.active_directions = tuple(active_directions)
         self.edges_by_id = build_edge_map(edges)
 
-        self.adapters = nn.ModuleDict(
-            {
-                direction: SingleLayerDirectionalTranslator(
-                    src_hidden_size=model_specs[self.edges_by_id[direction].src_id].hidden_size,
-                    dst_hidden_size=model_specs[self.edges_by_id[direction].dst_id].hidden_size,
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-                for direction in self.active_directions
-            }
-        )
+        adapters = {}
+        for direction in self.active_directions:
+            mapping = self.layer_mappings[direction]
+            adapters[direction] = LayerWindowDirectionalTranslator(
+                src_hidden_size=model_specs[self.edges_by_id[direction].src_id].hidden_size,
+                dst_hidden_size=model_specs[self.edges_by_id[direction].dst_id].hidden_size,
+                translated_num_layers=mapping.translated_num_layers,
+                translator_dim=translator_dim,
+                translator_heads=translator_heads,
+                translator_depth=translator_depth,
+                mlp_ratio=mlp_ratio,
+            )
+        self.adapters = nn.ModuleDict(adapters)
 
-    def translate_single_layer(
+    def translate_layer_window(
         self,
         past_key_values: PastKeyValues,
         src_name: str,
@@ -192,9 +234,12 @@ class SingleLayerTranslatorPool(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, LayerMapping]:
         direction = f"{src_name}_to_{dst_name}"
         mapping = self.layer_mappings[direction]
-        key_layer, value_layer = extract_single_layer_block(past_key_values, mapping.src_layer_idx)
-        translated_key = self.adapters[direction].key_layer(key_layer)
-        translated_value = self.adapters[direction].value_layer(value_layer)
+        key_block, value_block = extract_layer_window_blocks(
+            past_key_values=past_key_values,
+            start_layer_idx=mapping.src_layer_idx,
+            num_layers=mapping.translated_num_layers,
+        )
+        translated_key, translated_value = self.adapters[direction](key_block, value_block)
         return translated_key, translated_value, mapping
 
 
@@ -341,52 +386,71 @@ def build_layer_mappings(
     relative_depth = float(config.position_ratio)
 
     reference_target_layer_idx = relative_depth_to_layer_index(relative_depth, reference_target_spec.num_layers)
+    reference_available_upper = reference_target_spec.num_layers - 1 - reference_target_layer_idx
+    reference_translated_num_layers = 1 + min(config.num_upper_layers, reference_available_upper)
+    reference_target_layer_end_idx = reference_target_layer_idx + reference_translated_num_layers - 1
+
     edge_map = build_edge_map(edges)
     mappings: Dict[str, LayerMapping] = {}
     for direction in active_directions:
         edge = edge_map[direction]
         src_spec = model_specs[edge.src_id]
         dst_spec = model_specs[edge.dst_id]
+        src_layer_idx = relative_depth_to_layer_index(relative_depth, src_spec.num_layers)
+        dst_layer_idx = relative_depth_to_layer_index(relative_depth, dst_spec.num_layers)
+        available_upper_layers = min(
+            src_spec.num_layers - 1 - src_layer_idx,
+            dst_spec.num_layers - 1 - dst_layer_idx,
+        )
+        translated_num_layers = 1 + min(config.num_upper_layers, available_upper_layers)
         mappings[direction] = LayerMapping(
             reference_direction=reference_edge.id,
             reference_target_node_id=reference_edge.dst_id,
             reference_target_num_layers=reference_target_spec.num_layers,
             reference_target_layer_idx=reference_target_layer_idx,
+            reference_target_layer_end_idx=reference_target_layer_end_idx,
             relative_depth=relative_depth,
-            src_layer_idx=relative_depth_to_layer_index(relative_depth, src_spec.num_layers),
-            dst_layer_idx=relative_depth_to_layer_index(relative_depth, dst_spec.num_layers),
+            src_layer_idx=src_layer_idx,
+            src_layer_end_idx=src_layer_idx + translated_num_layers - 1,
+            dst_layer_idx=dst_layer_idx,
+            dst_layer_end_idx=dst_layer_idx + translated_num_layers - 1,
+            translated_num_layers=translated_num_layers,
+            requested_num_upper_layers=config.num_upper_layers,
             src_num_layers=src_spec.num_layers,
             dst_num_layers=dst_spec.num_layers,
         )
     return mappings
 
 
-def extract_single_layer_block(
+def extract_layer_window_blocks(
     past_key_values: PastKeyValues,
-    layer_idx: int,
+    start_layer_idx: int,
+    num_layers: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if not (0 <= layer_idx < len(past_key_values)):
-        raise ValueError(f"layer_idx={layer_idx} must be in [0, {len(past_key_values) - 1}]")
-    key, value = past_key_values[layer_idx]
-    batch_size, num_heads, seq_len, head_dim = key.shape
-    key_flat = key.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-    value_flat = value.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, num_heads * head_dim)
-    return key_flat, value_flat
+    if num_layers < 1:
+        raise ValueError("num_layers must be >= 1")
+    end_layer_idx = start_layer_idx + num_layers
+    if not (0 <= start_layer_idx < len(past_key_values)):
+        raise ValueError(f"start_layer_idx={start_layer_idx} must be in [0, {len(past_key_values) - 1}]")
+    if end_layer_idx > len(past_key_values):
+        raise ValueError(
+            f"Cannot extract layers [{start_layer_idx}, {end_layer_idx - 1}] from cache with {len(past_key_values)} layers"
+        )
+    return past_key_values_to_blocks(past_key_values[start_layer_idx:end_layer_idx])
 
 
-def single_layer_blocks_to_past(
-    key_layer: torch.Tensor,
-    value_layer: torch.Tensor,
+def layer_window_blocks_to_past(
+    key_block: torch.Tensor,
+    value_block: torch.Tensor,
     num_heads: int,
     head_dim: int,
 ) -> PastKeyValues:
-    batch_size, seq_len, hidden_size = key_layer.shape
-    expected_hidden_size = num_heads * head_dim
-    if hidden_size != expected_hidden_size:
-        raise ValueError(f"Hidden mismatch: got {hidden_size}, expected {expected_hidden_size}")
-    key = key_layer.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    value = value_layer.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
-    return ((key, value),)
+    return blocks_to_partial_past_key_values(
+        key_block=key_block,
+        value_block=value_block,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
 
 
 def require_gpt2_transformer(model: PreTrainedModel):
@@ -503,61 +567,73 @@ def run_gpt2_block_with_injected_layer(
     return hidden_states, (injected_key, injected_value)
 
 
-def replay_target_prefill_with_single_layer(
+def replay_target_prefill_with_injected_window(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    target_layer_idx: int,
-    injected_key_layer: torch.Tensor,
-    injected_value_layer: torch.Tensor,
+    target_start_layer_idx: int,
+    injected_key_block: torch.Tensor,
+    injected_value_block: torch.Tensor,
     dst_spec: ModelSpec,
 ) -> PastKeyValues:
-    translated_key, translated_value = single_layer_blocks_to_past(
-        injected_key_layer,
-        injected_value_layer,
+    injected_window = layer_window_blocks_to_past(
+        injected_key_block,
+        injected_value_block,
         dst_spec.num_heads,
         dst_spec.head_dim,
-    )[0]
+    )
+    translated_num_layers = len(injected_window)
 
     transformer = require_gpt2_transformer(target_model)
-    if not (0 <= target_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_layer_idx={target_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+    target_end_layer_idx = target_start_layer_idx + translated_num_layers - 1
+    if not (0 <= target_start_layer_idx < len(transformer.h)):
+        raise ValueError(f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+    if target_end_layer_idx >= len(transformer.h):
+        raise ValueError(
+            f"Injected window ending at layer {target_end_layer_idx} exceeds target stack with {len(transformer.h)} layers"
+        )
 
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
     if torch.is_grad_enabled():
         with torch.no_grad():
             hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-            for lower_idx in range(target_layer_idx):
+            for lower_idx in range(target_start_layer_idx):
                 hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
                 rebuilt_past.append((present[0].detach(), present[1].detach()))
         hidden_states = hidden_states.detach()
     else:
         hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-        for lower_idx in range(target_layer_idx):
+        for lower_idx in range(target_start_layer_idx):
             hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
             rebuilt_past.append(present)
 
-    hidden_states, present = run_gpt2_block_with_injected_layer(
-        transformer.h[target_layer_idx],
-        hidden_states,
-        translated_key,
-        translated_value,
-    )
-    rebuilt_past.append(present)
+    for offset, injected_present in enumerate(injected_window):
+        layer_idx = target_start_layer_idx + offset
+        hidden_states, present = run_gpt2_block_with_injected_layer(
+            transformer.h[layer_idx],
+            hidden_states,
+            injected_present[0],
+            injected_present[1],
+        )
+        rebuilt_past.append(present)
 
-    for upper_idx in range(target_layer_idx + 1, len(transformer.h)):
+    for upper_idx in range(target_end_layer_idx + 1, len(transformer.h)):
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
         rebuilt_past.append(present)
 
     return tuple(rebuilt_past)
 
 
-def build_run_output_dir(config: LayerPositionConfig) -> Path:
+def build_study_dir(config: LayerPositionConfig) -> Path:
     study_id = config.study_id or f"run_{sanitize_slug(config.model_directions)}"
+    return Path(config.output_root) / study_id / f"upper_{config.num_upper_layers:02d}"
+
+
+def build_run_output_dir(config: LayerPositionConfig) -> Path:
     if config.position_ratio is None:
         raise ValueError("position_ratio must be set before building the run directory")
     position_label = f"ratio_{int(round(config.position_ratio * 100)):03d}"
-    return Path(config.output_root) / study_id / position_label
+    return build_study_dir(config) / position_label
 
 
 def build_train_log_path(run_dir: Path) -> Path:
@@ -603,16 +679,19 @@ def log_layer_mappings(
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
         logger.info(
-            "[LayerMapping] %s | %s(%s): layer %d/%d -> %s(%s): layer %d/%d | relative_depth=%.4f",
+            "[LayerMapping] %s | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | relative_depth=%.4f",
             direction,
             src_id,
             node_map[src_id].model_id,
             mapping.src_layer_idx,
+            mapping.src_layer_end_idx,
             model_specs[src_id].num_layers - 1,
             dst_id,
             node_map[dst_id].model_id,
             mapping.dst_layer_idx,
+            mapping.dst_layer_end_idx,
             model_specs[dst_id].num_layers - 1,
+            mapping.translated_num_layers,
             mapping.relative_depth,
         )
 
@@ -659,10 +738,10 @@ def build_translator_pool(
     active_directions: List[str],
     edges: List[Edge],
     reference_edge: Edge,
-) -> Tuple[SingleLayerTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
+) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
     model_specs = {node_id: get_model_spec(model) for node_id, model in models.items()}
     layer_mappings = build_layer_mappings(config, model_specs, edges, active_directions, reference_edge)
-    translator_pool = SingleLayerTranslatorPool(
+    translator_pool = LayerWindowTranslatorPool(
         model_specs=model_specs,
         edges=edges,
         layer_mappings=layer_mappings,
@@ -685,9 +764,9 @@ def run_train(
     edges: List[Edge],
     active_directions: List[str],
     reference_edge: Edge,
-) -> Tuple[SingleLayerTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
+) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
-    logger.info("Starting single-layer position training with target-layer replay")
+    logger.info("Starting layer-window position training with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
 
     translator_pool, model_specs, layer_mappings = build_translator_pool(
@@ -742,17 +821,17 @@ def run_train(
             total_direction_loss = 0.0
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_key, translated_value, mapping = translator_pool.translate_single_layer(
+                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replay_target_prefill_with_single_layer(
+                mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_cache_ids,
-                    target_layer_idx=mapping.dst_layer_idx,
-                    injected_key_layer=translated_key,
-                    injected_value_layer=translated_value,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=translated_key,
+                    injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
                 total_direction_loss = total_direction_loss + compute_suffix_lm_loss(
@@ -777,7 +856,7 @@ def run_train(
             progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.lr:.2e}")
             gpu_memory = gpu_memory_tracker.summary()
             logger.info(
-                "[Step %04d] single_layer_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] window_suffix_lm_loss=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
                 scheduler.lr,
@@ -806,7 +885,7 @@ def evaluate_logit_dataset(
     dataloader: DataLoader,
     tokenizer,
     config: LayerPositionConfig,
-    translator_pool: SingleLayerTranslatorPool,
+    translator_pool: LayerWindowTranslatorPool,
     model_specs: Dict[str, ModelSpec],
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
@@ -838,17 +917,17 @@ def evaluate_logit_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_key, translated_value, mapping = translator_pool.translate_single_layer(
+                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replay_target_prefill_with_single_layer(
+                mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix["cache_ids"],
-                    target_layer_idx=mapping.dst_layer_idx,
-                    injected_key_layer=translated_key,
-                    injected_value_layer=translated_value,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=translated_key,
+                    injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
                 translated_scores = score_answer_choices(
@@ -896,7 +975,7 @@ def evaluate_generation_dataset(
     dataloader: DataLoader,
     tokenizer,
     config: LayerPositionConfig,
-    translator_pool: SingleLayerTranslatorPool,
+    translator_pool: LayerWindowTranslatorPool,
     model_specs: Dict[str, ModelSpec],
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
@@ -936,17 +1015,17 @@ def evaluate_generation_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_key, translated_value, mapping = translator_pool.translate_single_layer(
+                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                mixed_target_past = replay_target_prefill_with_single_layer(
+                mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=cache_input_ids,
-                    target_layer_idx=mapping.dst_layer_idx,
-                    injected_key_layer=translated_key,
-                    injected_value_layer=translated_value,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=translated_key,
+                    injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
 
@@ -1020,8 +1099,12 @@ class DriftSummaryRow:
     study_id: str
     benchmark_mode: str
     position_ratio: float
+    requested_num_upper_layers: int
+    translated_num_layers: int
     source_layer_idx: int
+    source_layer_end_idx: int
     target_layer_idx: int
+    target_layer_end_idx: int
     injected_cosine: float
     injected_l2: float
     final_cosine: float
@@ -1105,28 +1188,28 @@ def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
 def run_native_prefill_capture(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    target_layer_idx: int,
+    capture_layer_idx: int,
 ) -> Dict[str, torch.Tensor]:
     transformer = require_gpt2_transformer(target_model)
-    if not (0 <= target_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_layer_idx={target_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+    if not (0 <= capture_layer_idx < len(transformer.h)):
+        raise ValueError(f"capture_layer_idx={capture_layer_idx} must be in [0, {len(transformer.h) - 1}]")
 
     hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-    after_target_hidden = None
+    after_capture_hidden = None
     for layer_idx, block in enumerate(transformer.h):
         hidden_states, _ = run_gpt2_block_with_cache(block, hidden_states)
-        if layer_idx == target_layer_idx:
-            after_target_hidden = hidden_states.detach().clone()
+        if layer_idx == capture_layer_idx:
+            after_capture_hidden = hidden_states.detach().clone()
 
-    if after_target_hidden is None:
-        raise RuntimeError("Failed to capture native hidden states at target layer")
+    if after_capture_hidden is None:
+        raise RuntimeError("Failed to capture native hidden states at the requested layer")
 
     final_hidden = hidden_states
     if getattr(transformer, "ln_f", None) is not None:
         final_hidden = transformer.ln_f(final_hidden)
 
     return {
-        "after_target_hidden": after_target_hidden,
+        "after_injected_window_hidden": after_capture_hidden,
         "final_hidden": final_hidden.detach().clone(),
     }
 
@@ -1135,39 +1218,52 @@ def run_native_prefill_capture(
 def replay_target_prefill_with_capture(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    target_layer_idx: int,
-    injected_key_layer: torch.Tensor,
-    injected_value_layer: torch.Tensor,
+    target_start_layer_idx: int,
+    injected_key_block: torch.Tensor,
+    injected_value_block: torch.Tensor,
     dst_spec: ModelSpec,
 ) -> Dict[str, Any]:
-    translated_key, translated_value = single_layer_blocks_to_past(
-        injected_key_layer,
-        injected_value_layer,
+    injected_window = layer_window_blocks_to_past(
+        injected_key_block,
+        injected_value_block,
         dst_spec.num_heads,
         dst_spec.head_dim,
-    )[0]
+    )
+    translated_num_layers = len(injected_window)
 
     transformer = require_gpt2_transformer(target_model)
-    if not (0 <= target_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_layer_idx={target_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+    target_end_layer_idx = target_start_layer_idx + translated_num_layers - 1
+    if not (0 <= target_start_layer_idx < len(transformer.h)):
+        raise ValueError(f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+    if target_end_layer_idx >= len(transformer.h):
+        raise ValueError(
+            f"Injected window ending at layer {target_end_layer_idx} exceeds target stack with {len(transformer.h)} layers"
+        )
 
     hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
     rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
-    for lower_idx in range(target_layer_idx):
+    for lower_idx in range(target_start_layer_idx):
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
         rebuilt_past.append((present[0].detach(), present[1].detach()))
 
-    hidden_states, present = run_gpt2_block_with_injected_layer(
-        transformer.h[target_layer_idx],
-        hidden_states,
-        translated_key,
-        translated_value,
-    )
-    rebuilt_past.append((present[0].detach(), present[1].detach()))
-    after_target_hidden = hidden_states.detach().clone()
+    after_injected_window_hidden = None
+    for offset, injected_present in enumerate(injected_window):
+        layer_idx = target_start_layer_idx + offset
+        hidden_states, present = run_gpt2_block_with_injected_layer(
+            transformer.h[layer_idx],
+            hidden_states,
+            injected_present[0],
+            injected_present[1],
+        )
+        rebuilt_past.append((present[0].detach(), present[1].detach()))
+        if layer_idx == target_end_layer_idx:
+            after_injected_window_hidden = hidden_states.detach().clone()
 
-    for upper_idx in range(target_layer_idx + 1, len(transformer.h)):
+    if after_injected_window_hidden is None:
+        raise RuntimeError("Failed to capture hidden states after the injected layer window")
+
+    for upper_idx in range(target_end_layer_idx + 1, len(transformer.h)):
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
         rebuilt_past.append((present[0].detach(), present[1].detach()))
 
@@ -1177,7 +1273,7 @@ def replay_target_prefill_with_capture(
 
     return {
         "past_key_values": tuple(rebuilt_past),
-        "after_target_hidden": after_target_hidden,
+        "after_injected_window_hidden": after_injected_window_hidden,
         "final_hidden": final_hidden.detach().clone(),
     }
 
@@ -1209,7 +1305,7 @@ def evaluate_drift_on_dataset(
     benchmark_mode: str,
     tokenizer: PreTrainedTokenizerBase,
     config: LayerPositionConfig,
-    translator_pool: SingleLayerTranslatorPool,
+    translator_pool: LayerWindowTranslatorPool,
     model_specs: Dict[str, ModelSpec],
     models: Dict[str, PreTrainedModel],
     nodes: List[Node],
@@ -1251,7 +1347,7 @@ def evaluate_drift_on_dataset(
 
             for direction in active_directions:
                 edge = edge_map[direction]
-                translated_key, translated_value, mapping = translator_pool.translate_single_layer(
+                translated_key, translated_value, mapping = translator_pool.translate_layer_window(
                     past_key_values=past_by_node_id[edge.src_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
@@ -1260,25 +1356,25 @@ def evaluate_drift_on_dataset(
                 translated_capture = replay_target_prefill_with_capture(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_input_ids,
-                    target_layer_idx=mapping.dst_layer_idx,
-                    injected_key_layer=translated_key,
-                    injected_value_layer=translated_value,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=translated_key,
+                    injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
                 native_capture = run_native_prefill_capture(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_input_ids,
-                    target_layer_idx=mapping.dst_layer_idx,
+                    capture_layer_idx=mapping.dst_layer_end_idx,
                 )
 
                 path_metrics[direction].update(
                     injected_cosine=compute_hidden_cosine(
-                        translated_capture["after_target_hidden"],
-                        native_capture["after_target_hidden"],
+                        translated_capture["after_injected_window_hidden"],
+                        native_capture["after_injected_window_hidden"],
                     ),
                     injected_l2=compute_hidden_l2(
-                        translated_capture["after_target_hidden"],
-                        native_capture["after_target_hidden"],
+                        translated_capture["after_injected_window_hidden"],
+                        native_capture["after_injected_window_hidden"],
                     ),
                     final_cosine=compute_hidden_cosine(
                         translated_capture["final_hidden"],
@@ -1308,7 +1404,7 @@ def evaluate_drift_on_dataset(
 def run_drift_eval(
     config: LayerPositionConfig,
     run_dir: Path,
-    translator_pool: SingleLayerTranslatorPool,
+    translator_pool: LayerWindowTranslatorPool,
     model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, LayerMapping],
     models: Dict[str, PreTrainedModel],
@@ -1399,8 +1495,12 @@ def build_drift_summary_row(
         study_id=config.study_id or "",
         benchmark_mode=str(metrics["benchmark_mode"]),
         position_ratio=float(reference_mapping.relative_depth),
+        requested_num_upper_layers=int(reference_mapping.requested_num_upper_layers),
+        translated_num_layers=int(reference_mapping.translated_num_layers),
         source_layer_idx=int(reference_mapping.src_layer_idx),
+        source_layer_end_idx=int(reference_mapping.src_layer_end_idx),
         target_layer_idx=int(reference_mapping.dst_layer_idx),
+        target_layer_end_idx=int(reference_mapping.dst_layer_end_idx),
         injected_cosine=float(metrics["average_injected_cosine"]),
         injected_l2=float(metrics["average_injected_l2"]),
         final_cosine=float(metrics["average_final_cosine"]),
@@ -1413,12 +1513,13 @@ def build_drift_summary_markdown(rows: List[DriftSummaryRow]) -> str:
     lines = [
         "# Layer Position Drift Summary",
         "",
-        "| Ratio | Src Layer | Tgt Layer | Injected Cosine | Injected L2 | Final Cosine | Final L2 |",
-        "|---:|---:|---:|---:|---:|---:|---:|",
+        "| Ratio | Upper Layers | Window | Src Layers | Tgt Layers | Injected Cosine | Injected L2 | Final Cosine | Final L2 |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in sorted(rows, key=lambda item: item.position_ratio):
         lines.append(
-            f"| {row.position_ratio:.1f} | {row.source_layer_idx} | {row.target_layer_idx} | "
+            f"| {row.position_ratio:.1f} | {row.requested_num_upper_layers} | {row.translated_num_layers} | "
+            f"{row.source_layer_idx}-{row.source_layer_end_idx} | {row.target_layer_idx}-{row.target_layer_end_idx} | "
             f"{row.injected_cosine:.6f} | {row.injected_l2:.6f} | {row.final_cosine:.6f} | {row.final_l2:.6f} |"
         )
     return "\n".join(lines)
@@ -1504,8 +1605,12 @@ def save_drift_artifacts(
                             study_id=existing.get("study_id", ""),
                             benchmark_mode=existing["benchmark_mode"],
                             position_ratio=float(existing["position_ratio"]),
+                            requested_num_upper_layers=int(existing.get("requested_num_upper_layers", 0)),
+                            translated_num_layers=int(existing.get("translated_num_layers", 1)),
                             source_layer_idx=int(existing["source_layer_idx"]),
+                            source_layer_end_idx=int(existing.get("source_layer_end_idx", existing["source_layer_idx"])),
                             target_layer_idx=int(existing["target_layer_idx"]),
+                            target_layer_end_idx=int(existing.get("target_layer_end_idx", existing["target_layer_idx"])),
                             injected_cosine=float(existing["injected_cosine"]),
                             injected_l2=float(existing["injected_l2"]),
                             final_cosine=float(existing["final_cosine"]),
@@ -1530,7 +1635,7 @@ def save_drift_artifacts(
 def run_eval(
     config: LayerPositionConfig,
     run_dir: Path,
-    translator_pool: SingleLayerTranslatorPool,
+    translator_pool: LayerWindowTranslatorPool,
     model_specs: Dict[str, ModelSpec],
     layer_mappings: Dict[str, LayerMapping],
     models: Dict[str, PreTrainedModel],
@@ -1540,7 +1645,7 @@ def run_eval(
     active_directions: List[str],
 ) -> Dict[str, Any]:
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
-    logger.info("Starting single-layer position evaluation with target-layer replay")
+    logger.info("Starting layer-window position evaluation with target-layer replay")
     logger.info("experiment_config=%s", asdict(config))
     log_layer_mappings(logger, nodes, model_specs, layer_mappings)
 
@@ -1655,6 +1760,7 @@ def build_summary_markdown(metrics: Dict[str, Any]) -> str:
     dataset_results_key = "dataset_accuracies" if metric_name == "accuracy" else "dataset_f1"
     metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
     native_metric_label = f"Native {metric_label}"
+    reference_mapping = next(iter(metrics["layer_mappings"].values()))
 
     lines = [
         "# Layer Position Result",
@@ -1663,6 +1769,10 @@ def build_summary_markdown(metrics: Dict[str, Any]) -> str:
         f"- metric_name: {metric_name}",
         f"- average_metric: {metrics['average_metric']:.6f}",
         f"- average_native_metric: {metrics['average_native_metric']:.6f}",
+        f"- requested_num_upper_layers: {int(reference_mapping['requested_num_upper_layers'])}",
+        f"- translated_num_layers: {int(reference_mapping['translated_num_layers'])}",
+        f"- source_layers: {int(reference_mapping['src_layer_idx'])}-{int(reference_mapping['src_layer_end_idx'])}",
+        f"- target_layers: {int(reference_mapping['dst_layer_idx'])}-{int(reference_mapping['dst_layer_end_idx'])}",
         "",
         f"## Dataset {metric_label}",
         "",
@@ -1689,8 +1799,12 @@ def build_study_summary_row(
         "benchmark_mode": str(metrics["benchmark_mode"]),
         "metric_name": str(metrics["metric_name"]),
         "position_ratio": float(reference_mapping["relative_depth"]),
+        "requested_num_upper_layers": int(reference_mapping["requested_num_upper_layers"]),
+        "translated_num_layers": int(reference_mapping["translated_num_layers"]),
         "source_layer_idx": int(reference_mapping["src_layer_idx"]),
+        "source_layer_end_idx": int(reference_mapping["src_layer_end_idx"]),
         "target_layer_idx": int(reference_mapping["dst_layer_idx"]),
+        "target_layer_end_idx": int(reference_mapping["dst_layer_end_idx"]),
         "average_metric": float(metrics["average_metric"]),
         "average_native_metric": float(metrics["average_native_metric"]),
         "run_dir": str(run_dir),
@@ -1803,12 +1917,13 @@ def save_run_artifacts(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a single translated layer by replaying target prefill before the layer, injecting it, and continuing above it. Hidden-state drift evaluation is run automatically as part of the same execution."
+        description="Train and evaluate a translated layer window anchored at the chosen position ratio by replaying target prefill below the window, injecting the translated window, and continuing above it. Hidden-state drift evaluation is run automatically as part of the same execution."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--position-ratio", type=float, default=None)
+    parser.add_argument("--num-upper-layers", type=int, default=0, help="How many immediately higher layers to translate together with the anchor layer selected by --position-ratio.")
     parser.add_argument("--print-target-num-layers", action="store_true")
     parser.add_argument("--plot-study-summary", action="store_true")
 
@@ -1854,7 +1969,20 @@ def main() -> None:
         return
 
     study_id = args.study_id or f"run_{sanitize_slug(args.model_directions)}"
-    study_dir = Path(args.output_root) / study_id
+    study_dir = build_study_dir(
+        LayerPositionConfig(
+            model_ids=args.model_ids,
+            model_directions=args.model_directions,
+            reference_direction=args.reference_direction,
+            position_ratio=0.0,
+            num_upper_layers=args.num_upper_layers,
+            output_root=args.output_root,
+            study_id=args.study_id,
+            device=args.device,
+            dtype=args.dtype,
+            benchmark_mode=args.benchmark_mode,
+        )
+    )
     if args.plot_study_summary:
         chart_path = plot_study_summary(study_dir)
         print(chart_path)
@@ -1865,6 +1993,7 @@ def main() -> None:
         model_directions=args.model_directions,
         reference_direction=args.reference_direction,
         position_ratio=args.position_ratio,
+        num_upper_layers=args.num_upper_layers,
         output_root=args.output_root,
         study_id=args.study_id,
         max_steps=args.max_steps,
