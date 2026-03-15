@@ -41,7 +41,13 @@ CHART_PATH=$(python exp/layer_position.py \
   "${COMMON_ARGS[@]}")
 
 SUMMARY_PATH="${OUTPUT_ROOT}/${STUDY_ID}/summary.csv"
+DRIFT_SUMMARY_PATH="${OUTPUT_ROOT}/${STUDY_ID}/drift_summary.csv"
+DRIFT_COSINE_CHART_PATH="${OUTPUT_ROOT}/${STUDY_ID}/layer_position_drift_cosine.png"
+DRIFT_L2_CHART_PATH="${OUTPUT_ROOT}/${STUDY_ID}/layer_position_drift_l2.png"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
 echo "[LayerPosition] chart_png=${CHART_PATH}"
+echo "[LayerPosition] drift_summary_csv=${DRIFT_SUMMARY_PATH}"
+echo "[LayerPosition] drift_cosine_chart_png=${DRIFT_COSINE_CHART_PATH}"
+echo "[LayerPosition] drift_l2_chart_png=${DRIFT_L2_CHART_PATH}"
