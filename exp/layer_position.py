@@ -755,6 +755,56 @@ def build_models_for_experiment(
     )
 
 
+def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> int:
+    config = getattr(model, "config", None)
+    candidates = [
+        getattr(config, "n_positions", None),
+        getattr(config, "max_position_embeddings", None),
+        getattr(config, "n_ctx", None),
+    ]
+    if tokenizer is not None:
+        tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
+            candidates.append(tokenizer_limit)
+    limits = [int(value) for value in candidates if isinstance(value, int) and value > 0]
+    if not limits:
+        return 1024
+    return min(limits)
+
+
+
+def compute_generation_context_budget(
+    tokenizer: PreTrainedTokenizerBase,
+    question: str,
+    config: LayerPositionConfig,
+    models: Dict[str, PreTrainedModel],
+) -> int:
+    shared_limit = min(get_model_context_limit(model, tokenizer) for model in models.values())
+    if config.benchmark_mode == "multinews_f1":
+        question_prefix = prepare_multinews_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device="cpu",
+        )
+    else:
+        question_prefix = prepare_generation_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device="cpu",
+        )
+    reserved_tokens = (
+        int(question_prefix["cache_ids"].shape[1])
+        + int(question_prefix["seed_token"].shape[1])
+        + int(config.generation_max_new_tokens)
+    )
+    budget = shared_limit - reserved_tokens
+    if budget < 16:
+        raise ValueError(
+            f"Insufficient context budget for generation: shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
+        )
+    return budget
+
+
 def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: LayerPositionConfig,
@@ -1061,10 +1111,17 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
+            context_budget = compute_generation_context_budget(
+                tokenizer=tokenizer,
+                question=question,
+                config=config,
+                models=models,
+            )
             context_prefix = prepare_multinews_context_inputs(
                 tokenizer=tokenizer,
                 context=context_text,
                 device=config.device,
+                max_input_tokens=context_budget,
             )
             cache_input_ids = context_prefix["input_ids"]
 
@@ -1075,6 +1132,15 @@ def evaluate_generation_dataset(
             )
             question_cache_ids = question_prefix["cache_ids"]
             seed_token = question_prefix["seed_token"]
+
+            if context_prefix.get("was_truncated") and processed_examples < 3:
+                logger.info(
+                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, generation_max_new_tokens=%d)",
+                    spec.name_for_log,
+                    int(cache_input_ids.shape[1]),
+                    int(question_cache_ids.shape[1]),
+                    int(config.generation_max_new_tokens),
+                )
 
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)

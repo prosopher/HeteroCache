@@ -788,20 +788,42 @@ def format_generation_question_prefix(question: str) -> str:
     )
 
 
-def prepare_full_text_inputs(tokenizer, text: str, device: str) -> Dict[str, Any]:
-    tokenized = tokenizer(text, return_tensors="pt")
+def prepare_full_text_inputs(
+    tokenizer,
+    text: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    tokenizer_kwargs = {"return_tensors": "pt"}
+    if max_input_tokens is not None:
+        if max_input_tokens < 1:
+            raise ValueError("max_input_tokens must be >= 1")
+        tokenizer_kwargs["truncation"] = True
+        tokenizer_kwargs["max_length"] = int(max_input_tokens)
+    tokenized = tokenizer(text, **tokenizer_kwargs)
     input_ids = tokenized.input_ids.to(device)
     if input_ids.shape[1] < 1:
         raise ValueError("Text must tokenize to at least 1 token.")
     return {
         "text": text,
         "input_ids": input_ids,
+        "was_truncated": bool(max_input_tokens is not None and input_ids.shape[1] >= int(max_input_tokens)),
     }
 
 
-def prepare_generation_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def prepare_generation_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_generation_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
@@ -823,9 +845,19 @@ def format_multinews_question_prefix(question: str) -> str:
     )
 
 
-def prepare_multinews_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def prepare_multinews_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_multinews_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
