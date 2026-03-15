@@ -1207,27 +1207,42 @@ def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
 def run_native_prefill_capture(
     target_model: PreTrainedModel,
     prefix_input_ids: torch.Tensor,
-    capture_layer_idx: int,
-) -> Dict[str, torch.Tensor]:
+    capture_start_layer_idx: int,
+    capture_end_layer_idx: int,
+) -> Dict[str, Any]:
     transformer = require_gpt2_transformer(target_model)
-    if not (0 <= capture_layer_idx < len(transformer.h)):
-        raise ValueError(f"capture_layer_idx={capture_layer_idx} must be in [0, {len(transformer.h) - 1}]")
+    if not (0 <= capture_start_layer_idx < len(transformer.h)):
+        raise ValueError(
+            f"capture_start_layer_idx={capture_start_layer_idx} must be in [0, {len(transformer.h) - 1}]"
+        )
+    if not (capture_start_layer_idx <= capture_end_layer_idx < len(transformer.h)):
+        raise ValueError(
+            "capture_end_layer_idx must satisfy "
+            f"{capture_start_layer_idx} <= capture_end_layer_idx < {len(transformer.h)}"
+        )
 
     hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
+    captured_window_hiddens: List[torch.Tensor] = []
     after_capture_hidden = None
     for layer_idx, block in enumerate(transformer.h):
         hidden_states, _ = run_gpt2_block_with_cache(block, hidden_states)
-        if layer_idx == capture_layer_idx:
-            after_capture_hidden = hidden_states.detach().clone()
+        if capture_start_layer_idx <= layer_idx <= capture_end_layer_idx:
+            captured_hidden = hidden_states.detach().clone()
+            captured_window_hiddens.append(captured_hidden)
+            if layer_idx == capture_end_layer_idx:
+                after_capture_hidden = captured_hidden
 
+    if len(captured_window_hiddens) != (capture_end_layer_idx - capture_start_layer_idx + 1):
+        raise RuntimeError("Failed to capture native hidden states across the requested layer window")
     if after_capture_hidden is None:
-        raise RuntimeError("Failed to capture native hidden states at the requested layer")
+        raise RuntimeError("Failed to capture native hidden states at the requested layer window end")
 
     final_hidden = hidden_states
     if getattr(transformer, "ln_f", None) is not None:
         final_hidden = transformer.ln_f(final_hidden)
 
     return {
+        "window_hidden_states": tuple(captured_window_hiddens),
         "after_injected_window_hidden": after_capture_hidden,
         "final_hidden": final_hidden.detach().clone(),
     }
@@ -1266,6 +1281,7 @@ def replay_target_prefill_with_capture(
         hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
         rebuilt_past.append((present[0].detach(), present[1].detach()))
 
+    captured_window_hiddens: List[torch.Tensor] = []
     after_injected_window_hidden = None
     for offset, injected_present in enumerate(injected_window):
         layer_idx = target_start_layer_idx + offset
@@ -1276,9 +1292,13 @@ def replay_target_prefill_with_capture(
             injected_present[1],
         )
         rebuilt_past.append((present[0].detach(), present[1].detach()))
+        captured_hidden = hidden_states.detach().clone()
+        captured_window_hiddens.append(captured_hidden)
         if layer_idx == target_end_layer_idx:
-            after_injected_window_hidden = hidden_states.detach().clone()
+            after_injected_window_hidden = captured_hidden
 
+    if len(captured_window_hiddens) != translated_num_layers:
+        raise RuntimeError("Failed to capture hidden states across the injected layer window")
     if after_injected_window_hidden is None:
         raise RuntimeError("Failed to capture hidden states after the injected layer window")
 
@@ -1292,6 +1312,7 @@ def replay_target_prefill_with_capture(
 
     return {
         "past_key_values": tuple(rebuilt_past),
+        "window_hidden_states": tuple(captured_window_hiddens),
         "after_injected_window_hidden": after_injected_window_hidden,
         "final_hidden": final_hidden.detach().clone(),
     }
@@ -1315,6 +1336,23 @@ def compute_hidden_l2(hidden_a: torch.Tensor, hidden_b: torch.Tensor) -> float:
     hidden_b = hidden_b.float()
     l2 = (hidden_a - hidden_b).pow(2).sum(dim=-1).sqrt()
     return float(l2.mean().item())
+
+
+def compute_window_hidden_metric_average(
+    hidden_list_a: Sequence[torch.Tensor],
+    hidden_list_b: Sequence[torch.Tensor],
+    metric_fn: Callable[[torch.Tensor, torch.Tensor], float],
+) -> float:
+    if len(hidden_list_a) != len(hidden_list_b):
+        raise ValueError(
+            f"Window hidden lists must have the same length, got {len(hidden_list_a)} vs {len(hidden_list_b)}"
+        )
+    if not hidden_list_a:
+        raise ValueError("Window hidden lists must be non-empty")
+    return float(
+        sum(metric_fn(hidden_a, hidden_b) for hidden_a, hidden_b in zip(hidden_list_a, hidden_list_b))
+        / len(hidden_list_a)
+    )
 
 
 @torch.inference_mode()
@@ -1383,17 +1421,20 @@ def evaluate_drift_on_dataset(
                 native_capture = run_native_prefill_capture(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_input_ids,
-                    capture_layer_idx=mapping.dst_layer_end_idx,
+                    capture_start_layer_idx=mapping.dst_layer_idx,
+                    capture_end_layer_idx=mapping.dst_layer_end_idx,
                 )
 
                 path_metrics[direction].update(
-                    injected_cosine=compute_hidden_cosine(
-                        translated_capture["after_injected_window_hidden"],
-                        native_capture["after_injected_window_hidden"],
+                    injected_cosine=compute_window_hidden_metric_average(
+                        translated_capture["window_hidden_states"],
+                        native_capture["window_hidden_states"],
+                        compute_hidden_cosine,
                     ),
-                    injected_l2=compute_hidden_l2(
-                        translated_capture["after_injected_window_hidden"],
-                        native_capture["after_injected_window_hidden"],
+                    injected_l2=compute_window_hidden_metric_average(
+                        translated_capture["window_hidden_states"],
+                        native_capture["window_hidden_states"],
+                        compute_hidden_l2,
                     ),
                     final_cosine=compute_hidden_cosine(
                         translated_capture["final_hidden"],
@@ -1471,7 +1512,7 @@ def run_drift_eval(
         for direction in active_directions:
             row = dataset_results[direction]
             logger.info(
-                "[%s] %s | injected_cosine=%.6f | injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d",
+                "[%s] %s | injected_window_avg_cosine=%.6f | injected_window_avg_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d",
                 spec.name_for_log,
                 direction,
                 row["injected_cosine"],
@@ -1494,7 +1535,7 @@ def run_drift_eval(
     }
     write_json(str(build_drift_metrics_path(run_dir)), metrics)
     logger.info(
-        "[Summary] avg_injected_cosine=%.6f | avg_injected_l2=%.6f | avg_final_cosine=%.6f | avg_final_l2=%.6f",
+        "[Summary] avg_injected_window_cosine=%.6f | avg_injected_window_l2=%.6f | avg_final_cosine=%.6f | avg_final_l2=%.6f",
         metrics["average_injected_cosine"],
         metrics["average_injected_l2"],
         metrics["average_final_cosine"],
@@ -1585,7 +1626,7 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
     cosine_fig = plt.figure(figsize=(9, 5.2))
     cosine_ax = cosine_fig.add_subplot(111)
-    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected window")
+    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected window avg")
     cosine_ax.plot(x_values, [row.final_cosine for row in rows], marker="s", label="Final layer")
     annotate_injected_layer_ranges(cosine_ax, rows, lambda row: row.injected_cosine)
     cosine_ax.set_xlabel("Injection position ratio")
@@ -1602,7 +1643,7 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
     l2_fig = plt.figure(figsize=(9, 5.2))
     l2_ax = l2_fig.add_subplot(111)
-    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected window")
+    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected window avg")
     l2_ax.plot(x_values, [row.final_l2 for row in rows], marker="s", label="Final layer")
     annotate_injected_layer_ranges(l2_ax, rows, lambda row: row.injected_l2)
     l2_ax.set_xlabel("Injection position ratio")
