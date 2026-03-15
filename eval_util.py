@@ -291,6 +291,28 @@ def normalize_context_text(raw_value: Any) -> Optional[str]:
 
 
 def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
+    if spec.answer_mode == "multinews":
+        context_field = spec.context_field or "document"
+        answers_field = spec.answers_field or "summary"
+
+        context = normalize_context_text(example.get(context_field, None))
+        if context is None:
+            return None
+        context = context.replace(" ||||| ", "\n\n").replace("|||||", "\n\n").strip()
+        if not context:
+            return None
+
+        summary_value = example.get(answers_field, None)
+        if not isinstance(summary_value, str) or not summary_value.strip():
+            return None
+
+        question = "Summarize the news articles above."
+        return {
+            "question": question,
+            "context": context,
+            "answers": [summary_value.strip()],
+        }
+
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
         return None
@@ -784,6 +806,30 @@ def prepare_generation_context_inputs(tokenizer, context: str, device: str) -> D
 
 def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
     prefix_text = format_generation_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
+def format_multinews_context_prefix(context: str) -> str:
+    return (
+        "Read the following news articles and write a concise summary.\n\n"
+        f"Articles:\n{context.strip()}\n"
+    )
+
+
+def format_multinews_question_prefix(question: str) -> str:
+    return (
+        f"Task: {question.strip()}\n"
+        "Summary:"
+    )
+
+
+def prepare_multinews_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_multinews_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_multinews_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 

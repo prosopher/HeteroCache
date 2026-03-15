@@ -44,7 +44,7 @@ fi
 
 case "${BENCHMARK_MODE}" in
   qa_accuracy) METRIC_NAME=accuracy ;;
-  squad_f1) METRIC_NAME=f1 ;;
+  multinews_f1) METRIC_NAME=f1 ;;
   *)
     echo "Unsupported --benchmark-mode: ${BENCHMARK_MODE}" >&2
     exit 1

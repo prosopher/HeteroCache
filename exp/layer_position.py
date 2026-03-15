@@ -38,16 +38,15 @@ LOGIT_QA_DATASET_SPECS = [
     ),
 ]
 
-GENERATION_DATASET_SPECS = [
+MULTINEWS_DATASET_SPECS = [
     HFDatasetSpec(
-        name_for_log="SQuAD/validation",
-        dataset_path="rajpurkar/squad",
+        name_for_log="MultiNews/validation",
+        dataset_path="multi_news",
         dataset_name=None,
         split="validation",
-        answer_mode="squad",
-        question_field="question",
-        context_field="context",
-        answers_field="answers",
+        answer_mode="multinews",
+        context_field="document",
+        answers_field="summary",
         streaming=False,
     ),
 ]
@@ -106,10 +105,8 @@ class LayerPositionConfig:
     eval_num_workers: int = 0
     eval_max_examples_per_dataset: int = 256
     eval_shuffle_stream: bool = False
-    benchmark_mode: str = "squad_f1"
-    generation_max_new_tokens: int = 32
-    extractive_max_answer_tokens: int = 16
-    extractive_beam_size: int = 8
+    benchmark_mode: str = "multinews_f1"
+    generation_max_new_tokens: int = 64
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -123,12 +120,8 @@ class LayerPositionConfig:
             raise ValueError("position_layer_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
-        if self.benchmark_mode not in {"qa_accuracy", "squad_f1"}:
-            raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1'}")
-        if self.extractive_max_answer_tokens < 1:
-            raise ValueError("extractive_max_answer_tokens must be >= 1")
-        if self.extractive_beam_size < 1:
-            raise ValueError("extractive_beam_size must be >= 1")
+        if self.benchmark_mode not in {"qa_accuracy", "multinews_f1"}:
+            raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'multinews_f1'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
@@ -1068,14 +1061,14 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            context_prefix = prepare_extractive_context_inputs(
+            context_prefix = prepare_multinews_context_inputs(
                 tokenizer=tokenizer,
                 context=context_text,
                 device=config.device,
             )
             cache_input_ids = context_prefix["input_ids"]
 
-            question_prefix = prepare_extractive_question_prefix(
+            question_prefix = prepare_multinews_question_prefix(
                 tokenizer=tokenizer,
                 question=question,
                 device=config.device,
@@ -1127,23 +1120,19 @@ def evaluate_generation_dataset(
                     input_ids=question_cache_ids,
                 )
 
-                translated_answer = predict_extractive_answer(
+                translated_answer = generate_greedy_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=translated_answer_past,
                     seed_token=seed_token,
-                    context=context_text,
-                    max_answer_tokens=config.extractive_max_answer_tokens,
-                    beam_size=config.extractive_beam_size,
+                    max_new_tokens=config.generation_max_new_tokens,
                 )
-                native_answer = predict_extractive_answer(
+                native_answer = generate_greedy_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=native_answer_past,
                     seed_token=seed_token,
-                    context=context_text,
-                    max_answer_tokens=config.extractive_max_answer_tokens,
-                    beam_size=config.extractive_beam_size,
+                    max_new_tokens=config.generation_max_new_tokens,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -1177,7 +1166,7 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logger.info(
-                "[%s] extractive progress: %d/%d examples",
+                "[%s] generation progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
                 config.eval_max_examples_per_dataset,
@@ -1291,8 +1280,8 @@ def build_drift_l2_chart_path(study_dir: Path) -> Path:
 def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
     if benchmark_mode == "qa_accuracy":
         return LOGIT_QA_DATASET_SPECS
-    if benchmark_mode == "squad_f1":
-        return GENERATION_DATASET_SPECS
+    if benchmark_mode == "multinews_f1":
+        return MULTINEWS_DATASET_SPECS
     raise ValueError(f"Unsupported benchmark_mode: {benchmark_mode}")
 
 
@@ -1644,10 +1633,10 @@ def run_eval(
             "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | injected_cosine=%.6f | "
             "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
         )
-    elif config.benchmark_mode == "squad_f1":
+    elif config.benchmark_mode == "multinews_f1":
         metric_name = "f1"
         dataset_results_key = "dataset_f1"
-        dataset_specs = GENERATION_DATASET_SPECS
+        dataset_specs = MULTINEWS_DATASET_SPECS
         dataset_evaluator = evaluate_generation_dataset
         progress_log_template = (
             "[%s] %s | f1=%.6f | native_f1=%.6f | injected_cosine=%.6f | "
@@ -1840,10 +1829,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=200)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
-    parser.add_argument("--generation-max-new-tokens", type=int, default=32)
-    parser.add_argument("--extractive-max-answer-tokens", type=int, default=8)
-    parser.add_argument("--extractive-beam-size", type=int, default=4)
+    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "multinews_f1"], default="qa_accuracy")
+    parser.add_argument("--generation-max-new-tokens", type=int, default=64)
     return parser.parse_args()
 
 
@@ -1887,8 +1874,6 @@ def main() -> None:
         eval_shuffle_stream=args.eval_shuffle_stream,
         benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
-        extractive_max_answer_tokens=args.extractive_max_answer_tokens,
-        extractive_beam_size=args.extractive_beam_size,
     )
 
     if config.position_layer_idx is None:
