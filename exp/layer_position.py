@@ -646,15 +646,13 @@ def format_layer_range(start_idx: int, end_idx: int) -> str:
 def format_window_slug(injection_window_size: int) -> str:
     if injection_window_size < 1:
         raise ValueError("injection_window_size must be >= 1")
-    return f"injection_window_{injection_window_size:02d}_layers"
+    return f"win{injection_window_size:02d}"
 
 
 def format_window_title(injection_window_size: int) -> str:
     if injection_window_size < 1:
         raise ValueError("injection_window_size must be >= 1")
-    if injection_window_size == 1:
-        return "1-layer injection window (anchor only)"
-    return f"{injection_window_size}-layer injection window (anchor + {injection_window_size - 1} upper layers)"
+    return f"win={injection_window_size}"
 
 
 def build_train_log_path(run_dir: Path) -> Path:
@@ -682,11 +680,11 @@ def build_metrics_path(run_dir: Path) -> Path:
 
 
 def build_summary_markdown_path(run_dir: Path) -> Path:
-    return run_dir / "target_injection_evaluation_summary.md"
+    return run_dir / "eval_summary.md"
 
 
 def build_chart_path(study_dir: Path, metric_name: str, injection_window_size: int) -> Path:
-    return study_dir / f"target_injection_ratio_vs_{sanitize_slug(metric_name)}__{format_window_slug(injection_window_size)}.png"
+    return study_dir / f"ratio_vs_{sanitize_slug(metric_name)}__{format_window_slug(injection_window_size)}.png"
 
 
 def log_layer_mappings(
@@ -1174,27 +1172,27 @@ class DriftMeter:
 
 
 def build_drift_log_path(run_dir: Path) -> Path:
-    return run_dir / "target_injection_hidden_state_drift.log"
+    return run_dir / "drift.log"
 
 
 def build_drift_metrics_path(run_dir: Path) -> Path:
-    return run_dir / "target_injection_hidden_state_drift_metrics.json"
+    return run_dir / "drift_metrics.json"
 
 
 def build_drift_summary_csv_path(study_dir: Path) -> Path:
-    return study_dir / "target_injection_hidden_state_drift_summary.csv"
+    return study_dir / "drift_summary.csv"
 
 
 def build_drift_summary_md_path(study_dir: Path) -> Path:
-    return study_dir / "target_injection_hidden_state_drift_summary.md"
+    return study_dir / "drift_summary.md"
 
 
 def build_drift_cosine_chart_path(study_dir: Path, injection_window_size: int) -> Path:
-    return study_dir / f"target_injection_ratio_vs_hidden_state_cosine__{format_window_slug(injection_window_size)}.png"
+    return study_dir / f"drift_cosine__{format_window_slug(injection_window_size)}.png"
 
 
 def build_drift_l2_chart_path(study_dir: Path, injection_window_size: int) -> Path:
-    return study_dir / f"target_injection_ratio_vs_hidden_state_l2__{format_window_slug(injection_window_size)}.png"
+    return study_dir / f"drift_l2__{format_window_slug(injection_window_size)}.png"
 
 
 def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
@@ -1587,15 +1585,12 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
     cosine_fig = plt.figure(figsize=(9, 5.2))
     cosine_ax = cosine_fig.add_subplot(111)
-    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected-window cosine")
-    cosine_ax.plot(x_values, [row.final_cosine for row in rows], marker="s", label="Final-layer cosine")
+    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected window")
+    cosine_ax.plot(x_values, [row.final_cosine for row in rows], marker="s", label="Final layer")
     annotate_injected_layer_ranges(cosine_ax, rows, lambda row: row.injected_cosine)
-    cosine_ax.set_xlabel("Target Injection Position Ratio")
-    cosine_ax.set_ylabel("Cosine Similarity")
-    cosine_ax.set_title(
-        "Hidden-State Cosine Drift vs Target Injection Position Ratio\n"
-        f"{window_title}; annotated markers show injected target layers (e.g., L6-L8)"
-    )
+    cosine_ax.set_xlabel("Injection position ratio")
+    cosine_ax.set_ylabel("Cosine similarity")
+    cosine_ax.set_title(f"Drift cosine vs position ratio ({window_title})")
     cosine_ax.set_xticks(x_values)
     cosine_ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     cosine_ax.grid(True, alpha=0.3)
@@ -1607,15 +1602,12 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
     l2_fig = plt.figure(figsize=(9, 5.2))
     l2_ax = l2_fig.add_subplot(111)
-    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected-window L2")
-    l2_ax.plot(x_values, [row.final_l2 for row in rows], marker="s", label="Final-layer L2")
+    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected window")
+    l2_ax.plot(x_values, [row.final_l2 for row in rows], marker="s", label="Final layer")
     annotate_injected_layer_ranges(l2_ax, rows, lambda row: row.injected_l2)
-    l2_ax.set_xlabel("Target Injection Position Ratio")
-    l2_ax.set_ylabel("Mean Token L2")
-    l2_ax.set_title(
-        "Hidden-State L2 Drift vs Target Injection Position Ratio\n"
-        f"{window_title}; annotated markers show injected target layers (e.g., L6-L8)"
-    )
+    l2_ax.set_xlabel("Injection position ratio")
+    l2_ax.set_ylabel("L2 distance")
+    l2_ax.set_title(f"Drift L2 vs position ratio ({window_title})")
     l2_ax.set_xticks(x_values)
     l2_ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     l2_ax.grid(True, alpha=0.3)
@@ -1865,7 +1857,7 @@ def update_study_summary(
 ) -> Path:
     study_dir = run_dir.parent
     study_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = study_dir / "target_injection_position_study_summary.csv"
+    summary_path = study_dir / "study_summary.csv"
     row = build_study_summary_row(config, run_dir, metrics)
 
     rows = []
@@ -1944,12 +1936,9 @@ def plot_study_summary(summary_path: Path) -> Path:
             ha="center",
             fontsize=8,
         )
-    ax.set_xlabel("Target Injection Position Ratio")
+    ax.set_xlabel("Injection position ratio")
     ax.set_ylabel(metric_label)
-    ax.set_title(
-        f"{metric_label} vs Target Injection Position Ratio\n"
-        f"{window_title}; annotated markers show injected target layers (e.g., L6-L8)"
-    )
+    ax.set_title(f"{metric_label} vs position ratio ({window_title})")
     ax.set_xticks(x_values)
     ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     ax.grid(True, alpha=0.3)

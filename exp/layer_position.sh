@@ -63,8 +63,8 @@ if ! [[ "${NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-WINDOW_DIR=$(printf 'injection_window_%02d_layers' "${INJECTION_WINDOW_SIZE}")
-WINDOW_SLUG=$(printf 'injection_window_%02d_layers' "${INJECTION_WINDOW_SIZE}")
+WINDOW_DIR=$(printf 'win%02d' "${INJECTION_WINDOW_SIZE}")
+WINDOW_SLUG=$(printf 'win%02d' "${INJECTION_WINDOW_SIZE}")
 
 echo "[LayerPosition] study_id=${STUDY_ID}"
 echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
@@ -83,11 +83,11 @@ for ratio in "${POSITION_RATIOS[@]}"; do
 done
 
 SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}/${WINDOW_DIR}"
-SUMMARY_PATH="${SUMMARY_ROOT}/target_injection_position_study_summary.csv"
-CHART_PATH="${SUMMARY_ROOT}/target_injection_ratio_vs_${METRIC_NAME}__${WINDOW_SLUG}.png"
-DRIFT_SUMMARY_PATH="${SUMMARY_ROOT}/target_injection_hidden_state_drift_summary.csv"
-DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/target_injection_ratio_vs_hidden_state_cosine__${WINDOW_SLUG}.png"
-DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/target_injection_ratio_vs_hidden_state_l2__${WINDOW_SLUG}.png"
+SUMMARY_PATH="${SUMMARY_ROOT}/study_summary.csv"
+CHART_PATH="${SUMMARY_ROOT}/ratio_vs_${METRIC_NAME}__${WINDOW_SLUG}.png"
+DRIFT_SUMMARY_PATH="${SUMMARY_ROOT}/drift_summary.csv"
+DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/drift_cosine__${WINDOW_SLUG}.png"
+DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/drift_l2__${WINDOW_SLUG}.png"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
