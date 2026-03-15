@@ -16,7 +16,7 @@
   "log_every": 1,
   "seed": 123,
   "shuffle_buffer": 8,
-  "bottom_layers_to_translate": 1,
+  "top_layers_to_translate": 1,
   "translator_dim": 8,
   "translator_heads": 1,
   "translator_depth": 1,

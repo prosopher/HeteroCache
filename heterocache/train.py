@@ -319,7 +319,10 @@ def load_translator_pool_from_checkpoint(
     List[Edge],
 ]:
     payload = torch.load(checkpoint_path, map_location="cpu")
-    config = TrainConfig(**payload["train_config"])
+    train_config_payload = dict(payload["train_config"])
+    if "bottom_layers_to_translate" not in train_config_payload and "top_layers_to_translate" in train_config_payload:
+        train_config_payload["bottom_layers_to_translate"] = train_config_payload.pop("top_layers_to_translate")
+    config = TrainConfig(**train_config_payload)
     if device_override is not None:
         config.device = device_override
     models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
