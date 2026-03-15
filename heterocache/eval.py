@@ -6,11 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from eval_util import *
-from heterocache.train import (
-    load_translator_pool_from_checkpoint,
-    replace_bottom_layers,
-    slice_bottom_layers,
-)
+from heterocache.train import load_translator_pool_from_checkpoint
 
 
 @torch.inference_mode()

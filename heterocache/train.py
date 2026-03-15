@@ -243,64 +243,17 @@ def extract_bottom_layer_blocks(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if bottom_layers_to_translate < 1:
         raise ValueError("bottom_layers_to_translate must be >= 1")
-    max_allowed = len(past_key_values) - 1
-    if bottom_layers_to_translate > max_allowed:
+
+    max_replaceable_layers = len(past_key_values) - 1
+    if bottom_layers_to_translate > max_replaceable_layers:
         raise ValueError(
-            f"Cannot extract {bottom_layers_to_translate} bottom layers from cache with only {len(past_key_values)} layers "
-            f"when layer 0 is excluded."
-        )
-    return past_key_values_to_blocks(past_key_values[1 : 1 + bottom_layers_to_translate])
-
-
-def slice_bottom_layers(
-    past_key_values: PastKeyValues,
-    bottom_layers_to_translate: int,
-) -> PastKeyValues:
-    if bottom_layers_to_translate < 1:
-        raise ValueError("bottom_layers_to_translate must be >= 1")
-    max_allowed = len(past_key_values) - 1
-    if bottom_layers_to_translate > max_allowed:
-        raise ValueError(
-            f"Cannot slice {bottom_layers_to_translate} bottom layers from cache with only {len(past_key_values)} layers "
-            f"when layer 0 is excluded."
-        )
-    return tuple(past_key_values[1 : 1 + bottom_layers_to_translate])
-
-
-def replace_bottom_layers(
-    base_past_key_values: PastKeyValues,
-    translated_bottom_past_key_values: PastKeyValues,
-) -> PastKeyValues:
-    num_replace = len(translated_bottom_past_key_values)
-    if num_replace < 1:
-        raise ValueError("translated_bottom_past_key_values must contain at least one layer.")
-    max_allowed = len(base_past_key_values) - 1
-    if num_replace > max_allowed:
-        raise ValueError(
-            f"Cannot replace {num_replace} bottom layers in cache with only {len(base_past_key_values)} layers "
-            f"when layer 0 is excluded."
+            f"Cannot extract {bottom_layers_to_translate} bottom layers above layer 0 from cache with only "
+            f"{len(past_key_values)} layers."
         )
 
-    base_list = list(base_past_key_values)
-
-    for offset, translated_layer in enumerate(translated_bottom_past_key_values, start=1):
-        base_key, base_value = base_list[offset]
-        translated_key, translated_value = translated_layer
-
-        if base_key.shape != translated_key.shape:
-            raise ValueError(
-                f"Key shape mismatch at replaced layer {offset}: "
-                f"base={tuple(base_key.shape)} vs translated={tuple(translated_key.shape)}"
-            )
-        if base_value.shape != translated_value.shape:
-            raise ValueError(
-                f"Value shape mismatch at replaced layer {offset}: "
-                f"base={tuple(base_value.shape)} vs translated={tuple(translated_value.shape)}"
-            )
-
-        base_list[offset] = (translated_key, translated_value)
-
-    return tuple(base_list)
+    start_idx = 1
+    end_idx = start_idx + bottom_layers_to_translate
+    return past_key_values_to_blocks(past_key_values[start_idx:end_idx])
 
 
 def blocks_to_partial_past_key_values(
