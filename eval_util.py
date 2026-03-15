@@ -24,8 +24,8 @@ class EvalConfig:
     generation_max_new_tokens: int
 
     # extractive SQuAD-style QA
-    extractive_max_answer_tokens: int = 8
-    extractive_beam_size: int = 4
+    extractive_max_answer_tokens: int = 16
+    extractive_beam_size: int = 8
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -504,6 +504,13 @@ class ExtractiveSpanTrieNode:
         self.terminal_text = None
 
 
+def _tokenize_extractive_answer_candidate(tokenizer, candidate_text: str) -> List[int]:
+    candidate_text = candidate_text.strip()
+    if not candidate_text:
+        return []
+    return list(tokenizer(" " + candidate_text, add_special_tokens=False).input_ids)
+
+
 @dataclass
 class ExtractiveBeamState:
     node: ExtractiveSpanTrieNode
@@ -563,26 +570,36 @@ def build_extractive_span_trie(
     num_tokens = len(context_token_ids)
 
     for start_idx in range(num_tokens):
-        node = root
         max_end_idx = min(num_tokens, start_idx + max_answer_tokens)
         for end_idx in range(start_idx, max_end_idx):
-            token_id = int(context_token_ids[end_idx])
-            child = node.children.get(token_id)
-            if child is None:
-                child = ExtractiveSpanTrieNode()
-                node.children[token_id] = child
-            if child.terminal_text is None:
-                terminal_text = _decode_extractive_span_text(
-                    tokenizer=tokenizer,
-                    context=context,
-                    context_token_ids=context_token_ids,
-                    offsets=offsets,
-                    start_idx=start_idx,
-                    end_idx=end_idx,
-                )
-                if terminal_text:
-                    child.terminal_text = terminal_text
-            node = child
+            terminal_text = _decode_extractive_span_text(
+                tokenizer=tokenizer,
+                context=context,
+                context_token_ids=context_token_ids,
+                offsets=offsets,
+                start_idx=start_idx,
+                end_idx=end_idx,
+            )
+            if not terminal_text:
+                continue
+
+            answer_position_token_ids = _tokenize_extractive_answer_candidate(
+                tokenizer=tokenizer,
+                candidate_text=terminal_text,
+            )
+            if not answer_position_token_ids or len(answer_position_token_ids) > max_answer_tokens:
+                continue
+
+            node = root
+            for token_id in answer_position_token_ids:
+                token_id = int(token_id)
+                child = node.children.get(token_id)
+                if child is None:
+                    child = ExtractiveSpanTrieNode()
+                    node.children[token_id] = child
+                node = child
+            if node.terminal_text is None:
+                node.terminal_text = terminal_text
 
     return root
 
