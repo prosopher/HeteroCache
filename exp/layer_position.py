@@ -52,6 +52,119 @@ MULTINEWS_DATASET_SPECS = [
 ]
 
 
+class MultiNewsLayerPositionStream(IterableDataset):
+    def __init__(
+        self,
+        spec: HFDatasetSpec,
+        max_examples: int,
+        shuffle: bool,
+        seed: int,
+        shuffle_buffer: int,
+    ) -> None:
+        super().__init__()
+        self.spec = spec
+        self.max_examples = max_examples
+        self.shuffle = shuffle
+        self.seed = seed
+        self.shuffle_buffer = shuffle_buffer
+
+    def _load_dataset(self):
+        if self.spec.dataset_name is None:
+            return load_dataset(
+                self.spec.dataset_path,
+                split=self.spec.split,
+                streaming=self.spec.streaming,
+            )
+        return load_dataset(
+            self.spec.dataset_path,
+            self.spec.dataset_name,
+            split=self.spec.split,
+            streaming=self.spec.streaming,
+        )
+
+    def __iter__(self):
+        dataset = self._load_dataset()
+        if self.shuffle:
+            if self.spec.streaming:
+                dataset = dataset.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
+            else:
+                dataset = dataset.shuffle(seed=self.seed)
+
+        emitted = 0
+        context_field = self.spec.context_field or "document"
+        answers_field = self.spec.answers_field or "summary"
+        for example in dataset:
+            context = normalize_context_text(example.get(context_field, None))
+            if context is None:
+                continue
+            context = context.replace(" ||||| ", "\n\n").replace("|||||", "\n\n").strip()
+            if not context:
+                continue
+
+            summary_value = example.get(answers_field, None)
+            if not isinstance(summary_value, str) or not summary_value.strip():
+                continue
+
+            yield {
+                "question": "Summarize the news articles above.",
+                "context": context,
+                "answers": [summary_value.strip()],
+            }
+            emitted += 1
+            if emitted >= self.max_examples:
+                return
+
+
+def build_multinews_eval_dataloader(spec: HFDatasetSpec, eval_config) -> DataLoader:
+    dataset = MultiNewsLayerPositionStream(
+        spec=spec,
+        max_examples=eval_config.max_examples_per_dataset,
+        shuffle=eval_config.shuffle_eval_stream,
+        seed=eval_config.seed,
+        shuffle_buffer=eval_config.shuffle_buffer,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=eval_config.batch_size,
+        num_workers=eval_config.num_workers,
+        collate_fn=lambda batch: batch,
+    )
+
+
+def format_multinews_context_prefix(context: str) -> str:
+    return (
+        "Read the following news articles and write a concise summary.\n\n"
+        f"Articles:\n{context.strip()}\n"
+    )
+
+
+def format_multinews_question_prefix(question: str) -> str:
+    return (
+        f"Task: {question.strip()}\n"
+        "Summary:"
+    )
+
+
+def prepare_multinews_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    prefix_text = format_multinews_context_prefix(context=context)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
+
+
+def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_multinews_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
 @dataclass(frozen=True)
 class LayerMapping:
     reference_direction: str
@@ -71,7 +184,7 @@ class LayerMapping:
 
 @dataclass
 class LayerPositionConfig:
-    model_ids: str = "gpt2,gpt2-medium"
+    model_ids: str = "gpt2,gpt2"
     model_directions: str = "A_to_B"
     reference_direction: Optional[str] = None
     position_layer_idx: Optional[int] = None
@@ -103,7 +216,7 @@ class LayerPositionConfig:
 
     eval_batch_size: int = 4
     eval_num_workers: int = 0
-    eval_max_examples_per_dataset: int = 256
+    eval_max_examples_per_dataset: int = 100
     eval_shuffle_stream: bool = False
     benchmark_mode: str = "multinews_f1"
     generation_max_new_tokens: int = 64
@@ -1712,7 +1825,10 @@ def run_eval(
         raise ValueError(f"Unsupported benchmark_mode: {config.benchmark_mode}")
 
     for spec in dataset_specs:
-        dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
+        if config.benchmark_mode == "multinews_f1":
+            dataloader = build_multinews_eval_dataloader(spec=spec, eval_config=eval_config)
+        else:
+            dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
         dataset_results, dataset_drift = dataset_evaluator(
             spec=spec,
             dataloader=dataloader,
@@ -1893,7 +2009,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--eval-num-workers", type=int, default=0)
-    parser.add_argument("--eval-max-examples-per-dataset", type=int, default=200)
+    parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "multinews_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)

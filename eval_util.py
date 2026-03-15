@@ -67,30 +67,18 @@ class HFQAPairStream(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
 
     def _load_dataset(self):
-        candidates = [(self.spec.dataset_path, self.spec.dataset_name)]
-
-        last_error = None
-        for dataset_path, dataset_name in candidates:
-            try:
-                if dataset_name is None:
-                    return load_dataset(
-                        dataset_path,
-                        split=self.spec.split,
-                        streaming=self.spec.streaming,
-                    )
-                return load_dataset(
-                    dataset_path,
-                    dataset_name,
-                    split=self.spec.split,
-                    streaming=self.spec.streaming,
-                )
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(
-            f"Failed to load dataset {self.spec.name_for_log} "
-            f"with candidates={candidates}"
-        ) from last_error
+        if self.spec.dataset_name is None:
+            return load_dataset(
+                self.spec.dataset_path,
+                split=self.spec.split,
+                streaming=self.spec.streaming,
+            )
+        return load_dataset(
+            self.spec.dataset_path,
+            self.spec.dataset_name,
+            split=self.spec.split,
+            streaming=self.spec.streaming,
+        )
 
     def __iter__(self):
         dataset = self._load_dataset()
@@ -291,28 +279,6 @@ def normalize_context_text(raw_value: Any) -> Optional[str]:
 
 
 def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[Dict[str, Any]]:
-    if spec.answer_mode == "multinews":
-        context_field = spec.context_field or "document"
-        answers_field = spec.answers_field or "summary"
-
-        context = normalize_context_text(example.get(context_field, None))
-        if context is None:
-            return None
-        context = context.replace(" ||||| ", "\n\n").replace("|||||", "\n\n").strip()
-        if not context:
-            return None
-
-        summary_value = example.get(answers_field, None)
-        if not isinstance(summary_value, str) or not summary_value.strip():
-            return None
-
-        question = "Summarize the news articles above."
-        return {
-            "question": question,
-            "context": context,
-            "answers": [summary_value.strip()],
-        }
-
     question = example.get(spec.question_field, "")
     if not isinstance(question, str) or not question.strip():
         return None
@@ -830,39 +796,6 @@ def prepare_generation_question_prefix(tokenizer, question: str, device: str) ->
     prefix_text = format_generation_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
-
-def format_multinews_context_prefix(context: str) -> str:
-    return (
-        "Read the following news articles and write a concise summary.\n\n"
-        f"Articles:\n{context.strip()}\n"
-    )
-
-
-def format_multinews_question_prefix(question: str) -> str:
-    return (
-        f"Task: {question.strip()}\n"
-        "Summary:"
-    )
-
-
-def prepare_multinews_context_inputs(
-    tokenizer,
-    context: str,
-    device: str,
-    max_input_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    prefix_text = format_multinews_context_prefix(context=context)
-    return prepare_full_text_inputs(
-        tokenizer=tokenizer,
-        text=prefix_text,
-        device=device,
-        max_input_tokens=max_input_tokens,
-    )
-
-
-def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_multinews_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
 @torch.inference_mode()
