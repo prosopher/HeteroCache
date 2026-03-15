@@ -66,7 +66,7 @@ class LayerMapping:
     dst_layer_idx: int
     dst_layer_end_idx: int
     translated_num_layers: int
-    requested_num_upper_layers: int
+    injection_window_size: int
     src_num_layers: int
     dst_num_layers: int
 
@@ -77,7 +77,7 @@ class LayerPositionConfig:
     model_directions: str = "A_to_B"
     reference_direction: Optional[str] = None
     position_ratio: Optional[float] = None
-    num_upper_layers: int = 0
+    injection_window_size: int = 1
 
     output_root: str = "outputs/layer_position"
     study_id: Optional[str] = None
@@ -120,8 +120,8 @@ class LayerPositionConfig:
             raise ValueError("prefix_tokens must satisfy 2 <= prefix_tokens < total_tokens")
         if self.position_ratio is not None and not (0.0 <= self.position_ratio <= 1.0):
             raise ValueError("position_ratio must be in [0.0, 1.0]")
-        if self.num_upper_layers < 0:
-            raise ValueError("num_upper_layers must be >= 0")
+        if self.injection_window_size < 1:
+            raise ValueError("injection_window_size must be >= 1")
         if self.benchmark_mode not in {"qa_accuracy", "squad_f1"}:
             raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1'}")
         if self.translator_dim % self.translator_heads != 0:
@@ -387,7 +387,8 @@ def build_layer_mappings(
 
     reference_target_layer_idx = relative_depth_to_layer_index(relative_depth, reference_target_spec.num_layers)
     reference_available_upper = reference_target_spec.num_layers - 1 - reference_target_layer_idx
-    reference_translated_num_layers = 1 + min(config.num_upper_layers, reference_available_upper)
+    requested_window_size = int(config.injection_window_size)
+    reference_translated_num_layers = min(requested_window_size, 1 + reference_available_upper)
     reference_target_layer_end_idx = reference_target_layer_idx + reference_translated_num_layers - 1
 
     edge_map = build_edge_map(edges)
@@ -402,7 +403,7 @@ def build_layer_mappings(
             src_spec.num_layers - 1 - src_layer_idx,
             dst_spec.num_layers - 1 - dst_layer_idx,
         )
-        translated_num_layers = 1 + min(config.num_upper_layers, available_upper_layers)
+        translated_num_layers = min(requested_window_size, 1 + available_upper_layers)
         mappings[direction] = LayerMapping(
             reference_direction=reference_edge.id,
             reference_target_node_id=reference_edge.dst_id,
@@ -415,7 +416,7 @@ def build_layer_mappings(
             dst_layer_idx=dst_layer_idx,
             dst_layer_end_idx=dst_layer_idx + translated_num_layers - 1,
             translated_num_layers=translated_num_layers,
-            requested_num_upper_layers=config.num_upper_layers,
+            injection_window_size=config.injection_window_size,
             src_num_layers=src_spec.num_layers,
             dst_num_layers=dst_spec.num_layers,
         )
@@ -626,46 +627,66 @@ def replay_target_prefill_with_injected_window(
 
 def build_study_dir(config: LayerPositionConfig) -> Path:
     study_id = config.study_id or f"run_{sanitize_slug(config.model_directions)}"
-    return Path(config.output_root) / study_id / f"upper_{config.num_upper_layers:02d}"
+    return Path(config.output_root) / study_id / format_window_slug(config.injection_window_size)
 
 
 def build_run_output_dir(config: LayerPositionConfig) -> Path:
     if config.position_ratio is None:
         raise ValueError("position_ratio must be set before building the run directory")
-    position_label = f"ratio_{int(round(config.position_ratio * 100)):03d}"
+    position_label = f"position_ratio_{int(round(config.position_ratio * 100)):03d}"
     return build_study_dir(config) / position_label
 
 
+def format_layer_range(start_idx: int, end_idx: int) -> str:
+    if start_idx == end_idx:
+        return f"L{start_idx}"
+    return f"L{start_idx}-L{end_idx}"
+
+
+def format_window_slug(injection_window_size: int) -> str:
+    if injection_window_size < 1:
+        raise ValueError("injection_window_size must be >= 1")
+    return f"injection_window_{injection_window_size:02d}_layers"
+
+
+def format_window_title(injection_window_size: int) -> str:
+    if injection_window_size < 1:
+        raise ValueError("injection_window_size must be >= 1")
+    if injection_window_size == 1:
+        return "1-layer injection window (anchor only)"
+    return f"{injection_window_size}-layer injection window (anchor + {injection_window_size - 1} upper layers)"
+
+
 def build_train_log_path(run_dir: Path) -> Path:
-    return run_dir / "train.log"
+    return run_dir / "target_injection_training.log"
 
 
 def build_eval_log_path(run_dir: Path) -> Path:
-    return run_dir / "eval.log"
+    return run_dir / "target_injection_evaluation.log"
 
 
 def build_checkpoint_path(run_dir: Path) -> Path:
-    return run_dir / "final_checkpoint.pt"
+    return run_dir / "final_translator_checkpoint.pt"
 
 
 def build_config_path(run_dir: Path) -> Path:
-    return run_dir / "experiment_config.json"
+    return run_dir / "target_injection_run_config.json"
 
 
 def build_layer_mapping_path(run_dir: Path) -> Path:
-    return run_dir / "layer_mapping.json"
+    return run_dir / "target_injection_layer_mapping.json"
 
 
 def build_metrics_path(run_dir: Path) -> Path:
-    return run_dir / "metrics.json"
+    return run_dir / "target_injection_evaluation_metrics.json"
 
 
 def build_summary_markdown_path(run_dir: Path) -> Path:
-    return run_dir / "summary.md"
+    return run_dir / "target_injection_evaluation_summary.md"
 
 
-def build_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_position_metric.png"
+def build_chart_path(study_dir: Path, metric_name: str, injection_window_size: int) -> Path:
+    return study_dir / f"target_injection_ratio_vs_{sanitize_slug(metric_name)}__{format_window_slug(injection_window_size)}.png"
 
 
 def log_layer_mappings(
@@ -1099,7 +1120,7 @@ class DriftSummaryRow:
     study_id: str
     benchmark_mode: str
     position_ratio: float
-    requested_num_upper_layers: int
+    injection_window_size: int
     translated_num_layers: int
     source_layer_idx: int
     source_layer_end_idx: int
@@ -1153,27 +1174,27 @@ class DriftMeter:
 
 
 def build_drift_log_path(run_dir: Path) -> Path:
-    return run_dir / "drift_eval.log"
+    return run_dir / "target_injection_hidden_state_drift.log"
 
 
 def build_drift_metrics_path(run_dir: Path) -> Path:
-    return run_dir / "drift_metrics.json"
+    return run_dir / "target_injection_hidden_state_drift_metrics.json"
 
 
 def build_drift_summary_csv_path(study_dir: Path) -> Path:
-    return study_dir / "drift_summary.csv"
+    return study_dir / "target_injection_hidden_state_drift_summary.csv"
 
 
 def build_drift_summary_md_path(study_dir: Path) -> Path:
-    return study_dir / "drift_summary.md"
+    return study_dir / "target_injection_hidden_state_drift_summary.md"
 
 
-def build_drift_cosine_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_position_drift_cosine.png"
+def build_drift_cosine_chart_path(study_dir: Path, injection_window_size: int) -> Path:
+    return study_dir / f"target_injection_ratio_vs_hidden_state_cosine__{format_window_slug(injection_window_size)}.png"
 
 
-def build_drift_l2_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_position_drift_l2.png"
+def build_drift_l2_chart_path(study_dir: Path, injection_window_size: int) -> Path:
+    return study_dir / f"target_injection_ratio_vs_hidden_state_l2__{format_window_slug(injection_window_size)}.png"
 
 
 def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
@@ -1495,7 +1516,7 @@ def build_drift_summary_row(
         study_id=config.study_id or "",
         benchmark_mode=str(metrics["benchmark_mode"]),
         position_ratio=float(reference_mapping.relative_depth),
-        requested_num_upper_layers=int(reference_mapping.requested_num_upper_layers),
+        injection_window_size=int(reference_mapping.injection_window_size),
         translated_num_layers=int(reference_mapping.translated_num_layers),
         source_layer_idx=int(reference_mapping.src_layer_idx),
         source_layer_end_idx=int(reference_mapping.src_layer_end_idx),
@@ -1511,15 +1532,16 @@ def build_drift_summary_row(
 
 def build_drift_summary_markdown(rows: List[DriftSummaryRow]) -> str:
     lines = [
-        "# Layer Position Drift Summary",
+        "# Hidden-State Drift Summary for Injection Window Study",
         "",
-        "| Ratio | Upper Layers | Window | Src Layers | Tgt Layers | Injected Cosine | Injected L2 | Final Cosine | Final L2 |",
+        "| Ratio | Window Size | Translated Layers | Src Layers | Injected Tgt Layers | Injected Cosine | Injected L2 | Final Cosine | Final L2 |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in sorted(rows, key=lambda item: item.position_ratio):
         lines.append(
-            f"| {row.position_ratio:.1f} | {row.requested_num_upper_layers} | {row.translated_num_layers} | "
-            f"{row.source_layer_idx}-{row.source_layer_end_idx} | {row.target_layer_idx}-{row.target_layer_end_idx} | "
+            f"| {row.position_ratio:.1f} | {row.injection_window_size} | {row.translated_num_layers} | "
+            f"{format_layer_range(row.source_layer_idx, row.source_layer_end_idx)} | "
+            f"{format_layer_range(row.target_layer_idx, row.target_layer_end_idx)} | "
             f"{row.injected_cosine:.6f} | {row.injected_l2:.6f} | {row.final_cosine:.6f} | {row.final_l2:.6f} |"
         )
     return "\n".join(lines)
@@ -1543,41 +1565,63 @@ def save_drift_summary_markdown(study_dir: Path, rows: List[DriftSummaryRow]) ->
     return markdown_path
 
 
+def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
+    for row in rows:
+        ax.annotate(
+            format_layer_range(int(row.target_layer_idx), int(row.target_layer_end_idx)),
+            (float(row.position_ratio), float(y_getter(row))),
+            textcoords="offset points",
+            xytext=(0, 7),
+            ha="center",
+            fontsize=8,
+        )
+
+
 def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Path, Path]:
     rows = sorted(rows, key=lambda row: row.position_ratio)
     x_values = [row.position_ratio for row in rows]
+    injection_window_size = rows[0].injection_window_size if rows else 1
+    window_title = format_window_title(injection_window_size)
 
     import matplotlib.pyplot as plt
 
-    cosine_fig = plt.figure(figsize=(8, 4.5))
+    cosine_fig = plt.figure(figsize=(9, 5.2))
     cosine_ax = cosine_fig.add_subplot(111)
-    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected-layer cosine")
+    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected-window cosine")
     cosine_ax.plot(x_values, [row.final_cosine for row in rows], marker="s", label="Final-layer cosine")
-    cosine_ax.set_xlabel("Layer Index Ratio")
+    annotate_injected_layer_ranges(cosine_ax, rows, lambda row: row.injected_cosine)
+    cosine_ax.set_xlabel("Target Injection Position Ratio")
     cosine_ax.set_ylabel("Cosine Similarity")
-    cosine_ax.set_title("Layer Ratio vs Hidden-State Cosine")
+    cosine_ax.set_title(
+        "Hidden-State Cosine Drift vs Target Injection Position Ratio\n"
+        f"{window_title}; annotated markers show injected target layers (e.g., L6-L8)"
+    )
     cosine_ax.set_xticks(x_values)
     cosine_ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     cosine_ax.grid(True, alpha=0.3)
     cosine_ax.legend()
     cosine_fig.tight_layout()
-    cosine_path = build_drift_cosine_chart_path(study_dir)
+    cosine_path = build_drift_cosine_chart_path(study_dir, injection_window_size)
     cosine_fig.savefig(cosine_path, dpi=200)
     plt.close(cosine_fig)
 
-    l2_fig = plt.figure(figsize=(8, 4.5))
+    l2_fig = plt.figure(figsize=(9, 5.2))
     l2_ax = l2_fig.add_subplot(111)
-    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected-layer L2")
+    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected-window L2")
     l2_ax.plot(x_values, [row.final_l2 for row in rows], marker="s", label="Final-layer L2")
-    l2_ax.set_xlabel("Layer Index Ratio")
+    annotate_injected_layer_ranges(l2_ax, rows, lambda row: row.injected_l2)
+    l2_ax.set_xlabel("Target Injection Position Ratio")
     l2_ax.set_ylabel("Mean Token L2")
-    l2_ax.set_title("Layer Ratio vs Hidden-State L2 Drift")
+    l2_ax.set_title(
+        "Hidden-State L2 Drift vs Target Injection Position Ratio\n"
+        f"{window_title}; annotated markers show injected target layers (e.g., L6-L8)"
+    )
     l2_ax.set_xticks(x_values)
     l2_ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     l2_ax.grid(True, alpha=0.3)
     l2_ax.legend()
     l2_fig.tight_layout()
-    l2_path = build_drift_l2_chart_path(study_dir)
+    l2_path = build_drift_l2_chart_path(study_dir, injection_window_size)
     l2_fig.savefig(l2_path, dpi=200)
     plt.close(l2_fig)
 
@@ -1585,6 +1629,7 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
 
 
 def save_drift_artifacts(
+
     config: LayerPositionConfig,
     run_dir: Path,
     layer_mappings: Dict[str, LayerMapping],
@@ -1605,7 +1650,7 @@ def save_drift_artifacts(
                             study_id=existing.get("study_id", ""),
                             benchmark_mode=existing["benchmark_mode"],
                             position_ratio=float(existing["position_ratio"]),
-                            requested_num_upper_layers=int(existing.get("requested_num_upper_layers", 0)),
+                            injection_window_size=int(existing.get("injection_window_size", int(existing.get("requested_num_upper_layers", 0)) + 1)),
                             translated_num_layers=int(existing.get("translated_num_layers", 1)),
                             source_layer_idx=int(existing["source_layer_idx"]),
                             source_layer_end_idx=int(existing.get("source_layer_end_idx", existing["source_layer_idx"])),
@@ -1763,16 +1808,17 @@ def build_summary_markdown(metrics: Dict[str, Any]) -> str:
     reference_mapping = next(iter(metrics["layer_mappings"].values()))
 
     lines = [
-        "# Layer Position Result",
+        "# Injection Window Evaluation Result",
         "",
         f"- benchmark_mode: {metrics['benchmark_mode']}",
         f"- metric_name: {metric_name}",
         f"- average_metric: {metrics['average_metric']:.6f}",
         f"- average_native_metric: {metrics['average_native_metric']:.6f}",
-        f"- requested_num_upper_layers: {int(reference_mapping['requested_num_upper_layers'])}",
+        f"- injection_window: {format_window_title(int(reference_mapping['injection_window_size']))}",
+        f"- injection_window_size: {int(reference_mapping['injection_window_size'])}",
         f"- translated_num_layers: {int(reference_mapping['translated_num_layers'])}",
-        f"- source_layers: {int(reference_mapping['src_layer_idx'])}-{int(reference_mapping['src_layer_end_idx'])}",
-        f"- target_layers: {int(reference_mapping['dst_layer_idx'])}-{int(reference_mapping['dst_layer_end_idx'])}",
+        f"- source_translation_layers: {format_layer_range(int(reference_mapping['src_layer_idx']), int(reference_mapping['src_layer_end_idx']))}",
+        f"- target_injection_layers: {format_layer_range(int(reference_mapping['dst_layer_idx']), int(reference_mapping['dst_layer_end_idx']))}",
         "",
         f"## Dataset {metric_label}",
         "",
@@ -1799,7 +1845,7 @@ def build_study_summary_row(
         "benchmark_mode": str(metrics["benchmark_mode"]),
         "metric_name": str(metrics["metric_name"]),
         "position_ratio": float(reference_mapping["relative_depth"]),
-        "requested_num_upper_layers": int(reference_mapping["requested_num_upper_layers"]),
+        "injection_window_size": int(reference_mapping["injection_window_size"]),
         "translated_num_layers": int(reference_mapping["translated_num_layers"]),
         "source_layer_idx": int(reference_mapping["src_layer_idx"]),
         "source_layer_end_idx": int(reference_mapping["src_layer_end_idx"]),
@@ -1819,7 +1865,7 @@ def update_study_summary(
 ) -> Path:
     study_dir = run_dir.parent
     study_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = study_dir / "summary.csv"
+    summary_path = study_dir / "target_injection_position_study_summary.csv"
     row = build_study_summary_row(config, run_dir, metrics)
 
     rows = []
@@ -1844,37 +1890,42 @@ def update_study_summary(
 
 
 
-def plot_study_summary(study_dir: Path) -> Path:
-    summary_path = study_dir / "summary.csv"
+def plot_study_summary(summary_path: Path) -> Path:
     if not summary_path.exists():
         raise FileNotFoundError(f"Study summary not found: {summary_path}")
 
     rows = []
     native_values = []
     metric_name = None
+    injection_window_size = None
     with summary_path.open("r", encoding="utf-8", newline="") as fp:
         for row in csv.DictReader(fp):
             try:
-                rows.append((float(row["position_ratio"]), float(row["average_metric"])))
+                rows.append(row)
                 native_values.append(float(row["average_native_metric"]))
                 if metric_name is None:
                     metric_name = row.get("metric_name", "metric")
+                if injection_window_size is None:
+                    injection_window_size = int(row.get("injection_window_size", int(row.get("requested_num_upper_layers", 0)) + 1))
             except (KeyError, ValueError):
                 continue
 
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
 
-    rows.sort(key=lambda item: item[0])
-    x_values = [item[0] for item in rows]
-    y_values = [item[1] for item in rows]
+    rows.sort(key=lambda item: float(item["position_ratio"]))
+    x_values = [float(item["position_ratio"]) for item in rows]
+    y_values = [float(item["average_metric"]) for item in rows]
     average_native_metric = sum(native_values) / len(native_values) if native_values else float("nan")
     metric_name = metric_name or "metric"
+    injection_window_size = injection_window_size or 1
     metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
+    window_title = format_window_title(injection_window_size)
+    study_dir = summary_path.parent
 
     import matplotlib.pyplot as plt
 
-    fig = plt.figure(figsize=(8, 4.5))
+    fig = plt.figure(figsize=(9, 5.2))
     ax = fig.add_subplot(111)
     ax.plot(x_values, y_values, marker="o", label=f"Translated {metric_label}")
     if average_native_metric == average_native_metric:
@@ -1884,16 +1935,28 @@ def plot_study_summary(study_dir: Path) -> Path:
             linewidth=1.5,
             label=f"Native {metric_label} Mean ({average_native_metric:.4f})",
         )
-    ax.set_xlabel("Layer Index Ratio")
+    for row, y_value in zip(rows, y_values):
+        ax.annotate(
+            format_layer_range(int(row["target_layer_idx"]), int(row["target_layer_end_idx"])),
+            (float(row["position_ratio"]), y_value),
+            textcoords="offset points",
+            xytext=(0, 7),
+            ha="center",
+            fontsize=8,
+        )
+    ax.set_xlabel("Target Injection Position Ratio")
     ax.set_ylabel(metric_label)
-    ax.set_title(f"Layer Position Ratio vs {metric_label}")
+    ax.set_title(
+        f"{metric_label} vs Target Injection Position Ratio\n"
+        f"{window_title}; annotated markers show injected target layers (e.g., L6-L8)"
+    )
     ax.set_xticks(x_values)
     ax.set_xticklabels([f"{value:.1f}" for value in x_values])
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
 
-    chart_path = build_chart_path(study_dir)
+    chart_path = build_chart_path(study_dir, metric_name, injection_window_size)
     fig.savefig(chart_path, dpi=200)
     plt.close(fig)
     return chart_path
@@ -1911,12 +1974,13 @@ def save_run_artifacts(
     write_json(str(build_metrics_path(run_dir)), metrics)
     build_summary_markdown_path(run_dir).write_text(build_summary_markdown(metrics), encoding="utf-8")
     summary_path = update_study_summary(config, run_dir, metrics)
-    chart_path = plot_study_summary(run_dir.parent)
+    chart_path = plot_study_summary(summary_path)
     return summary_path, build_metrics_path(run_dir), chart_path
 
 
 
 def parse_args() -> argparse.Namespace:
+
     parser = argparse.ArgumentParser(
         description="Train and evaluate a translated layer window anchored at the chosen position ratio by replaying target prefill below the window, injecting the translated window, and continuing above it. Hidden-state drift evaluation is run automatically as part of the same execution."
     )
@@ -1924,7 +1988,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-directions", default="A_to_B")
     parser.add_argument("--reference-direction", default=None)
     parser.add_argument("--position-ratio", type=float, default=None)
-    parser.add_argument("--num-upper-layers", type=int, default=0, help="How many immediately higher layers to translate together with the anchor layer selected by --position-ratio.")
+    parser.add_argument("--injection-window-size", type=int, default=1, help="Total number of consecutive layers to translate and inject, starting from the anchor layer selected by --position-ratio. For example, 1 injects only the anchor layer, and 3 injects the anchor layer plus the next two upper layers.")
     parser.add_argument("--print-target-num-layers", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/layer_position")
@@ -1973,7 +2037,7 @@ def main() -> None:
         model_directions=args.model_directions,
         reference_direction=args.reference_direction,
         position_ratio=args.position_ratio,
-        num_upper_layers=args.num_upper_layers,
+        injection_window_size=args.injection_window_size,
         output_root=args.output_root,
         study_id=args.study_id,
         max_steps=args.max_steps,

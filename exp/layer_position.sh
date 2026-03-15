@@ -9,31 +9,53 @@ STUDY_ID=${STUDY_ID:-$(date +%Y%m%d_%H%M%S)}
 OUTPUT_ROOT=${OUTPUT_ROOT:-outputs/layer_position}
 COMMON_ARGS=("$@")
 
-NUM_UPPER_LAYERS=0
+INJECTION_WINDOW_SIZE=1
+BENCHMARK_MODE=qa_accuracy
 for ((i=1; i<=$#; i++)); do
   arg="${!i}"
-  if [[ "${arg}" == --num-upper-layers ]]; then
+  if [[ "${arg}" == --injection-window-size ]]; then
     next_index=$((i + 1))
     if (( next_index > $# )); then
-      echo "Missing value after --num-upper-layers" >&2
+      echo "Missing value after --injection-window-size" >&2
       exit 1
     fi
-    NUM_UPPER_LAYERS="${!next_index}"
-  elif [[ "${arg}" == --num-upper-layers=* ]]; then
-    NUM_UPPER_LAYERS="${arg#*=}"
+    INJECTION_WINDOW_SIZE="${!next_index}"
+  elif [[ "${arg}" == --injection-window-size=* ]]; then
+    INJECTION_WINDOW_SIZE="${arg#*=}"
+  elif [[ "${arg}" == --benchmark-mode ]]; then
+    next_index=$((i + 1))
+    if (( next_index > $# )); then
+      echo "Missing value after --benchmark-mode" >&2
+      exit 1
+    fi
+    BENCHMARK_MODE="${!next_index}"
+  elif [[ "${arg}" == --benchmark-mode=* ]]; then
+    BENCHMARK_MODE="${arg#*=}"
+  elif [[ "${arg}" == --num-upper-layers || "${arg}" == --num-upper-layers=* ]]; then
+    echo "--num-upper-layers has been renamed to --injection-window-size" >&2
+    exit 1
   fi
 done
 
-if ! [[ "${NUM_UPPER_LAYERS}" =~ ^[0-9]+$ ]]; then
-  echo "--num-upper-layers must be a non-negative integer: ${NUM_UPPER_LAYERS}" >&2
+if ! [[ "${INJECTION_WINDOW_SIZE}" =~ ^[0-9]+$ ]] || (( INJECTION_WINDOW_SIZE < 1 )); then
+  echo "--injection-window-size must be a positive integer: ${INJECTION_WINDOW_SIZE}" >&2
   exit 1
 fi
+
+case "${BENCHMARK_MODE}" in
+  qa_accuracy) METRIC_NAME=accuracy ;;
+  squad_f1) METRIC_NAME=f1 ;;
+  *)
+    echo "Unsupported --benchmark-mode: ${BENCHMARK_MODE}" >&2
+    exit 1
+    ;;
+esac
 
 NUM_LAYERS=$(python exp/layer_position.py \
   --print-target-num-layers \
   --output-root "${OUTPUT_ROOT}" \
   --study-id "${STUDY_ID}" \
-  --num-upper-layers "${NUM_UPPER_LAYERS}" \
+  --injection-window-size "${INJECTION_WINDOW_SIZE}" \
   "${COMMON_ARGS[@]}")
 
 if ! [[ "${NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
@@ -41,11 +63,12 @@ if ! [[ "${NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-UPPER_DIR=$(printf 'upper_%02d' "${NUM_UPPER_LAYERS}")
+WINDOW_DIR=$(printf 'injection_window_%02d_layers' "${INJECTION_WINDOW_SIZE}")
+WINDOW_SLUG=$(printf 'injection_window_%02d_layers' "${INJECTION_WINDOW_SIZE}")
 
 echo "[LayerPosition] study_id=${STUDY_ID}"
 echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
-echo "[LayerPosition] translated_upper_layers=${NUM_UPPER_LAYERS}"
+echo "[LayerPosition] injection_window_size=${INJECTION_WINDOW_SIZE}"
 echo "[LayerPosition] target_num_layers=${NUM_LAYERS}"
 
 POSITION_RATIOS=(0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0)
@@ -55,20 +78,20 @@ for ratio in "${POSITION_RATIOS[@]}"; do
     --position-ratio "${ratio}" \
     --output-root "${OUTPUT_ROOT}" \
     --study-id "${STUDY_ID}" \
-    --num-upper-layers "${NUM_UPPER_LAYERS}" \
+    --injection-window-size "${INJECTION_WINDOW_SIZE}" \
     "${COMMON_ARGS[@]}"
 done
 
-
-SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}/${UPPER_DIR}"
-SUMMARY_PATH="${SUMMARY_ROOT}/summary.csv"
-DRIFT_SUMMARY_PATH="${SUMMARY_ROOT}/drift_summary.csv"
-DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/layer_position_drift_cosine.png"
-DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/layer_position_drift_l2.png"
+SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}/${WINDOW_DIR}"
+SUMMARY_PATH="${SUMMARY_ROOT}/target_injection_position_study_summary.csv"
+CHART_PATH="${SUMMARY_ROOT}/target_injection_ratio_vs_${METRIC_NAME}__${WINDOW_SLUG}.png"
+DRIFT_SUMMARY_PATH="${SUMMARY_ROOT}/target_injection_hidden_state_drift_summary.csv"
+DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/target_injection_ratio_vs_hidden_state_cosine__${WINDOW_SLUG}.png"
+DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/target_injection_ratio_vs_hidden_state_l2__${WINDOW_SLUG}.png"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
-echo "[LayerPosition] chart_png=${SUMMARY_ROOT}/layer_position_metric.png"
+echo "[LayerPosition] chart_png=${CHART_PATH}"
 echo "[LayerPosition] drift_summary_csv=${DRIFT_SUMMARY_PATH}"
 echo "[LayerPosition] drift_cosine_chart_png=${DRIFT_COSINE_CHART_PATH}"
 echo "[LayerPosition] drift_l2_chart_png=${DRIFT_L2_CHART_PATH}"
