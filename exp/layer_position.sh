@@ -63,9 +63,6 @@ if ! [[ "${NUM_LAYERS}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-WINDOW_DIR=$(printf 'win%02d' "${INJECTION_WINDOW_SIZE}")
-WINDOW_SLUG=$(printf 'win%02d' "${INJECTION_WINDOW_SIZE}")
-
 echo "[LayerPosition] study_id=${STUDY_ID}"
 echo "[LayerPosition] output_root=${OUTPUT_ROOT}"
 echo "[LayerPosition] injection_window_size=${INJECTION_WINDOW_SIZE}"
@@ -88,16 +85,14 @@ for ((layer_idx=0; layer_idx<=MAX_START_LAYER_IDX; layer_idx++)); do
     "${COMMON_ARGS[@]}"
 done
 
-SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}/${WINDOW_DIR}"
-SUMMARY_PATH="${SUMMARY_ROOT}/study_summary.csv"
-CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}__${WINDOW_SLUG}.png"
-DRIFT_SUMMARY_PATH="${SUMMARY_ROOT}/drift_summary.csv"
-DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/drift_cosine__${WINDOW_SLUG}.png"
-DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/drift_l2__${WINDOW_SLUG}.png"
+SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}"
+SUMMARY_PATH="${SUMMARY_ROOT}/summary.csv"
+CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}.png"
+DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/drift_cosine.png"
+DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/drift_l2.png"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
 echo "[LayerPosition] chart_png=${CHART_PATH}"
-echo "[LayerPosition] drift_summary_csv=${DRIFT_SUMMARY_PATH}"
 echo "[LayerPosition] drift_cosine_chart_png=${DRIFT_COSINE_CHART_PATH}"
 echo "[LayerPosition] drift_l2_chart_png=${DRIFT_L2_CHART_PATH}"

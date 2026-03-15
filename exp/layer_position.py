@@ -66,7 +66,6 @@ class LayerMapping:
     dst_layer_idx: int
     dst_layer_end_idx: int
     translated_num_layers: int
-    injection_window_size: int
     src_num_layers: int
     dst_num_layers: int
 
@@ -434,7 +433,6 @@ def build_layer_mappings(
             dst_layer_idx=dst_layer_idx,
             dst_layer_end_idx=dst_layer_idx + translated_num_layers - 1,
             translated_num_layers=translated_num_layers,
-            injection_window_size=config.injection_window_size,
             src_num_layers=src_spec.num_layers,
             dst_num_layers=dst_spec.num_layers,
         )
@@ -645,7 +643,7 @@ def replay_target_prefill_with_injected_window(
 
 def build_study_dir(config: LayerPositionConfig) -> Path:
     study_id = config.study_id or f"run_{sanitize_slug(config.model_directions)}"
-    return Path(config.output_root) / study_id / format_window_slug(config.injection_window_size)
+    return Path(config.output_root) / study_id
 
 
 def build_run_output_dir(config: LayerPositionConfig) -> Path:
@@ -656,12 +654,6 @@ def format_layer_range(start_idx: int, end_idx: int) -> str:
     if start_idx == end_idx:
         return f"L{start_idx}"
     return f"L{start_idx}-L{end_idx}"
-
-
-def format_window_slug(injection_window_size: int) -> str:
-    if injection_window_size < 1:
-        raise ValueError("injection_window_size must be >= 1")
-    return f"win{injection_window_size:02d}"
 
 
 def format_window_title(injection_window_size: int) -> str:
@@ -693,8 +685,8 @@ def build_layer_mapping_path(run_dir: Path) -> Path:
 def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
 
-def build_chart_path(study_dir: Path, metric_name: str, injection_window_size: int) -> Path:
-    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}__{format_window_slug(injection_window_size)}.png"
+def build_chart_path(study_dir: Path, metric_name: str) -> Path:
+    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}.png"
 
 
 def log_layer_mappings(
@@ -1212,16 +1204,18 @@ def compute_average_metric(
 
 
 @dataclass
-class DriftSummaryRow:
+class SummaryRow:
     study_id: str
     benchmark_mode: str
+    metric_name: str
     position_layer_idx: int
-    injection_window_size: int
     translated_num_layers: int
     source_layer_idx: int
     source_layer_end_idx: int
     target_layer_idx: int
     target_layer_end_idx: int
+    average_metric: float
+    average_native_metric: float
     injected_cosine: float
     injected_l2: float
     final_cosine: float
@@ -1272,15 +1266,16 @@ def build_drift_metrics_path(run_dir: Path) -> Path:
     return run_dir / "drift_metrics.json"
 
 
-def build_drift_summary_csv_path(study_dir: Path) -> Path:
-    return study_dir / "drift_summary.csv"
-
-def build_drift_cosine_chart_path(study_dir: Path, injection_window_size: int) -> Path:
-    return study_dir / f"drift_cosine__{format_window_slug(injection_window_size)}.png"
+def build_summary_csv_path(study_dir: Path) -> Path:
+    return study_dir / "summary.csv"
 
 
-def build_drift_l2_chart_path(study_dir: Path, injection_window_size: int) -> Path:
-    return study_dir / f"drift_l2__{format_window_slug(injection_window_size)}.png"
+def build_drift_cosine_chart_path(study_dir: Path) -> Path:
+    return study_dir / "drift_cosine.png"
+
+
+def build_drift_l2_chart_path(study_dir: Path) -> Path:
+    return study_dir / "drift_l2.png"
 
 
 def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
@@ -1434,23 +1429,24 @@ def extract_drift_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_drift_summary_row(
+def build_summary_row(
     config: LayerPositionConfig,
     run_dir: Path,
-    layer_mappings: Dict[str, LayerMapping],
     metrics: Dict[str, Any],
-) -> DriftSummaryRow:
-    reference_mapping = next(iter(layer_mappings.values()))
-    return DriftSummaryRow(
+) -> SummaryRow:
+    reference_mapping = next(iter(metrics["layer_mappings"].values()))
+    return SummaryRow(
         study_id=config.study_id or "",
         benchmark_mode=str(metrics["benchmark_mode"]),
-        position_layer_idx=int(reference_mapping.reference_target_layer_idx),
-        injection_window_size=int(reference_mapping.injection_window_size),
-        translated_num_layers=int(reference_mapping.translated_num_layers),
-        source_layer_idx=int(reference_mapping.src_layer_idx),
-        source_layer_end_idx=int(reference_mapping.src_layer_end_idx),
-        target_layer_idx=int(reference_mapping.dst_layer_idx),
-        target_layer_end_idx=int(reference_mapping.dst_layer_end_idx),
+        metric_name=str(metrics["metric_name"]),
+        position_layer_idx=int(reference_mapping["reference_target_layer_idx"]),
+        translated_num_layers=int(reference_mapping["translated_num_layers"]),
+        source_layer_idx=int(reference_mapping["src_layer_idx"]),
+        source_layer_end_idx=int(reference_mapping["src_layer_end_idx"]),
+        target_layer_idx=int(reference_mapping["dst_layer_idx"]),
+        target_layer_end_idx=int(reference_mapping["dst_layer_end_idx"]),
+        average_metric=float(metrics["average_metric"]),
+        average_native_metric=float(metrics["average_native_metric"]),
         injected_cosine=float(metrics["average_injected_cosine"]),
         injected_l2=float(metrics["average_injected_l2"]),
         final_cosine=float(metrics["average_final_cosine"]),
@@ -1458,16 +1454,66 @@ def build_drift_summary_row(
         run_dir=str(run_dir),
     )
 
-def write_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Path:
-    summary_path = build_drift_summary_csv_path(study_dir)
+
+def read_summary_rows(summary_path: Path) -> List[SummaryRow]:
+    rows: List[SummaryRow] = []
+    if not summary_path.exists():
+        return rows
+    with summary_path.open("r", encoding="utf-8", newline="") as fp:
+        for existing in csv.DictReader(fp):
+            try:
+                rows.append(
+                    SummaryRow(
+                        study_id=existing.get("study_id", ""),
+                        benchmark_mode=existing["benchmark_mode"],
+                        metric_name=existing["metric_name"],
+                        position_layer_idx=int(existing["position_layer_idx"]),
+                        translated_num_layers=int(existing["translated_num_layers"]),
+                        source_layer_idx=int(existing["source_layer_idx"]),
+                        source_layer_end_idx=int(existing["source_layer_end_idx"]),
+                        target_layer_idx=int(existing["target_layer_idx"]),
+                        target_layer_end_idx=int(existing["target_layer_end_idx"]),
+                        average_metric=float(existing["average_metric"]),
+                        average_native_metric=float(existing["average_native_metric"]),
+                        injected_cosine=float(existing["injected_cosine"]),
+                        injected_l2=float(existing["injected_l2"]),
+                        final_cosine=float(existing["final_cosine"]),
+                        final_l2=float(existing["final_l2"]),
+                        run_dir=existing["run_dir"],
+                    )
+                )
+            except (KeyError, ValueError):
+                continue
+    return rows
+
+
+def write_summary(study_dir: Path, rows: List[SummaryRow]) -> Path:
+    summary_path = build_summary_csv_path(study_dir)
     rows = sorted(rows, key=lambda row: row.position_layer_idx)
-    fieldnames = list(DriftSummaryRow.__dataclass_fields__.keys())
+    fieldnames = list(SummaryRow.__dataclass_fields__.keys())
     with summary_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             writer.writerow({key: getattr(row, key) for key in fieldnames})
     return summary_path
+
+
+def update_summary(
+    config: LayerPositionConfig,
+    run_dir: Path,
+    metrics: Dict[str, Any],
+) -> Path:
+    study_dir = run_dir.parent
+    study_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = build_summary_csv_path(study_dir)
+    row = build_summary_row(config, run_dir, metrics)
+
+    rows = [existing for existing in read_summary_rows(summary_path) if existing.position_layer_idx != row.position_layer_idx]
+    rows.append(row)
+    rows.sort(key=lambda item: item.position_layer_idx)
+    return write_summary(study_dir, rows)
+
 
 def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
     for row in rows:
@@ -1482,11 +1528,15 @@ def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
         )
 
 
-def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Path, Path]:
-    rows = sorted(rows, key=lambda row: row.position_layer_idx)
+def plot_drift_summary(summary_path: Path) -> Tuple[Path, Path]:
+    rows = read_summary_rows(summary_path)
+    if not rows:
+        raise ValueError(f"No plottable rows found in {summary_path}")
+
+    rows.sort(key=lambda row: row.position_layer_idx)
     x_values = [row.position_layer_idx for row in rows]
-    injection_window_size = rows[0].injection_window_size if rows else 1
-    window_title = format_window_title(injection_window_size)
+    window_title = format_window_title(rows[0].translated_num_layers)
+    study_dir = summary_path.parent
 
     import matplotlib.pyplot as plt
 
@@ -1502,7 +1552,7 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
     cosine_ax.grid(True, alpha=0.3)
     cosine_ax.legend()
     cosine_fig.tight_layout()
-    cosine_path = build_drift_cosine_chart_path(study_dir, injection_window_size)
+    cosine_path = build_drift_cosine_chart_path(study_dir)
     cosine_fig.savefig(cosine_path, dpi=200)
     plt.close(cosine_fig)
 
@@ -1518,62 +1568,28 @@ def plot_drift_summary(study_dir: Path, rows: List[DriftSummaryRow]) -> Tuple[Pa
     l2_ax.grid(True, alpha=0.3)
     l2_ax.legend()
     l2_fig.tight_layout()
-    l2_path = build_drift_l2_chart_path(study_dir, injection_window_size)
+    l2_path = build_drift_l2_chart_path(study_dir)
     l2_fig.savefig(l2_path, dpi=200)
     plt.close(l2_fig)
 
     return cosine_path, l2_path
 
 
-def save_drift_artifacts(
-    config: LayerPositionConfig,
-    run_dir: Path,
-    layer_mappings: Dict[str, LayerMapping],
-    metrics: Dict[str, Any],
-) -> Tuple[Path, Path, Path]:
-    study_dir = run_dir.parent
-    study_dir.mkdir(parents=True, exist_ok=True)
-    stale_markdown_path = study_dir / "drift_summary.md"
-    if stale_markdown_path.exists():
-        stale_markdown_path.unlink()
+def remove_stale_summary_artifacts(study_dir: Path, run_dir: Path) -> None:
+    stale_paths = [
+        run_dir / "eval_summary.md",
+        study_dir / "drift_summary.md",
+        study_dir / "study_summary.csv",
+        study_dir / "drift_summary.csv",
+    ]
+    for stale_path in stale_paths:
+        if stale_path.exists():
+            stale_path.unlink()
+
+
+def save_drift_artifacts(run_dir: Path, metrics: Dict[str, Any]) -> Path:
     write_json(str(build_drift_metrics_path(run_dir)), metrics)
-    summary_path = build_drift_summary_csv_path(study_dir)
-    row = build_drift_summary_row(config, run_dir, layer_mappings, metrics)
-
-    rows: List[DriftSummaryRow] = []
-    if summary_path.exists():
-        with summary_path.open("r", encoding="utf-8", newline="") as fp:
-            for existing in csv.DictReader(fp):
-                try:
-                    rows.append(
-                        DriftSummaryRow(
-                            study_id=existing.get("study_id", ""),
-                            benchmark_mode=existing["benchmark_mode"],
-                            position_layer_idx=int(existing["position_layer_idx"]),
-                            injection_window_size=int(existing["injection_window_size"]),
-                            translated_num_layers=int(existing["translated_num_layers"]),
-                            source_layer_idx=int(existing["source_layer_idx"]),
-                            source_layer_end_idx=int(existing["source_layer_end_idx"]),
-                            target_layer_idx=int(existing["target_layer_idx"]),
-                            target_layer_end_idx=int(existing["target_layer_end_idx"]),
-                            injected_cosine=float(existing["injected_cosine"]),
-                            injected_l2=float(existing["injected_l2"]),
-                            final_cosine=float(existing["final_cosine"]),
-                            final_l2=float(existing["final_l2"]),
-                            run_dir=existing["run_dir"],
-                        )
-                    )
-                except (KeyError, ValueError):
-                    continue
-
-    rows = [existing for existing in rows if existing.position_layer_idx != row.position_layer_idx]
-    rows.append(row)
-    rows.sort(key=lambda item: item.position_layer_idx)
-
-    summary_csv_path = write_drift_summary(study_dir, rows)
-    cosine_chart_path, l2_chart_path = plot_drift_summary(study_dir, rows)
-    return summary_csv_path, cosine_chart_path, l2_chart_path
-
+    return build_drift_metrics_path(run_dir)
 
 
 def run_eval(
@@ -1704,92 +1720,19 @@ def run_eval(
 
 
 
-def build_study_summary_row(
-    config: LayerPositionConfig,
-    run_dir: Path,
-    metrics: Dict[str, Any],
-) -> Dict[str, Any]:
-    reference_mapping = next(iter(metrics["layer_mappings"].values()))
-    return {
-        "study_id": config.study_id or "",
-        "benchmark_mode": str(metrics["benchmark_mode"]),
-        "metric_name": str(metrics["metric_name"]),
-        "position_layer_idx": int(reference_mapping["reference_target_layer_idx"]),
-        "injection_window_size": int(reference_mapping["injection_window_size"]),
-        "translated_num_layers": int(reference_mapping["translated_num_layers"]),
-        "source_layer_idx": int(reference_mapping["src_layer_idx"]),
-        "source_layer_end_idx": int(reference_mapping["src_layer_end_idx"]),
-        "target_layer_idx": int(reference_mapping["dst_layer_idx"]),
-        "target_layer_end_idx": int(reference_mapping["dst_layer_end_idx"]),
-        "average_metric": float(metrics["average_metric"]),
-        "average_native_metric": float(metrics["average_native_metric"]),
-        "run_dir": str(run_dir),
-    }
-
-
-
-def update_study_summary(
-    config: LayerPositionConfig,
-    run_dir: Path,
-    metrics: Dict[str, Any],
-) -> Path:
-    study_dir = run_dir.parent
-    study_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = study_dir / "study_summary.csv"
-    row = build_study_summary_row(config, run_dir, metrics)
-
-    rows = []
-    if summary_path.exists():
-        with summary_path.open("r", encoding="utf-8", newline="") as fp:
-            rows = list(csv.DictReader(fp))
-
-    filtered_rows = [
-        existing
-        for existing in rows
-        if int(existing["position_layer_idx"]) != row["position_layer_idx"]
-    ]
-    filtered_rows.append({key: str(value) for key, value in row.items()})
-    filtered_rows.sort(key=lambda item: int(item["position_layer_idx"]))
-
-    fieldnames = list(row.keys())
-    with summary_path.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.DictWriter(fp, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(filtered_rows)
-    return summary_path
-
-
 def plot_study_summary(summary_path: Path) -> Path:
-    if not summary_path.exists():
-        raise FileNotFoundError(f"Study summary not found: {summary_path}")
-
-    rows = []
-    native_values = []
-    metric_name = None
-    injection_window_size = None
-    with summary_path.open("r", encoding="utf-8", newline="") as fp:
-        for row in csv.DictReader(fp):
-            try:
-                rows.append(row)
-                native_values.append(float(row["average_native_metric"]))
-                if metric_name is None:
-                    metric_name = row.get("metric_name", "metric")
-                if injection_window_size is None:
-                    injection_window_size = int(row["injection_window_size"])
-            except (KeyError, ValueError):
-                continue
-
+    rows = read_summary_rows(summary_path)
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
 
-    rows.sort(key=lambda item: int(item["position_layer_idx"]))
-    x_values = [int(item["position_layer_idx"]) for item in rows]
-    y_values = [float(item["average_metric"]) for item in rows]
+    rows.sort(key=lambda item: int(item.position_layer_idx))
+    x_values = [int(item.position_layer_idx) for item in rows]
+    y_values = [float(item.average_metric) for item in rows]
+    native_values = [float(item.average_native_metric) for item in rows]
     average_native_metric = sum(native_values) / len(native_values) if native_values else float("nan")
-    metric_name = metric_name or "metric"
-    injection_window_size = injection_window_size or 1
+    metric_name = rows[0].metric_name or "metric"
     metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
-    window_title = format_window_title(injection_window_size)
+    window_title = format_window_title(rows[0].translated_num_layers)
     study_dir = summary_path.parent
 
     import matplotlib.pyplot as plt
@@ -1806,7 +1749,7 @@ def plot_study_summary(summary_path: Path) -> Path:
         )
     for row, x_value, y_value in zip(rows, x_values, y_values):
         ax.annotate(
-            format_layer_range(int(row["target_layer_idx"]), int(row["target_layer_end_idx"])),
+            format_layer_range(int(row.target_layer_idx), int(row.target_layer_end_idx)),
             (x_value, y_value),
             textcoords="offset points",
             xytext=(0, 7),
@@ -1821,7 +1764,7 @@ def plot_study_summary(summary_path: Path) -> Path:
     ax.legend()
     fig.tight_layout()
 
-    chart_path = build_chart_path(study_dir, metric_name, injection_window_size)
+    chart_path = build_chart_path(study_dir, metric_name)
     fig.savefig(chart_path, dpi=200)
     plt.close(fig)
     return chart_path
@@ -1831,17 +1774,19 @@ def save_run_artifacts(
     config: LayerPositionConfig,
     run_dir: Path,
     layer_mappings: Dict[str, LayerMapping],
-    metrics: Dict[str, Any],
-) -> Tuple[Path, Path, Path]:
-    stale_markdown_path = run_dir / "eval_summary.md"
-    if stale_markdown_path.exists():
-        stale_markdown_path.unlink()
+    eval_metrics: Dict[str, Any],
+    combined_metrics: Dict[str, Any],
+) -> Tuple[Path, Path, Path, Path, Path]:
+    study_dir = run_dir.parent
+    study_dir.mkdir(parents=True, exist_ok=True)
+    remove_stale_summary_artifacts(study_dir, run_dir)
     write_json(str(build_config_path(run_dir)), asdict(config))
     write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
-    write_json(str(build_metrics_path(run_dir)), metrics)
-    summary_path = update_study_summary(config, run_dir, metrics)
+    write_json(str(build_metrics_path(run_dir)), eval_metrics)
+    summary_path = update_summary(config, run_dir, combined_metrics)
     chart_path = plot_study_summary(summary_path)
-    return summary_path, build_metrics_path(run_dir), chart_path
+    drift_cosine_chart_path, drift_l2_chart_path = plot_drift_summary(summary_path)
+    return summary_path, build_metrics_path(run_dir), chart_path, drift_cosine_chart_path, drift_l2_chart_path
 
 
 
@@ -1970,20 +1915,20 @@ def main() -> None:
     eval_metrics = extract_eval_metrics(combined_metrics)
     drift_metrics = extract_drift_metrics(combined_metrics)
 
-    summary_path, metrics_path, chart_path = save_run_artifacts(config, run_dir, layer_mappings, eval_metrics)
-    drift_summary_csv_path, drift_cosine_chart_path, drift_l2_chart_path = save_drift_artifacts(
+    summary_path, metrics_path, chart_path, drift_cosine_chart_path, drift_l2_chart_path = save_run_artifacts(
         config=config,
         run_dir=run_dir,
         layer_mappings=layer_mappings,
-        metrics=drift_metrics,
+        eval_metrics=eval_metrics,
+        combined_metrics=combined_metrics,
     )
+    drift_metrics_path = save_drift_artifacts(run_dir=run_dir, metrics=drift_metrics)
 
     print(f"Run directory: {run_dir}")
     print(f"Metrics: {metrics_path}")
-    print(f"Study summary CSV: {summary_path}")
+    print(f"Summary CSV: {summary_path}")
     print(f"Study chart: {chart_path}")
-    print(f"Drift metrics: {build_drift_metrics_path(run_dir)}")
-    print(f"Drift summary CSV: {drift_summary_csv_path}")
+    print(f"Drift metrics: {drift_metrics_path}")
     print(f"Drift cosine chart: {drift_cosine_chart_path}")
     print(f"Drift L2 chart: {drift_l2_chart_path}")
 
