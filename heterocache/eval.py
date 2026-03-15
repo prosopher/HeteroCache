@@ -164,11 +164,6 @@ def evaluate_generation_dataset(
                 )
                 question_cache_ids = question_prefix["cache_ids"]
                 seed_token = question_prefix["seed_token"]
-                candidate_spans = build_extractive_span_candidates(
-                    tokenizer=tokenizer,
-                    context=context_text,
-                    max_answer_tokens=eval_config.extractive_max_answer_tokens,
-                )
             else:
                 prefix = prepare_generation_prefix(
                     tokenizer=tokenizer,
@@ -222,19 +217,20 @@ def evaluate_generation_dataset(
                         tokenizer=tokenizer,
                         past_key_values=translated_answer_past,
                         seed_token=seed_token,
-                        candidate_spans=candidate_spans,
+                        context=context_text,
                         max_answer_tokens=eval_config.extractive_max_answer_tokens,
+                        beam_size=eval_config.extractive_beam_size,
                     )
                     native_answer = predict_extractive_answer(
                         model=models[edge.dst_id],
                         tokenizer=tokenizer,
                         past_key_values=native_answer_past,
                         seed_token=seed_token,
-                        candidate_spans=candidate_spans,
+                        context=context_text,
                         max_answer_tokens=eval_config.extractive_max_answer_tokens,
+                        beam_size=eval_config.extractive_beam_size,
                     )
                 else:
-                    candidate_spans = None
                     translated_generation_past = mixed_target_past
                     native_generation_past = past_by_node_id[edge.dst_id]
 
