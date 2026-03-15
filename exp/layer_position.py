@@ -1842,8 +1842,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=32)
-    parser.add_argument("--extractive-max-answer-tokens", type=int, default=16)
-    parser.add_argument("--extractive-beam-size", type=int, default=8)
+    parser.add_argument("--extractive-max-answer-tokens", type=int, default=8)
+    parser.add_argument("--extractive-beam-size", type=int, default=4)
     return parser.parse_args()
 
 

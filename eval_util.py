@@ -24,8 +24,8 @@ class EvalConfig:
     generation_max_new_tokens: int
 
     # extractive SQuAD-style QA
-    extractive_max_answer_tokens: int = 16
-    extractive_beam_size: int = 8
+    extractive_max_answer_tokens: int = 8
+    extractive_beam_size: int = 4
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
