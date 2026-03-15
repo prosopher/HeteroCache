@@ -24,15 +24,12 @@ class EvalConfig:
     generation_max_new_tokens: int
 
     # extractive SQuAD-style QA
-    extractive_max_answer_tokens: int = 8
-    extractive_beam_size: int = 4
+    extractive_max_answer_tokens: int = 16
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
         if self.extractive_max_answer_tokens < 1:
             raise ValueError("extractive_max_answer_tokens must be >= 1")
-        if self.extractive_beam_size < 1:
-            raise ValueError("extractive_beam_size must be >= 1")
         initialize_eval_output_paths(self)
 
 
@@ -494,27 +491,10 @@ def prepare_extractive_question_prefix(tokenizer, question: str, device: str) ->
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
-@dataclass
-class ExtractiveSpanTrieNode:
-    children: Dict[int, "ExtractiveSpanTrieNode"]
-    terminal_text: Optional[str] = None
-
-    def __init__(self) -> None:
-        self.children = {}
-        self.terminal_text = None
-
-
-@dataclass
-class ExtractiveBeamState:
-    node: ExtractiveSpanTrieNode
-    past_key_values: PastKeyValues
-    input_ids: torch.Tensor
-    total_logprob: float
-    token_count: int
-
-    @property
-    def normalized_score(self) -> float:
-        return self.total_logprob / max(1, self.token_count)
+@dataclass(frozen=True)
+class ExtractiveSpanCandidate:
+    token_ids: Tuple[int, ...]
+    text: str
 
 
 def _tokenize_context_for_extractive_candidates(tokenizer, context: str) -> Tuple[List[int], Optional[List[Tuple[int, int]]]]:
@@ -550,41 +530,106 @@ def _decode_extractive_span_text(
     return tokenizer.decode(context_token_ids[start_idx:end_idx + 1], skip_special_tokens=True).strip()
 
 
-def build_extractive_span_trie(
+def build_extractive_span_candidates(
     tokenizer,
     context: str,
     max_answer_tokens: int,
-) -> ExtractiveSpanTrieNode:
+) -> List[ExtractiveSpanCandidate]:
     if max_answer_tokens < 1:
         raise ValueError("max_answer_tokens must be >= 1")
 
     context_token_ids, offsets = _tokenize_context_for_extractive_candidates(tokenizer, context)
-    root = ExtractiveSpanTrieNode()
     num_tokens = len(context_token_ids)
+    unique_candidates: Dict[Tuple[int, ...], str] = {}
 
     for start_idx in range(num_tokens):
-        node = root
         max_end_idx = min(num_tokens, start_idx + max_answer_tokens)
         for end_idx in range(start_idx, max_end_idx):
-            token_id = int(context_token_ids[end_idx])
-            child = node.children.get(token_id)
-            if child is None:
-                child = ExtractiveSpanTrieNode()
-                node.children[token_id] = child
-            if child.terminal_text is None:
-                terminal_text = _decode_extractive_span_text(
-                    tokenizer=tokenizer,
-                    context=context,
-                    context_token_ids=context_token_ids,
-                    offsets=offsets,
-                    start_idx=start_idx,
-                    end_idx=end_idx,
-                )
-                if terminal_text:
-                    child.terminal_text = terminal_text
-            node = child
+            token_tuple = tuple(int(token_id) for token_id in context_token_ids[start_idx:end_idx + 1])
+            if token_tuple in unique_candidates:
+                continue
+            candidate_text = _decode_extractive_span_text(
+                tokenizer=tokenizer,
+                context=context,
+                context_token_ids=context_token_ids,
+                offsets=offsets,
+                start_idx=start_idx,
+                end_idx=end_idx,
+            )
+            if candidate_text:
+                unique_candidates[token_tuple] = candidate_text
 
-    return root
+    return [
+        ExtractiveSpanCandidate(token_ids=token_ids, text=text)
+        for token_ids, text in unique_candidates.items()
+    ]
+
+
+def _repeat_past_key_values_for_batch(
+    past_key_values: PastKeyValues,
+    batch_size: int,
+) -> PastKeyValues:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if batch_size == 1:
+        return past_key_values
+
+    repeated = []
+    for key, value in past_key_values:
+        if key.shape[0] != 1 or value.shape[0] != 1:
+            raise ValueError(
+                "Batched extractive scoring expects batch dimension 1 in cached past key values, "
+                f"got {tuple(key.shape)} and {tuple(value.shape)}"
+            )
+        repeated.append(
+            (
+                key.expand(batch_size, *key.shape[1:]).contiguous(),
+                value.expand(batch_size, *value.shape[1:]).contiguous(),
+            )
+        )
+    return tuple(repeated)
+
+
+@torch.inference_mode()
+def score_candidate_logprob_batch(
+    model,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+    candidate_token_ids_batch: torch.Tensor,
+    normalize_by_length: bool = True,
+) -> List[float]:
+    if candidate_token_ids_batch.ndim != 2:
+        raise ValueError(
+            "candidate_token_ids_batch must have shape [batch, seq], "
+            f"got {tuple(candidate_token_ids_batch.shape)}"
+        )
+
+    batch_size, candidate_length = candidate_token_ids_batch.shape
+    if candidate_length < 1:
+        raise ValueError("candidate_token_ids_batch must include at least one answer token")
+
+    device = seed_token.device
+    candidate_ids = candidate_token_ids_batch.to(device)
+    repeated_past = _repeat_past_key_values_for_batch(past_key_values, batch_size)
+    repeated_seed = seed_token.expand(batch_size, -1)
+
+    if candidate_length == 1:
+        scoring_input_ids = repeated_seed
+    else:
+        scoring_input_ids = torch.cat([repeated_seed, candidate_ids[:, :-1]], dim=1)
+
+    outputs = model(
+        input_ids=scoring_input_ids,
+        past_key_values=repeated_past,
+        use_cache=False,
+    )
+    log_probs = F.log_softmax(outputs.logits, dim=-1)
+    token_log_probs = log_probs.gather(-1, candidate_ids.unsqueeze(-1)).squeeze(-1)
+
+    scores = token_log_probs.sum(dim=1)
+    if normalize_by_length:
+        scores = scores / float(candidate_length)
+    return [float(value) for value in scores.tolist()]
 
 
 @torch.inference_mode()
@@ -593,98 +638,57 @@ def predict_extractive_answer(
     tokenizer,
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
-    context: str,
-    max_answer_tokens: int,
-    beam_size: int,
+    context: Optional[str] = None,
+    max_answer_tokens: int = 16,
+    candidate_spans: Optional[List[ExtractiveSpanCandidate]] = None,
+    candidate_batch_size: int = 8,
 ) -> str:
     if max_answer_tokens < 1:
         raise ValueError("max_answer_tokens must be >= 1")
-    if beam_size < 1:
-        raise ValueError("beam_size must be >= 1")
+    if candidate_batch_size < 1:
+        raise ValueError("candidate_batch_size must be >= 1")
 
-    trie_root = build_extractive_span_trie(
-        tokenizer=tokenizer,
-        context=context,
-        max_answer_tokens=max_answer_tokens,
-    )
-    if not trie_root.children:
-        return ""
-
-    root_outputs = model(
-        input_ids=seed_token,
-        past_key_values=past_key_values,
-        use_cache=True,
-    )
-    root_log_probs = F.log_softmax(root_outputs.logits[:, -1, :], dim=-1).squeeze(0)
-    root_next_past = root_outputs.past_key_values
-
-    active_beams: List[ExtractiveBeamState] = []
-    completed_beams: List[ExtractiveBeamState] = []
-    device = seed_token.device
-
-    for token_id, child in trie_root.children.items():
-        active_beams.append(
-            ExtractiveBeamState(
-                node=child,
-                past_key_values=root_next_past,
-                input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
-                total_logprob=float(root_log_probs[token_id].item()),
-                token_count=1,
-            )
+    if candidate_spans is None:
+        if context is None:
+            raise ValueError("Either context or candidate_spans must be provided for extractive scoring")
+        candidate_spans = build_extractive_span_candidates(
+            tokenizer=tokenizer,
+            context=context,
+            max_answer_tokens=max_answer_tokens,
         )
 
-    active_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
-    active_beams = active_beams[:beam_size]
+    if not candidate_spans:
+        return ""
 
-    for _ in range(max_answer_tokens):
-        if not active_beams:
-            break
+    best_text = ""
+    best_score = float("-inf")
 
-        next_beams: List[ExtractiveBeamState] = []
-        for beam in active_beams:
-            if beam.node.terminal_text is not None:
-                completed_beams.append(beam)
+    candidates_by_length: Dict[int, List[ExtractiveSpanCandidate]] = {}
+    for candidate in candidate_spans:
+        candidates_by_length.setdefault(len(candidate.token_ids), []).append(candidate)
 
-            if beam.token_count >= max_answer_tokens or not beam.node.children:
-                continue
-
-            outputs = model(
-                input_ids=beam.input_ids,
-                past_key_values=beam.past_key_values,
-                use_cache=True,
+    for candidate_length in sorted(candidates_by_length):
+        candidates = candidates_by_length[candidate_length]
+        for start_idx in range(0, len(candidates), candidate_batch_size):
+            batch = candidates[start_idx:start_idx + candidate_batch_size]
+            candidate_token_ids_batch = torch.tensor(
+                [list(candidate.token_ids) for candidate in batch],
+                dtype=torch.long,
+                device=seed_token.device,
             )
-            log_probs = F.log_softmax(outputs.logits[:, -1, :], dim=-1).squeeze(0)
-            next_past = outputs.past_key_values
+            batch_scores = score_candidate_logprob_batch(
+                model=model,
+                past_key_values=past_key_values,
+                seed_token=seed_token,
+                candidate_token_ids_batch=candidate_token_ids_batch,
+                normalize_by_length=True,
+            )
+            for candidate, score in zip(batch, batch_scores):
+                if score > best_score:
+                    best_score = score
+                    best_text = candidate.text
 
-            child_candidates = []
-            for token_id, child in beam.node.children.items():
-                child_candidates.append((float(log_probs[token_id].item()), token_id, child))
-            child_candidates.sort(key=lambda item: item[0], reverse=True)
-            child_candidates = child_candidates[:beam_size]
-
-            for token_logprob, token_id, child in child_candidates:
-                next_beams.append(
-                    ExtractiveBeamState(
-                        node=child,
-                        past_key_values=next_past,
-                        input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
-                        total_logprob=beam.total_logprob + token_logprob,
-                        token_count=beam.token_count + 1,
-                    )
-                )
-
-        next_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
-        active_beams = next_beams[:beam_size]
-
-    if completed_beams:
-        best_beam = max(completed_beams, key=lambda beam: beam.normalized_score)
-        return best_beam.node.terminal_text or ""
-
-    if active_beams:
-        best_beam = max(active_beams, key=lambda beam: beam.normalized_score)
-        return best_beam.node.terminal_text or ""
-
-    return ""
+    return best_text
 
 
 def format_generation_prompt(context: str, question: str) -> str:

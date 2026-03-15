@@ -109,7 +109,6 @@ class LayerPositionConfig:
     benchmark_mode: str = "squad_f1"
     generation_max_new_tokens: int = 32
     extractive_max_answer_tokens: int = 16
-    extractive_beam_size: int = 8
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -127,8 +126,6 @@ class LayerPositionConfig:
             raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1'}")
         if self.extractive_max_answer_tokens < 1:
             raise ValueError("extractive_max_answer_tokens must be >= 1")
-        if self.extractive_beam_size < 1:
-            raise ValueError("extractive_beam_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
@@ -1082,6 +1079,11 @@ def evaluate_generation_dataset(
             )
             question_cache_ids = question_prefix["cache_ids"]
             seed_token = question_prefix["seed_token"]
+            candidate_spans = build_extractive_span_candidates(
+                tokenizer=tokenizer,
+                context=context_text,
+                max_answer_tokens=config.extractive_max_answer_tokens,
+            )
 
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
@@ -1132,18 +1134,16 @@ def evaluate_generation_dataset(
                     tokenizer=tokenizer,
                     past_key_values=translated_answer_past,
                     seed_token=seed_token,
-                    context=context_text,
+                    candidate_spans=candidate_spans,
                     max_answer_tokens=config.extractive_max_answer_tokens,
-                    beam_size=config.extractive_beam_size,
                 )
                 native_answer = predict_extractive_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=native_answer_past,
                     seed_token=seed_token,
-                    context=context_text,
+                    candidate_spans=candidate_spans,
                     max_answer_tokens=config.extractive_max_answer_tokens,
-                    beam_size=config.extractive_beam_size,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -1842,8 +1842,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=32)
-    parser.add_argument("--extractive-max-answer-tokens", type=int, default=8)
-    parser.add_argument("--extractive-beam-size", type=int, default=4)
+    parser.add_argument("--extractive-max-answer-tokens", type=int, default=16)
     return parser.parse_args()
 
 
@@ -1888,7 +1887,6 @@ def main() -> None:
         benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
         extractive_max_answer_tokens=args.extractive_max_answer_tokens,
-        extractive_beam_size=args.extractive_beam_size,
     )
 
     if config.position_layer_idx is None:
