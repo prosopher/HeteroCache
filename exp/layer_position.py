@@ -41,7 +41,7 @@ LOGIT_QA_DATASET_SPECS = [
 MULTINEWS_DATASET_SPECS = [
     HFDatasetSpec(
         name_for_log="MultiNews/validation",
-        dataset_path="multi_news",
+        dataset_path="alexfabbri/multi_news",
         dataset_name=None,
         split="validation",
         answer_mode="multinews",
