@@ -108,7 +108,6 @@ class LayerPositionConfig:
     eval_shuffle_stream: bool = False
     benchmark_mode: str = "squad_f1"
     generation_max_new_tokens: int = 32
-    squad_max_answer_tokens: int = 30
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -272,22 +271,11 @@ class F1Meter:
     def __init__(self) -> None:
         self.f1_sum = 0.0
         self.native_f1_sum = 0.0
-        self.exact_match_sum = 0.0
-        self.native_exact_match_sum = 0.0
         self.count = 0
 
-    def update(
-        self,
-        f1_value: float,
-        native_f1_value: float,
-        exact_match_value: float = 0.0,
-        native_exact_match_value: float = 0.0,
-        n: int = 1,
-    ) -> None:
+    def update(self, f1_value: float, native_f1_value: float, n: int = 1) -> None:
         self.f1_sum += float(f1_value) * n
         self.native_f1_sum += float(native_f1_value) * n
-        self.exact_match_sum += float(exact_match_value) * n
-        self.native_exact_match_sum += float(native_exact_match_value) * n
         self.count += n
 
     def summary(self) -> Dict[str, float]:
@@ -295,15 +283,11 @@ class F1Meter:
             return {
                 "f1": float("nan"),
                 "native_f1": float("nan"),
-                "exact_match": float("nan"),
-                "native_exact_match": float("nan"),
                 "count": 0,
             }
         return {
             "f1": self.f1_sum / self.count,
             "native_f1": self.native_f1_sum / self.count,
-            "exact_match": self.exact_match_sum / self.count,
-            "native_exact_match": self.native_exact_match_sum / self.count,
             "count": self.count,
         }
 
@@ -1078,20 +1062,26 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            squad_inputs = prepare_squad_extractive_inputs(
+            context_prefix = prepare_generation_context_inputs(
                 tokenizer=tokenizer,
                 context=context_text,
+                device=config.device,
+            )
+            cache_input_ids = context_prefix["input_ids"]
+
+            question_prefix = prepare_generation_question_prefix(
+                tokenizer=tokenizer,
                 question=question,
                 device=config.device,
             )
-            cache_input_ids = squad_inputs["context_prefill"]["input_ids"]
+            question_cache_ids = question_prefix["cache_ids"]
+            seed_token = question_prefix["seed_token"]
 
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
                 for node in nodes
             }
             native_capture_by_target: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
-            native_prediction_by_target: Dict[str, Dict[str, Any]] = {}
 
             for direction in active_directions:
                 edge = edge_map[direction]
@@ -1120,38 +1110,37 @@ def evaluate_generation_dataset(
                     )
                     native_capture_by_target[native_capture_key] = native_capture
 
-                translated_prediction = predict_squad_extractive_answer(
+                translated_generation_past = append_input_ids_to_past(
                     model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
-                    question_input_ids=squad_inputs["question_prefill"]["input_ids"],
-                    scoring_context_input_ids=squad_inputs["scoring_context"]["input_ids"],
-                    scoring_context_offset_mapping=squad_inputs["scoring_context"]["offset_mapping"],
-                    context_text=squad_inputs["context_text"],
-                    max_answer_tokens=config.squad_max_answer_tokens,
+                    input_ids=question_cache_ids,
+                )
+                native_generation_past = append_input_ids_to_past(
+                    model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    input_ids=question_cache_ids,
                 )
 
-                native_prediction = native_prediction_by_target.get(edge.dst_id)
-                if native_prediction is None:
-                    native_prediction = predict_squad_extractive_answer(
-                        model=models[edge.dst_id],
-                        past_key_values=past_by_node_id[edge.dst_id],
-                        question_input_ids=squad_inputs["question_prefill"]["input_ids"],
-                        scoring_context_input_ids=squad_inputs["scoring_context"]["input_ids"],
-                        scoring_context_offset_mapping=squad_inputs["scoring_context"]["offset_mapping"],
-                        context_text=squad_inputs["context_text"],
-                        max_answer_tokens=config.squad_max_answer_tokens,
-                    )
-                    native_prediction_by_target[edge.dst_id] = native_prediction
+                translated_answer = generate_greedy_answer(
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=translated_generation_past,
+                    seed_token=seed_token,
+                    max_new_tokens=config.generation_max_new_tokens,
+                )
+                native_answer = generate_greedy_answer(
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=native_generation_past,
+                    seed_token=seed_token,
+                    max_new_tokens=config.generation_max_new_tokens,
+                )
 
-                exact_match = compute_generation_exact_match(translated_prediction["text"], gold_answers)
-                f1 = compute_generation_f1(translated_prediction["text"], gold_answers)
-                native_exact_match = compute_generation_exact_match(native_prediction["text"], gold_answers)
-                native_f1 = compute_generation_f1(native_prediction["text"], gold_answers)
+                f1 = compute_generation_f1(translated_answer, gold_answers)
+                native_f1 = compute_generation_f1(native_answer, gold_answers)
                 path_metrics[direction].update(
                     f1_value=f1,
                     native_f1_value=native_f1,
-                    exact_match_value=exact_match,
-                    native_exact_match_value=native_exact_match,
                     n=1,
                 )
                 path_drift[direction].update(
@@ -1178,7 +1167,7 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logger.info(
-                "[%s] extractive progress: %d/%d examples",
+                "[%s] progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
                 config.eval_max_examples_per_dataset,
@@ -1189,8 +1178,6 @@ def evaluate_generation_dataset(
     return (
         {
             direction: {
-                "exact_match": row["exact_match"],
-                "native_exact_match": row["native_exact_match"],
                 "f1": row["f1"],
                 "native_f1": row["native_f1"],
                 "count": row["count"],
@@ -1199,6 +1186,7 @@ def evaluate_generation_dataset(
         },
         {direction: row for direction, row in summarized_drift.items()},
     )
+
 
 def compute_average_metric(
     logit_results: Dict[str, Dict[str, Dict[str, float]]],
@@ -1844,7 +1832,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=32)
-    parser.add_argument("--squad-max-answer-tokens", type=int, default=30)
     return parser.parse_args()
 
 
@@ -1888,7 +1875,6 @@ def main() -> None:
         eval_shuffle_stream=args.eval_shuffle_stream,
         benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
-        squad_max_answer_tokens=args.squad_max_answer_tokens,
     )
 
     if config.position_layer_idx is None:

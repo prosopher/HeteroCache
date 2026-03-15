@@ -20,9 +20,8 @@ class EvalConfig:
     shuffle_eval_stream: bool
     shuffle_buffer: int
 
-    # generation QA (kept for non-SQuAD free-form eval paths)
+    # generation QA
     generation_max_new_tokens: int
-    squad_max_answer_tokens: int
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -373,7 +372,6 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             return None
 
         answer_texts: List[str] = []
-        answer_starts: List[int] = []
         if isinstance(answers, dict):
             raw_texts = answers.get("text", [])
             if isinstance(raw_texts, list):
@@ -381,13 +379,6 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
                     item.strip()
                     for item in raw_texts
                     if isinstance(item, str) and item.strip()
-                ]
-            raw_starts = answers.get("answer_start", [])
-            if isinstance(raw_starts, list):
-                answer_starts = [
-                    int(item)
-                    for item in raw_starts
-                    if isinstance(item, int) and item >= 0
                 ]
         elif isinstance(answers, list):
             answer_texts = [
@@ -399,14 +390,11 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
         if not answer_texts:
             return None
 
-        result = {
+        return {
             "question": question.strip(),
             "context": context.strip(),
             "answers": answer_texts,
         }
-        if answer_starts:
-            result["answer_starts"] = answer_starts
-        return result
 
     raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
@@ -550,202 +538,9 @@ def prepare_generation_context_inputs(tokenizer, context: str, device: str) -> D
     return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
 
 
-
 def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
     prefix_text = format_generation_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
-
-
-def format_squad_context_prefill_prefix(context: str) -> str:
-    return f"Passage: {context.strip()}\n"
-
-
-def format_squad_question_prefix(question: str) -> str:
-    return (
-        f"Question: {question.strip()}\n"
-        "Select the shortest exact answer span from the passage below.\n"
-        "Passage: "
-    )
-
-
-def prepare_text_inputs_with_offsets(tokenizer, text: str, device: str) -> Dict[str, Any]:
-    tokenized = tokenizer(
-        text,
-        return_tensors="pt",
-        add_special_tokens=False,
-        return_offsets_mapping=True,
-    )
-    offset_mapping = tokenized.get("offset_mapping")
-    if offset_mapping is None:
-        raise ValueError("Tokenizer must provide offset mappings for extractive SQuAD evaluation.")
-    input_ids = tokenized["input_ids"].to(device)
-    if input_ids.shape[1] < 1:
-        raise ValueError("Text must tokenize to at least 1 token.")
-    return {
-        "text": text,
-        "input_ids": input_ids,
-        "offset_mapping": [tuple(item) for item in offset_mapping[0].tolist()],
-    }
-
-
-def prepare_squad_extractive_inputs(tokenizer, context: str, question: str, device: str) -> Dict[str, Any]:
-    normalized_context = context.strip()
-    return {
-        "context_text": normalized_context,
-        "context_prefill": prepare_full_text_inputs(
-            tokenizer=tokenizer,
-            text=format_squad_context_prefill_prefix(normalized_context),
-            device=device,
-        ),
-        "question_prefill": prepare_full_text_inputs(
-            tokenizer=tokenizer,
-            text=format_squad_question_prefix(question),
-            device=device,
-        ),
-        "scoring_context": prepare_text_inputs_with_offsets(
-            tokenizer=tokenizer,
-            text=normalized_context,
-            device=device,
-        ),
-    }
-
-
-@torch.inference_mode()
-def append_input_ids_to_past_with_hidden_states(
-    model,
-    past_key_values: PastKeyValues,
-    input_ids: torch.Tensor,
-) -> Dict[str, Any]:
-    if input_ids.shape[1] == 0:
-        raise ValueError("input_ids must contain at least one token.")
-
-    outputs = model(
-        input_ids=input_ids,
-        past_key_values=past_key_values,
-        use_cache=True,
-        output_hidden_states=True,
-    )
-    return {
-        "past_key_values": outputs.past_key_values,
-        "hidden_states": outputs.hidden_states[-1],
-    }
-
-
-def _is_valid_context_token(offset_mapping: List[Tuple[int, int]], context_text: str, token_idx: int) -> bool:
-    start_char, end_char = offset_mapping[token_idx]
-    if end_char <= start_char:
-        return False
-    return bool(context_text[start_char:end_char].strip())
-
-
-def select_best_span_from_hidden_states(
-    question_hidden_states: torch.Tensor,
-    context_hidden_states: torch.Tensor,
-    context_text: str,
-    offset_mapping: List[Tuple[int, int]],
-    max_answer_tokens: int,
-) -> Dict[str, Any]:
-    if question_hidden_states.ndim != 3 or context_hidden_states.ndim != 3:
-        raise ValueError("question_hidden_states and context_hidden_states must have shape [batch, seq, hidden].")
-    if question_hidden_states.shape[0] != 1 or context_hidden_states.shape[0] != 1:
-        raise ValueError("This extractive scorer expects batch size 1.")
-    if max_answer_tokens < 1:
-        raise ValueError("max_answer_tokens must be >= 1.")
-
-    question_hidden = question_hidden_states[0].float()
-    context_hidden = context_hidden_states[0].float()
-    if context_hidden.shape[0] != len(offset_mapping):
-        raise ValueError(
-            f"context_hidden length {context_hidden.shape[0]} must match offset_mapping length {len(offset_mapping)}"
-        )
-
-    query_window = min(8, question_hidden.shape[0])
-    start_query = F.normalize(question_hidden[-1], dim=0)
-    end_query = F.normalize(question_hidden[-query_window:].mean(dim=0), dim=0)
-    normalized_context = F.normalize(context_hidden, dim=-1)
-
-    start_scores = normalized_context @ start_query
-    end_scores = normalized_context @ end_query
-
-    best_score = float("-inf")
-    best_span = None
-    best_char_span = (0, 0)
-
-    valid_token_indices = [
-        idx
-        for idx in range(len(offset_mapping))
-        if _is_valid_context_token(offset_mapping, context_text, idx)
-    ]
-    if not valid_token_indices:
-        return {
-            "text": "",
-            "start_token_idx": -1,
-            "end_token_idx": -1,
-            "char_start": 0,
-            "char_end": 0,
-            "score": float("-inf"),
-        }
-
-    valid_token_index_set = set(valid_token_indices)
-    for start_idx in valid_token_indices:
-        max_end_idx = min(len(offset_mapping) - 1, start_idx + max_answer_tokens - 1)
-        for end_idx in range(start_idx, max_end_idx + 1):
-            if end_idx not in valid_token_index_set:
-                continue
-            score = float((start_scores[start_idx] + end_scores[end_idx]).item())
-            if best_span is None or score > best_score:
-                best_score = score
-                best_span = (start_idx, end_idx)
-                best_char_span = (offset_mapping[start_idx][0], offset_mapping[end_idx][1])
-
-    if best_span is None:
-        return {
-            "text": "",
-            "start_token_idx": -1,
-            "end_token_idx": -1,
-            "char_start": 0,
-            "char_end": 0,
-            "score": float("-inf"),
-        }
-
-    char_start, char_end = best_char_span
-    return {
-        "text": context_text[char_start:char_end].strip(),
-        "start_token_idx": int(best_span[0]),
-        "end_token_idx": int(best_span[1]),
-        "char_start": int(char_start),
-        "char_end": int(char_end),
-        "score": best_score,
-    }
-
-
-@torch.inference_mode()
-def predict_squad_extractive_answer(
-    model,
-    past_key_values: PastKeyValues,
-    question_input_ids: torch.Tensor,
-    scoring_context_input_ids: torch.Tensor,
-    scoring_context_offset_mapping: List[Tuple[int, int]],
-    context_text: str,
-    max_answer_tokens: int,
-) -> Dict[str, Any]:
-    question_outputs = append_input_ids_to_past_with_hidden_states(
-        model=model,
-        past_key_values=past_key_values,
-        input_ids=question_input_ids,
-    )
-    scoring_context_outputs = append_input_ids_to_past_with_hidden_states(
-        model=model,
-        past_key_values=question_outputs["past_key_values"],
-        input_ids=scoring_context_input_ids,
-    )
-    return select_best_span_from_hidden_states(
-        question_hidden_states=question_outputs["hidden_states"],
-        context_hidden_states=scoring_context_outputs["hidden_states"],
-        context_text=context_text,
-        offset_mapping=scoring_context_offset_mapping,
-        max_answer_tokens=max_answer_tokens,
-    )
 
 
 @torch.inference_mode()
