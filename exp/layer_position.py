@@ -108,6 +108,8 @@ class LayerPositionConfig:
     eval_shuffle_stream: bool = False
     benchmark_mode: str = "squad_f1"
     generation_max_new_tokens: int = 32
+    extractive_max_answer_tokens: int = 16
+    extractive_beam_size: int = 8
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -123,6 +125,10 @@ class LayerPositionConfig:
             raise ValueError("injection_window_size must be >= 1")
         if self.benchmark_mode not in {"qa_accuracy", "squad_f1"}:
             raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1'}")
+        if self.extractive_max_answer_tokens < 1:
+            raise ValueError("extractive_max_answer_tokens must be >= 1")
+        if self.extractive_beam_size < 1:
+            raise ValueError("extractive_beam_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
@@ -1062,14 +1068,14 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            context_prefix = prepare_generation_context_inputs(
+            context_prefix = prepare_extractive_context_inputs(
                 tokenizer=tokenizer,
                 context=context_text,
                 device=config.device,
             )
             cache_input_ids = context_prefix["input_ids"]
 
-            question_prefix = prepare_generation_question_prefix(
+            question_prefix = prepare_extractive_question_prefix(
                 tokenizer=tokenizer,
                 question=question,
                 device=config.device,
@@ -1110,30 +1116,34 @@ def evaluate_generation_dataset(
                     )
                     native_capture_by_target[native_capture_key] = native_capture
 
-                translated_generation_past = append_input_ids_to_past(
+                translated_answer_past = append_input_ids_to_past(
                     model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     input_ids=question_cache_ids,
                 )
-                native_generation_past = append_input_ids_to_past(
+                native_answer_past = append_input_ids_to_past(
                     model=models[edge.dst_id],
                     past_key_values=past_by_node_id[edge.dst_id],
                     input_ids=question_cache_ids,
                 )
 
-                translated_answer = generate_greedy_answer(
+                translated_answer = predict_extractive_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
-                    past_key_values=translated_generation_past,
+                    past_key_values=translated_answer_past,
                     seed_token=seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
+                    context=context_text,
+                    max_answer_tokens=config.extractive_max_answer_tokens,
+                    beam_size=config.extractive_beam_size,
                 )
-                native_answer = generate_greedy_answer(
+                native_answer = predict_extractive_answer(
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
-                    past_key_values=native_generation_past,
+                    past_key_values=native_answer_past,
                     seed_token=seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
+                    context=context_text,
+                    max_answer_tokens=config.extractive_max_answer_tokens,
+                    beam_size=config.extractive_beam_size,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -1167,7 +1177,7 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logger.info(
-                "[%s] progress: %d/%d examples",
+                "[%s] extractive progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
                 config.eval_max_examples_per_dataset,
@@ -1832,6 +1842,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
     parser.add_argument("--generation-max-new-tokens", type=int, default=32)
+    parser.add_argument("--extractive-max-answer-tokens", type=int, default=16)
+    parser.add_argument("--extractive-beam-size", type=int, default=8)
     return parser.parse_args()
 
 
@@ -1875,6 +1887,8 @@ def main() -> None:
         eval_shuffle_stream=args.eval_shuffle_stream,
         benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
+        extractive_max_answer_tokens=args.extractive_max_answer_tokens,
+        extractive_beam_size=args.extractive_beam_size,
     )
 
     if config.position_layer_idx is None:

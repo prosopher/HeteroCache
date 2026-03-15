@@ -151,17 +151,15 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            question_cache_ids = None
-
             if spec.answer_mode == "squad":
-                context_prefix = prepare_generation_context_inputs(
+                context_prefix = prepare_extractive_context_inputs(
                     tokenizer=tokenizer,
                     context=context_text,
                     device=device,
                 )
                 cache_input_ids = context_prefix["input_ids"]
 
-                question_prefix = prepare_generation_question_prefix(
+                question_prefix = prepare_extractive_question_prefix(
                     tokenizer=tokenizer,
                     question=question,
                     device=device,
@@ -176,6 +174,7 @@ def evaluate_generation_dataset(
                     device=device,
                 )
                 cache_input_ids = prefix["cache_ids"]
+                question_cache_ids = None
                 seed_token = prefix["seed_token"]
 
             past_by_node_id = {
@@ -204,34 +203,53 @@ def evaluate_generation_dataset(
                 )
 
                 if spec.answer_mode == "squad":
-                    translated_generation_past = append_input_ids_to_past(
+                    translated_answer_past = append_input_ids_to_past(
                         model=models[edge.dst_id],
                         past_key_values=mixed_target_past,
                         input_ids=question_cache_ids,
                     )
-                    native_generation_past = append_input_ids_to_past(
+                    native_answer_past = append_input_ids_to_past(
                         model=models[edge.dst_id],
                         past_key_values=past_by_node_id[edge.dst_id],
                         input_ids=question_cache_ids,
+                    )
+
+                    translated_answer = predict_extractive_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=translated_answer_past,
+                        seed_token=seed_token,
+                        context=context_text,
+                        max_answer_tokens=eval_config.extractive_max_answer_tokens,
+                        beam_size=eval_config.extractive_beam_size,
+                    )
+                    native_answer = predict_extractive_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=native_answer_past,
+                        seed_token=seed_token,
+                        context=context_text,
+                        max_answer_tokens=eval_config.extractive_max_answer_tokens,
+                        beam_size=eval_config.extractive_beam_size,
                     )
                 else:
                     translated_generation_past = mixed_target_past
                     native_generation_past = past_by_node_id[edge.dst_id]
 
-                translated_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=translated_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=eval_config.generation_max_new_tokens,
-                )
-                native_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=native_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=eval_config.generation_max_new_tokens,
-                )
+                    translated_answer = generate_greedy_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=translated_generation_past,
+                        seed_token=seed_token,
+                        max_new_tokens=eval_config.generation_max_new_tokens,
+                    )
+                    native_answer = generate_greedy_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=native_generation_past,
+                        seed_token=seed_token,
+                        max_new_tokens=eval_config.generation_max_new_tokens,
+                    )
 
                 exact_match = compute_generation_exact_match(translated_answer, gold_answers)
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -251,7 +269,7 @@ def evaluate_generation_dataset(
 
         if batch_idx % 25 == 0:
             logger.info(
-                "[%s] generation progress: %d/%d examples",
+                "[%s] extractive progress: %d/%d examples",
                 spec.name_for_log,
                 processed_examples,
                 eval_config.max_examples_per_dataset,

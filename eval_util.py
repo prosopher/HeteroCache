@@ -23,8 +23,16 @@ class EvalConfig:
     # generation QA
     generation_max_new_tokens: int
 
+    # extractive SQuAD-style QA
+    extractive_max_answer_tokens: int = 16
+    extractive_beam_size: int = 8
+
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
+        if self.extractive_max_answer_tokens < 1:
+            raise ValueError("extractive_max_answer_tokens must be >= 1")
+        if self.extractive_beam_size < 1:
+            raise ValueError("extractive_beam_size must be >= 1")
         initialize_eval_output_paths(self)
 
 
@@ -458,6 +466,225 @@ def format_question_prefix(
         prompt_lines.append(f"{label}. {choice.strip()}")
     prompt_lines.append("Answer:")
     return "\n".join(prompt_lines)
+
+
+
+
+def format_extractive_context_prefix(context: str) -> str:
+    return (
+        "Read the passage and answer the question by extracting a contiguous span from the passage.\n\n"
+        f"Passage: {context.strip()}\n"
+    )
+
+
+def format_extractive_question_prefix(question: str) -> str:
+    return (
+        f"Question: {question.strip()}\n"
+        "Extracted answer:"
+    )
+
+
+def prepare_extractive_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_extractive_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_extractive_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_extractive_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
+@dataclass
+class ExtractiveSpanTrieNode:
+    children: Dict[int, "ExtractiveSpanTrieNode"]
+    terminal_text: Optional[str] = None
+
+    def __init__(self) -> None:
+        self.children = {}
+        self.terminal_text = None
+
+
+@dataclass
+class ExtractiveBeamState:
+    node: ExtractiveSpanTrieNode
+    past_key_values: PastKeyValues
+    input_ids: torch.Tensor
+    total_logprob: float
+    token_count: int
+
+    @property
+    def normalized_score(self) -> float:
+        return self.total_logprob / max(1, self.token_count)
+
+
+def _tokenize_context_for_extractive_candidates(tokenizer, context: str) -> Tuple[List[int], Optional[List[Tuple[int, int]]]]:
+    try:
+        encoded = tokenizer(context, add_special_tokens=False, return_offsets_mapping=True)
+        token_ids = list(encoded.get("input_ids", []))
+        offsets = encoded.get("offset_mapping", None)
+        if offsets is not None:
+            offsets = [tuple(pair) for pair in offsets]
+        if token_ids:
+            return token_ids, offsets
+    except Exception:
+        pass
+
+    token_ids = tokenizer(context, add_special_tokens=False).input_ids
+    return list(token_ids), None
+
+
+def _decode_extractive_span_text(
+    tokenizer,
+    context: str,
+    context_token_ids: List[int],
+    offsets: Optional[List[Tuple[int, int]]],
+    start_idx: int,
+    end_idx: int,
+) -> str:
+    if offsets is not None and 0 <= start_idx <= end_idx < len(offsets):
+        start_char = int(offsets[start_idx][0])
+        end_char = int(offsets[end_idx][1])
+        text = context[start_char:end_char].strip()
+        if text:
+            return text
+    return tokenizer.decode(context_token_ids[start_idx:end_idx + 1], skip_special_tokens=True).strip()
+
+
+def build_extractive_span_trie(
+    tokenizer,
+    context: str,
+    max_answer_tokens: int,
+) -> ExtractiveSpanTrieNode:
+    if max_answer_tokens < 1:
+        raise ValueError("max_answer_tokens must be >= 1")
+
+    context_token_ids, offsets = _tokenize_context_for_extractive_candidates(tokenizer, context)
+    root = ExtractiveSpanTrieNode()
+    num_tokens = len(context_token_ids)
+
+    for start_idx in range(num_tokens):
+        node = root
+        max_end_idx = min(num_tokens, start_idx + max_answer_tokens)
+        for end_idx in range(start_idx, max_end_idx):
+            token_id = int(context_token_ids[end_idx])
+            child = node.children.get(token_id)
+            if child is None:
+                child = ExtractiveSpanTrieNode()
+                node.children[token_id] = child
+            if child.terminal_text is None:
+                terminal_text = _decode_extractive_span_text(
+                    tokenizer=tokenizer,
+                    context=context,
+                    context_token_ids=context_token_ids,
+                    offsets=offsets,
+                    start_idx=start_idx,
+                    end_idx=end_idx,
+                )
+                if terminal_text:
+                    child.terminal_text = terminal_text
+            node = child
+
+    return root
+
+
+@torch.inference_mode()
+def predict_extractive_answer(
+    model,
+    tokenizer,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+    context: str,
+    max_answer_tokens: int,
+    beam_size: int,
+) -> str:
+    if max_answer_tokens < 1:
+        raise ValueError("max_answer_tokens must be >= 1")
+    if beam_size < 1:
+        raise ValueError("beam_size must be >= 1")
+
+    trie_root = build_extractive_span_trie(
+        tokenizer=tokenizer,
+        context=context,
+        max_answer_tokens=max_answer_tokens,
+    )
+    if not trie_root.children:
+        return ""
+
+    root_outputs = model(
+        input_ids=seed_token,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+    root_log_probs = F.log_softmax(root_outputs.logits[:, -1, :], dim=-1).squeeze(0)
+    root_next_past = root_outputs.past_key_values
+
+    active_beams: List[ExtractiveBeamState] = []
+    completed_beams: List[ExtractiveBeamState] = []
+    device = seed_token.device
+
+    for token_id, child in trie_root.children.items():
+        active_beams.append(
+            ExtractiveBeamState(
+                node=child,
+                past_key_values=root_next_past,
+                input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
+                total_logprob=float(root_log_probs[token_id].item()),
+                token_count=1,
+            )
+        )
+
+    active_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
+    active_beams = active_beams[:beam_size]
+
+    for _ in range(max_answer_tokens):
+        if not active_beams:
+            break
+
+        next_beams: List[ExtractiveBeamState] = []
+        for beam in active_beams:
+            if beam.node.terminal_text is not None:
+                completed_beams.append(beam)
+
+            if beam.token_count >= max_answer_tokens or not beam.node.children:
+                continue
+
+            outputs = model(
+                input_ids=beam.input_ids,
+                past_key_values=beam.past_key_values,
+                use_cache=True,
+            )
+            log_probs = F.log_softmax(outputs.logits[:, -1, :], dim=-1).squeeze(0)
+            next_past = outputs.past_key_values
+
+            child_candidates = []
+            for token_id, child in beam.node.children.items():
+                child_candidates.append((float(log_probs[token_id].item()), token_id, child))
+            child_candidates.sort(key=lambda item: item[0], reverse=True)
+            child_candidates = child_candidates[:beam_size]
+
+            for token_logprob, token_id, child in child_candidates:
+                next_beams.append(
+                    ExtractiveBeamState(
+                        node=child,
+                        past_key_values=next_past,
+                        input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
+                        total_logprob=beam.total_logprob + token_logprob,
+                        token_count=beam.token_count + 1,
+                    )
+                )
+
+        next_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
+        active_beams = next_beams[:beam_size]
+
+    if completed_beams:
+        best_beam = max(completed_beams, key=lambda beam: beam.normalized_score)
+        return best_beam.node.terminal_text or ""
+
+    if active_beams:
+        best_beam = max(active_beams, key=lambda beam: beam.normalized_score)
+        return best_beam.node.terminal_text or ""
+
+    return ""
 
 
 def format_generation_prompt(context: str, question: str) -> str:
