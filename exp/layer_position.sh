@@ -59,12 +59,6 @@ for ratio in "${POSITION_RATIOS[@]}"; do
     "${COMMON_ARGS[@]}"
 done
 
-CHART_PATH=$(python exp/layer_position.py \
-  --plot-study-summary \
-  --output-root "${OUTPUT_ROOT}" \
-  --study-id "${STUDY_ID}" \
-  --num-upper-layers "${NUM_UPPER_LAYERS}" \
-  "${COMMON_ARGS[@]}")
 
 SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}/${UPPER_DIR}"
 SUMMARY_PATH="${SUMMARY_ROOT}/summary.csv"
@@ -74,7 +68,7 @@ DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/layer_position_drift_l2.png"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
-echo "[LayerPosition] chart_png=${CHART_PATH}"
+echo "[LayerPosition] chart_png=${SUMMARY_ROOT}/layer_position_metric.png"
 echo "[LayerPosition] drift_summary_csv=${DRIFT_SUMMARY_PATH}"
 echo "[LayerPosition] drift_cosine_chart_png=${DRIFT_COSINE_CHART_PATH}"
 echo "[LayerPosition] drift_l2_chart_png=${DRIFT_L2_CHART_PATH}"

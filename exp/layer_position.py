@@ -1905,13 +1905,14 @@ def save_run_artifacts(
     run_dir: Path,
     layer_mappings: Dict[str, LayerMapping],
     metrics: Dict[str, Any],
-) -> Tuple[Path, Path]:
+) -> Tuple[Path, Path, Path]:
     write_json(str(build_config_path(run_dir)), asdict(config))
     write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
     write_json(str(build_metrics_path(run_dir)), metrics)
     build_summary_markdown_path(run_dir).write_text(build_summary_markdown(metrics), encoding="utf-8")
     summary_path = update_study_summary(config, run_dir, metrics)
-    return summary_path, build_metrics_path(run_dir)
+    chart_path = plot_study_summary(run_dir.parent)
+    return summary_path, build_metrics_path(run_dir), chart_path
 
 
 
@@ -1925,7 +1926,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-ratio", type=float, default=None)
     parser.add_argument("--num-upper-layers", type=int, default=0, help="How many immediately higher layers to translate together with the anchor layer selected by --position-ratio.")
     parser.add_argument("--print-target-num-layers", action="store_true")
-    parser.add_argument("--plot-study-summary", action="store_true")
 
     parser.add_argument("--output-root", default="outputs/layer_position")
     parser.add_argument("--study-id", default=None)
@@ -1968,26 +1968,6 @@ def main() -> None:
         print(resolve_target_num_layers(args.model_ids, args.model_directions, args.reference_direction))
         return
 
-    study_id = args.study_id or f"run_{sanitize_slug(args.model_directions)}"
-    study_dir = build_study_dir(
-        LayerPositionConfig(
-            model_ids=args.model_ids,
-            model_directions=args.model_directions,
-            reference_direction=args.reference_direction,
-            position_ratio=0.0,
-            num_upper_layers=args.num_upper_layers,
-            output_root=args.output_root,
-            study_id=args.study_id,
-            device=args.device,
-            dtype=args.dtype,
-            benchmark_mode=args.benchmark_mode,
-        )
-    )
-    if args.plot_study_summary:
-        chart_path = plot_study_summary(study_dir)
-        print(chart_path)
-        return
-
     config = LayerPositionConfig(
         model_ids=args.model_ids,
         model_directions=args.model_directions,
@@ -2023,7 +2003,7 @@ def main() -> None:
     )
 
     if config.position_ratio is None:
-        raise SystemExit("--position-ratio is required unless --print-target-num-layers or --plot-study-summary is used.")
+        raise SystemExit("--position-ratio is required unless --print-target-num-layers is used.")
 
     set_seed(config.seed)
     run_dir = build_run_output_dir(config)
@@ -2057,7 +2037,7 @@ def main() -> None:
         edges=edges,
         active_directions=active_directions,
     )
-    summary_path, metrics_path = save_run_artifacts(config, run_dir, layer_mappings, metrics)
+    summary_path, metrics_path, chart_path = save_run_artifacts(config, run_dir, layer_mappings, metrics)
 
     drift_metrics = run_drift_eval(
         config=config,
@@ -2081,6 +2061,7 @@ def main() -> None:
     print(f"Run directory: {run_dir}")
     print(f"Metrics: {metrics_path}")
     print(f"Study summary CSV: {summary_path}")
+    print(f"Study chart: {chart_path}")
     print(f"Drift metrics: {build_drift_metrics_path(run_dir)}")
     print(f"Drift summary CSV: {drift_summary_csv_path}")
     print(f"Drift summary Markdown: {drift_summary_md_path}")
