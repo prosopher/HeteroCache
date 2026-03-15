@@ -60,6 +60,7 @@ class LayerMapping:
     reference_target_num_layers: int
     reference_target_layer_idx: int
     reference_target_layer_end_idx: int
+    relative_depth: float
     src_layer_idx: int
     src_layer_end_idx: int
     dst_layer_idx: int
@@ -106,8 +107,9 @@ class LayerPositionConfig:
     eval_max_examples_per_dataset: int = 256
     eval_shuffle_stream: bool = False
     benchmark_mode: str = "squad_f1"
-    extractive_max_answer_tokens: int = 8
-    extractive_beam_size: int = 4
+    generation_max_new_tokens: int = 32
+    extractive_max_answer_tokens: int = 16
+    extractive_beam_size: int = 8
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -341,22 +343,23 @@ def resolve_reference_direction_metadata(
     return nodes, edges, active_directions, edge_map[chosen_direction]
 
 
-def translate_reference_layer_idx(
-    reference_layer_idx: int,
-    reference_num_layers: int,
-    model_num_layers: int,
-) -> int:
-    if reference_num_layers < 1:
-        raise ValueError("reference_num_layers must be >= 1")
-    if model_num_layers < 1:
-        raise ValueError("model_num_layers must be >= 1")
-    if not (0 <= reference_layer_idx < reference_num_layers):
-        raise ValueError(
-            f"reference_layer_idx={reference_layer_idx} must be in [0, {reference_num_layers - 1}]"
-        )
-    if reference_num_layers == 1 or model_num_layers == 1:
+def relative_depth_from_layer_index(layer_idx: int, num_layers: int) -> float:
+    if num_layers < 1:
+        raise ValueError("num_layers must be >= 1")
+    if not (0 <= layer_idx < num_layers):
+        raise ValueError(f"layer_idx={layer_idx} must be in [0, {num_layers - 1}]")
+    if num_layers == 1:
+        return 0.0
+    return float(layer_idx) / float(num_layers - 1)
+
+
+def relative_depth_to_layer_index(relative_depth: float, num_layers: int) -> int:
+    if num_layers < 1:
+        raise ValueError("num_layers must be >= 1")
+    if num_layers == 1:
         return 0
-    return int(round(reference_layer_idx * (model_num_layers - 1) / (reference_num_layers - 1)))
+    clamped = min(1.0, max(0.0, float(relative_depth)))
+    return int(round(clamped * (num_layers - 1)))
 
 
 def resolve_reference_target_layer_idx(config: LayerPositionConfig, reference_target_num_layers: int) -> int:
@@ -409,22 +412,16 @@ def build_layer_mappings(
         )
     reference_translated_num_layers = requested_window_size
 
+    relative_depth = relative_depth_from_layer_index(reference_target_layer_idx, reference_target_spec.num_layers)
+
     edge_map = build_edge_map(edges)
     mappings: Dict[str, LayerMapping] = {}
     for direction in active_directions:
         edge = edge_map[direction]
         src_spec = model_specs[edge.src_id]
         dst_spec = model_specs[edge.dst_id]
-        src_layer_idx = translate_reference_layer_idx(
-            reference_layer_idx=reference_target_layer_idx,
-            reference_num_layers=reference_target_spec.num_layers,
-            model_num_layers=src_spec.num_layers,
-        )
-        dst_layer_idx = translate_reference_layer_idx(
-            reference_layer_idx=reference_target_layer_idx,
-            reference_num_layers=reference_target_spec.num_layers,
-            model_num_layers=dst_spec.num_layers,
-        )
+        src_layer_idx = relative_depth_to_layer_index(relative_depth, src_spec.num_layers)
+        dst_layer_idx = relative_depth_to_layer_index(relative_depth, dst_spec.num_layers)
         available_upper_layers = min(
             src_spec.num_layers - 1 - src_layer_idx,
             dst_spec.num_layers - 1 - dst_layer_idx,
@@ -436,6 +433,7 @@ def build_layer_mappings(
             reference_target_num_layers=reference_target_spec.num_layers,
             reference_target_layer_idx=reference_target_layer_idx,
             reference_target_layer_end_idx=reference_target_layer_end_idx,
+            relative_depth=relative_depth,
             src_layer_idx=src_layer_idx,
             src_layer_end_idx=src_layer_idx + translated_num_layers - 1,
             dst_layer_idx=dst_layer_idx,
@@ -708,7 +706,7 @@ def log_layer_mappings(
     for direction, mapping in layer_mappings.items():
         src_id, dst_id = direction.split("_to_")
         logger.info(
-            "[LayerMapping] %s | ref_target=L%d-%d/%d | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d",
+            "[LayerMapping] %s | ref_target=L%d-%d/%d | %s(%s): layers %d-%d/%d -> %s(%s): layers %d-%d/%d | translated_num_layers=%d | relative_depth=%.4f",
             direction,
             mapping.reference_target_layer_idx,
             mapping.reference_target_layer_end_idx,
@@ -724,6 +722,7 @@ def log_layer_mappings(
             mapping.dst_layer_end_idx,
             model_specs[dst_id].num_layers - 1,
             mapping.translated_num_layers,
+            mapping.relative_depth,
         )
 
 
@@ -1825,8 +1824,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=200)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1"], default="qa_accuracy")
-    parser.add_argument("--extractive-max-answer-tokens", type=int, default=16)
-    parser.add_argument("--extractive-beam-size", type=int, default=8)
+    parser.add_argument("--generation-max-new-tokens", type=int, default=32)
+    parser.add_argument("--extractive-max-answer-tokens", type=int, default=8)
+    parser.add_argument("--extractive-beam-size", type=int, default=4)
     return parser.parse_args()
 
 
@@ -1869,6 +1869,7 @@ def main() -> None:
         eval_max_examples_per_dataset=args.eval_max_examples_per_dataset,
         eval_shuffle_stream=args.eval_shuffle_stream,
         benchmark_mode=args.benchmark_mode,
+        generation_max_new_tokens=args.generation_max_new_tokens,
         extractive_max_answer_tokens=args.extractive_max_answer_tokens,
         extractive_beam_size=args.extractive_beam_size,
     )
