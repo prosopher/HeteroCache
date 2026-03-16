@@ -1665,6 +1665,7 @@ def run_eval(
         dataset_results_key = "dataset_accuracies"
         dataset_specs = LOGIT_QA_DATASET_SPECS
         dataset_evaluator = evaluate_logit_dataset
+        dataloader_builder = build_eval_dataloader
         progress_log_template = (
             "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | injected_cosine=%.6f | "
             "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
@@ -1684,6 +1685,7 @@ def run_eval(
         dataset_results_key = "dataset_f1"
         dataset_specs = MULTINEWS_DATASET_SPECS
         dataset_evaluator = evaluate_generation_dataset
+        dataloader_builder = build_generation_eval_dataloader
         progress_log_template = (
             "[%s] %s | f1=%.6f | native_f1=%.6f | injected_cosine=%.6f | "
             "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
@@ -1692,7 +1694,7 @@ def run_eval(
         raise ValueError(f"Unsupported benchmark_mode: {config.benchmark_mode}")
 
     for spec in dataset_specs:
-        dataloader = build_generation_eval_dataloader(spec=spec, eval_config=eval_config)
+        dataloader = dataloader_builder(spec=spec, eval_config=eval_config)
         dataset_results, dataset_drift = dataset_evaluator(
             spec=spec,
             dataloader=dataloader,
