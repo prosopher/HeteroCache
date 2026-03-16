@@ -83,19 +83,6 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
         ]
         return FakeMapDataset(items)
 
-    if key == ("Awesome075/multi_news_parquet", None, "validation"):
-        items = [
-            {
-                "document": "City council approved a new park downtown. ||||| Residents welcomed the plan and asked for more trees.",
-                "summary": "The city approved a new downtown park and residents supported it while requesting more trees.",
-            },
-            {
-                "document": "Scientists reported a small battery breakthrough. ||||| The prototype charges faster and lasts longer in lab tests.",
-                "summary": "Researchers announced a battery prototype that charges faster and lasts longer in early tests.",
-            },
-        ]
-        return FakeMapDataset(items)
-
     raise ValueError(
         f"Unsupported fake dataset request: dataset_path={dataset_path!r}, dataset_name={dataset_name!r}, split={split!r}, streaming={streaming!r}"
     )
