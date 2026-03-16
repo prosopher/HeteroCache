@@ -38,6 +38,23 @@ LOGIT_QA_DATASET_SPECS = [
     ),
 ]
 
+# NOTE: SQuAD extractive benchmark code is intentionally kept here in commented form.
+# It was requested to be disabled for layer_position experiments, not deleted, so that
+# the previous benchmark path can be restored later without reconstructing it again.
+# SQUAD_DATASET_SPECS = [
+#     HFDatasetSpec(
+#         name_for_log="SQuAD/validation",
+#         dataset_path="rajpurkar/squad",
+#         dataset_name=None,
+#         split="validation",
+#         answer_mode="squad",
+#         question_field="question",
+#         context_field="context",
+#         answers_field="answers",
+#         streaming=False,
+#     ),
+# ]
+
 MULTINEWS_DATASET_SPECS = [
     HFDatasetSpec(
         name_for_log="MultiNews/validation",
@@ -220,6 +237,11 @@ class LayerPositionConfig:
     eval_shuffle_stream: bool = False
     benchmark_mode: str = "multinews_f1"
     generation_max_new_tokens: int = 64
+    # Legacy SQuAD extractive benchmark knobs are intentionally preserved here in
+    # commented form. The benchmark path is disabled for layer_position, but these
+    # options are kept as documentation of the previous interface.
+    # extractive_max_answer_tokens: int = 16
+    # extractive_beam_size: int = 8
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -235,6 +257,15 @@ class LayerPositionConfig:
             raise ValueError("injection_window_size must be >= 1")
         if self.benchmark_mode not in {"qa_accuracy", "multinews_f1"}:
             raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'multinews_f1'}")
+        # Disabled but intentionally preserved for reference:
+        # if self.benchmark_mode not in {"qa_accuracy", "squad_f1", "multinews_f1"}:
+        #     raise ValueError(
+        #         "benchmark_mode must be one of {'qa_accuracy', 'squad_f1', 'multinews_f1'}"
+        #     )
+        # if self.extractive_max_answer_tokens < 1:
+        #     raise ValueError("extractive_max_answer_tokens must be >= 1")
+        # if self.extractive_beam_size < 1:
+        #     raise ValueError("extractive_beam_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
 
@@ -1200,6 +1231,8 @@ def evaluate_logit_dataset(
 
 
 @torch.inference_mode()
+# NOTE: The previous extractive SQuAD path is intentionally disabled for layer_position
+# but preserved in commented blocks elsewhere in this file, per request.
 def evaluate_generation_dataset(
     spec: HFDatasetSpec,
     dataloader: DataLoader,
@@ -1459,6 +1492,9 @@ def build_drift_l2_chart_path(study_dir: Path) -> Path:
 def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
     if benchmark_mode == "qa_accuracy":
         return LOGIT_QA_DATASET_SPECS
+    # Disabled for now, but left in place intentionally:
+    # if benchmark_mode == "squad_f1":
+    #     return SQUAD_DATASET_SPECS
     if benchmark_mode == "multinews_f1":
         return MULTINEWS_DATASET_SPECS
     raise ValueError(f"Unsupported benchmark_mode: {benchmark_mode}")
@@ -1812,6 +1848,16 @@ def run_eval(
             "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | injected_cosine=%.6f | "
             "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
         )
+    # Disabled intentionally for now; preserved as commented code rather than deleted.
+    # elif config.benchmark_mode == "squad_f1":
+    #     metric_name = "f1"
+    #     dataset_results_key = "dataset_f1"
+    #     dataset_specs = SQUAD_DATASET_SPECS
+    #     dataset_evaluator = evaluate_generation_dataset
+    #     progress_log_template = (
+    #         "[%s] %s | f1=%.6f | native_f1=%.6f | injected_cosine=%.6f | "
+    #         "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
+    #     )
     elif config.benchmark_mode == "multinews_f1":
         metric_name = "f1"
         dataset_results_key = "dataset_f1"
@@ -1827,6 +1873,8 @@ def run_eval(
     for spec in dataset_specs:
         if config.benchmark_mode == "multinews_f1":
             dataloader = build_multinews_eval_dataloader(spec=spec, eval_config=eval_config)
+        # elif config.benchmark_mode == "squad_f1":
+        #     dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
         else:
             dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
         dataset_results, dataset_drift = dataset_evaluator(
@@ -2012,7 +2060,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "multinews_f1"], default="qa_accuracy")
+    # Disabled intentionally, but kept here so the previous interface is not lost:
+    # parser.add_argument(
+    #     "--benchmark-mode",
+    #     choices=["qa_accuracy", "squad_f1", "multinews_f1"],
+    #     default="qa_accuracy",
+    # )
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
+    # parser.add_argument("--extractive-max-answer-tokens", type=int, default=16)
+    # parser.add_argument("--extractive-beam-size", type=int, default=8)
     return parser.parse_args()
 
 
@@ -2056,6 +2112,8 @@ def main() -> None:
         eval_shuffle_stream=args.eval_shuffle_stream,
         benchmark_mode=args.benchmark_mode,
         generation_max_new_tokens=args.generation_max_new_tokens,
+        # extractive_max_answer_tokens=args.extractive_max_answer_tokens,
+        # extractive_beam_size=args.extractive_beam_size,
     )
 
     if config.position_layer_idx is None:
