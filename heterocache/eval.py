@@ -149,23 +149,53 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            question_cache_ids = None
-
             if spec.answer_mode == "squad":
-                context_prefix = prepare_generation_context_inputs(
+                context_prefix = prepare_extractive_context_inputs(
                     tokenizer=tokenizer,
                     context=context_text,
                     device=device,
                 )
                 cache_input_ids = context_prefix["input_ids"]
 
-                question_prefix = prepare_generation_question_prefix(
+                question_prefix = prepare_extractive_question_prefix(
                     tokenizer=tokenizer,
                     question=question,
                     device=device,
                 )
                 question_cache_ids = question_prefix["cache_ids"]
                 seed_token = question_prefix["seed_token"]
+            elif spec.answer_mode == "multinews":
+                context_budget = compute_generation_context_budget(
+                    tokenizer=tokenizer,
+                    question=question,
+                    generation_max_new_tokens=eval_config.generation_max_new_tokens,
+                    models=models,
+                    answer_mode=spec.answer_mode,
+                )
+                context_prefix = prepare_multinews_context_inputs(
+                    tokenizer=tokenizer,
+                    context=context_text,
+                    device=device,
+                    max_input_tokens=context_budget,
+                )
+                cache_input_ids = context_prefix["input_ids"]
+
+                question_prefix = prepare_multinews_question_prefix(
+                    tokenizer=tokenizer,
+                    question=question,
+                    device=device,
+                )
+                question_cache_ids = question_prefix["cache_ids"]
+                seed_token = question_prefix["seed_token"]
+
+                if context_prefix.get("was_truncated") and processed_examples < 3:
+                    logger.info(
+                        "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, generation_max_new_tokens=%d)",
+                        spec.name_for_log,
+                        int(cache_input_ids.shape[1]),
+                        int(question_cache_ids.shape[1]),
+                        int(eval_config.generation_max_new_tokens),
+                    )
             else:
                 prefix = prepare_generation_prefix(
                     tokenizer=tokenizer,
@@ -174,6 +204,7 @@ def evaluate_generation_dataset(
                     device=device,
                 )
                 cache_input_ids = prefix["cache_ids"]
+                question_cache_ids = None
                 seed_token = prefix["seed_token"]
 
             past_by_node_id = {
@@ -202,6 +233,36 @@ def evaluate_generation_dataset(
                 )
 
                 if spec.answer_mode == "squad":
+                    translated_answer_past = append_input_ids_to_past(
+                        model=models[edge.dst_id],
+                        past_key_values=mixed_target_past,
+                        input_ids=question_cache_ids,
+                    )
+                    native_answer_past = append_input_ids_to_past(
+                        model=models[edge.dst_id],
+                        past_key_values=past_by_node_id[edge.dst_id],
+                        input_ids=question_cache_ids,
+                    )
+
+                    translated_answer = predict_extractive_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=translated_answer_past,
+                        seed_token=seed_token,
+                        context=context_text,
+                        max_answer_tokens=eval_config.extractive_max_answer_tokens,
+                        beam_size=eval_config.extractive_beam_size,
+                    )
+                    native_answer = predict_extractive_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=native_answer_past,
+                        seed_token=seed_token,
+                        context=context_text,
+                        max_answer_tokens=eval_config.extractive_max_answer_tokens,
+                        beam_size=eval_config.extractive_beam_size,
+                    )
+                elif spec.answer_mode == "multinews":
                     translated_generation_past = append_input_ids_to_past(
                         model=models[edge.dst_id],
                         past_key_values=mixed_target_past,
@@ -212,24 +273,39 @@ def evaluate_generation_dataset(
                         past_key_values=past_by_node_id[edge.dst_id],
                         input_ids=question_cache_ids,
                     )
+
+                    translated_answer = generate_greedy_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=translated_generation_past,
+                        seed_token=seed_token,
+                        max_new_tokens=eval_config.generation_max_new_tokens,
+                    )
+                    native_answer = generate_greedy_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=native_generation_past,
+                        seed_token=seed_token,
+                        max_new_tokens=eval_config.generation_max_new_tokens,
+                    )
                 else:
                     translated_generation_past = mixed_target_past
                     native_generation_past = past_by_node_id[edge.dst_id]
 
-                translated_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=translated_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=eval_config.generation_max_new_tokens,
-                )
-                native_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=native_generation_past,
-                    seed_token=seed_token,
-                    max_new_tokens=eval_config.generation_max_new_tokens,
-                )
+                    translated_answer = generate_greedy_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=translated_generation_past,
+                        seed_token=seed_token,
+                        max_new_tokens=eval_config.generation_max_new_tokens,
+                    )
+                    native_answer = generate_greedy_answer(
+                        model=models[edge.dst_id],
+                        tokenizer=tokenizer,
+                        past_key_values=native_generation_past,
+                        seed_token=seed_token,
+                        max_new_tokens=eval_config.generation_max_new_tokens,
+                    )
 
                 exact_match = compute_generation_exact_match(translated_answer, gold_answers)
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -308,52 +384,9 @@ def run_eval(eval_config: EvalConfig) -> Path:
     logger.info("translation_mode=replace_top_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
 
-    logit_dataset_specs = [
-        HFDatasetSpec(
-            name_for_log="BoolQ/validation",
-            dataset_path="google/boolq",
-            dataset_name=None,
-            split="validation",
-            answer_mode="boolq",
-            question_field="question",
-            context_field="passage",
-            streaming=False,
-        ),
-        HFDatasetSpec(
-            name_for_log="PubMedQA/pqa_labeled/train",
-            dataset_path="qiaojin/PubMedQA",
-            dataset_name="pqa_labeled",
-            split="train",
-            answer_mode="pubmed_qa",
-            question_field="question",
-            context_field="context",
-            streaming=False,
-        ),
-        HFDatasetSpec(
-            name_for_log="MMLU/all/validation",
-            dataset_path="cais/mmlu",
-            dataset_name="all",
-            split="validation",
-            answer_mode="mmlu",
-            question_field="question",
-            subject_field="subject",
-            streaming=False,
-        ),
-    ]
+    logit_dataset_specs = get_default_logit_dataset_specs()
 
-    generation_dataset_specs = [
-        HFDatasetSpec(
-            name_for_log="SQuAD/validation",
-            dataset_path="rajpurkar/squad",
-            dataset_name=None,
-            split="validation",
-            answer_mode="squad",
-            question_field="question",
-            context_field="context",
-            answers_field="answers",
-            streaming=False,
-        ),
-    ]
+    generation_dataset_specs = get_default_generation_dataset_specs()
 
     all_logit_results = {}
     all_generation_results = {}
