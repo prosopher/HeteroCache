@@ -151,31 +151,37 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            if spec.answer_mode == "squad":
-                context_prefix = prepare_extractive_context_inputs(
+            context_budget = None
+            if spec.answer_mode == "multinews":
+                context_budget = compute_benchmark_context_budget(
                     tokenizer=tokenizer,
-                    context=context_text,
-                    device=device,
+                    spec=spec,
+                    question=question,
+                    eval_config=eval_config,
+                    models=models,
                 )
-                cache_input_ids = context_prefix["input_ids"]
 
-                question_prefix = prepare_extractive_question_prefix(
-                    tokenizer=tokenizer,
-                    question=question,
-                    device=device,
+            prepared_inputs = prepare_generation_task_inputs(
+                spec=spec,
+                tokenizer=tokenizer,
+                context=context_text,
+                question=question,
+                device=device,
+                max_input_tokens=context_budget,
+            )
+            cache_input_ids = prepared_inputs["cache_input_ids"]
+            question_cache_ids = prepared_inputs["question_cache_ids"]
+            seed_token = prepared_inputs["seed_token"]
+
+            if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                question_cache_tokens = 0 if question_cache_ids is None else int(question_cache_ids.shape[1])
+                logger.info(
+                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
+                    spec.name_for_log,
+                    int(cache_input_ids.shape[1]),
+                    question_cache_tokens,
+                    get_answer_token_budget_for_spec(spec, eval_config),
                 )
-                question_cache_ids = question_prefix["cache_ids"]
-                seed_token = question_prefix["seed_token"]
-            else:
-                prefix = prepare_generation_prefix(
-                    tokenizer=tokenizer,
-                    context=context_text,
-                    question=question,
-                    device=device,
-                )
-                cache_input_ids = prefix["cache_ids"]
-                question_cache_ids = None
-                seed_token = prefix["seed_token"]
 
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
@@ -202,54 +208,26 @@ def evaluate_generation_dataset(
                     translated_top_past_key_values=translated_top_past,
                 )
 
-                if spec.answer_mode == "squad":
-                    translated_answer_past = append_input_ids_to_past(
-                        model=models[edge.dst_id],
-                        past_key_values=mixed_target_past,
-                        input_ids=question_cache_ids,
-                    )
-                    native_answer_past = append_input_ids_to_past(
-                        model=models[edge.dst_id],
-                        past_key_values=past_by_node_id[edge.dst_id],
-                        input_ids=question_cache_ids,
-                    )
-
-                    translated_answer = predict_extractive_answer(
-                        model=models[edge.dst_id],
-                        tokenizer=tokenizer,
-                        past_key_values=translated_answer_past,
-                        seed_token=seed_token,
-                        context=context_text,
-                        max_answer_tokens=eval_config.extractive_max_answer_tokens,
-                        beam_size=eval_config.extractive_beam_size,
-                    )
-                    native_answer = predict_extractive_answer(
-                        model=models[edge.dst_id],
-                        tokenizer=tokenizer,
-                        past_key_values=native_answer_past,
-                        seed_token=seed_token,
-                        context=context_text,
-                        max_answer_tokens=eval_config.extractive_max_answer_tokens,
-                        beam_size=eval_config.extractive_beam_size,
-                    )
-                else:
-                    translated_generation_past = mixed_target_past
-                    native_generation_past = past_by_node_id[edge.dst_id]
-
-                    translated_answer = generate_greedy_answer(
-                        model=models[edge.dst_id],
-                        tokenizer=tokenizer,
-                        past_key_values=translated_generation_past,
-                        seed_token=seed_token,
-                        max_new_tokens=eval_config.generation_max_new_tokens,
-                    )
-                    native_answer = generate_greedy_answer(
-                        model=models[edge.dst_id],
-                        tokenizer=tokenizer,
-                        past_key_values=native_generation_past,
-                        seed_token=seed_token,
-                        max_new_tokens=eval_config.generation_max_new_tokens,
-                    )
+                translated_answer = predict_generation_task_answer(
+                    spec=spec,
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=mixed_target_past,
+                    seed_token=seed_token,
+                    eval_config=eval_config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
+                )
+                native_answer = predict_generation_task_answer(
+                    spec=spec,
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    seed_token=seed_token,
+                    eval_config=eval_config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
+                )
 
                 exact_match = compute_generation_exact_match(translated_answer, gold_answers)
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -368,17 +346,9 @@ def run_eval(eval_config: EvalConfig) -> Path:
     ]
 
     generation_dataset_specs = [
-        HFDatasetSpec(
-            name_for_log="SQuAD/validation",
-            dataset_path="rajpurkar/squad",
-            dataset_name=None,
-            split="validation",
-            answer_mode="squad",
-            question_field="question",
-            context_field="context",
-            answers_field="answers",
-            streaming=False,
-        ),
+        # Disabled intentionally for now, but preserved as extractive beam-search config:
+        # get_extractive_squad_generation_dataset_spec(),
+        get_multinews_generation_dataset_spec(),
     ]
 
     all_logit_results = {}
@@ -422,7 +392,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     for spec in generation_dataset_specs:
         logger.info("Preparing generation dataloader for %s", spec.name_for_log)
-        dataloader = build_eval_dataloader(
+        dataloader = build_generation_eval_dataloader(
             spec=spec,
             eval_config=eval_config,
         )

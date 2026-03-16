@@ -56,130 +56,8 @@ LOGIT_QA_DATASET_SPECS = [
 # ]
 
 MULTINEWS_DATASET_SPECS = [
-    HFDatasetSpec(
-        name_for_log="MultiNews/validation",
-        dataset_path="Awesome075/multi_news_parquet",
-        dataset_name=None,
-        split="validation",
-        answer_mode="multinews",
-        context_field="document",
-        answers_field="summary",
-        streaming=False,
-    ),
+    get_multinews_generation_dataset_spec(),
 ]
-
-
-class MultiNewsLayerPositionStream(IterableDataset):
-    def __init__(
-        self,
-        spec: HFDatasetSpec,
-        max_examples: int,
-        shuffle: bool,
-        seed: int,
-        shuffle_buffer: int,
-    ) -> None:
-        super().__init__()
-        self.spec = spec
-        self.max_examples = max_examples
-        self.shuffle = shuffle
-        self.seed = seed
-        self.shuffle_buffer = shuffle_buffer
-
-    def _load_dataset(self):
-        if self.spec.dataset_name is None:
-            return load_dataset(
-                self.spec.dataset_path,
-                split=self.spec.split,
-                streaming=self.spec.streaming,
-            )
-        return load_dataset(
-            self.spec.dataset_path,
-            self.spec.dataset_name,
-            split=self.spec.split,
-            streaming=self.spec.streaming,
-        )
-
-    def __iter__(self):
-        dataset = self._load_dataset()
-        if self.shuffle:
-            if self.spec.streaming:
-                dataset = dataset.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
-            else:
-                dataset = dataset.shuffle(seed=self.seed)
-
-        emitted = 0
-        context_field = self.spec.context_field or "document"
-        answers_field = self.spec.answers_field or "summary"
-        for example in dataset:
-            context = normalize_context_text(example.get(context_field, None))
-            if context is None:
-                continue
-            context = context.replace(" ||||| ", "\n\n").replace("|||||", "\n\n").strip()
-            if not context:
-                continue
-
-            summary_value = example.get(answers_field, None)
-            if not isinstance(summary_value, str) or not summary_value.strip():
-                continue
-
-            yield {
-                "question": "Summarize the news articles above.",
-                "context": context,
-                "answers": [summary_value.strip()],
-            }
-            emitted += 1
-            if emitted >= self.max_examples:
-                return
-
-
-def build_multinews_eval_dataloader(spec: HFDatasetSpec, eval_config) -> DataLoader:
-    dataset = MultiNewsLayerPositionStream(
-        spec=spec,
-        max_examples=eval_config.max_examples_per_dataset,
-        shuffle=eval_config.shuffle_eval_stream,
-        seed=eval_config.seed,
-        shuffle_buffer=eval_config.shuffle_buffer,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=eval_config.batch_size,
-        num_workers=eval_config.num_workers,
-        collate_fn=lambda batch: batch,
-    )
-
-
-def format_multinews_context_prefix(context: str) -> str:
-    return (
-        "Read the following news articles and write a concise summary.\n\n"
-        f"Articles:\n{context.strip()}\n"
-    )
-
-
-def format_multinews_question_prefix(question: str) -> str:
-    return (
-        f"Task: {question.strip()}\n"
-        "Summary:"
-    )
-
-
-def prepare_multinews_context_inputs(
-    tokenizer,
-    context: str,
-    device: str,
-    max_input_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    prefix_text = format_multinews_context_prefix(context=context)
-    return prepare_full_text_inputs(
-        tokenizer=tokenizer,
-        text=prefix_text,
-        device=device,
-        max_input_tokens=max_input_tokens,
-    )
-
-
-def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_multinews_question_prefix(question=question)
-    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
 @dataclass(frozen=True)
@@ -899,56 +777,6 @@ def build_models_for_experiment(
     )
 
 
-def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrainedTokenizerBase] = None) -> int:
-    config = getattr(model, "config", None)
-    candidates = [
-        getattr(config, "n_positions", None),
-        getattr(config, "max_position_embeddings", None),
-        getattr(config, "n_ctx", None),
-    ]
-    if tokenizer is not None:
-        tokenizer_limit = getattr(tokenizer, "model_max_length", None)
-        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
-            candidates.append(tokenizer_limit)
-    limits = [int(value) for value in candidates if isinstance(value, int) and value > 0]
-    if not limits:
-        return 1024
-    return min(limits)
-
-
-
-def compute_generation_context_budget(
-    tokenizer: PreTrainedTokenizerBase,
-    question: str,
-    config: LayerPositionConfig,
-    models: Dict[str, PreTrainedModel],
-) -> int:
-    shared_limit = min(get_model_context_limit(model, tokenizer) for model in models.values())
-    if config.benchmark_mode == "multinews_f1":
-        question_prefix = prepare_multinews_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device="cpu",
-        )
-    else:
-        question_prefix = prepare_generation_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device="cpu",
-        )
-    reserved_tokens = (
-        int(question_prefix["cache_ids"].shape[1])
-        + int(question_prefix["seed_token"].shape[1])
-        + int(config.generation_max_new_tokens)
-    )
-    budget = shared_limit - reserved_tokens
-    if budget < 16:
-        raise ValueError(
-            f"Insufficient context budget for generation: shared_limit={shared_limit}, reserved_tokens={reserved_tokens}"
-        )
-    return budget
-
-
 def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: LayerPositionConfig,
@@ -1257,35 +1085,33 @@ def evaluate_generation_dataset(
             context_text = example["context"]
             gold_answers = example["answers"]
 
-            context_budget = compute_generation_context_budget(
+            context_budget = compute_benchmark_context_budget(
                 tokenizer=tokenizer,
+                spec=spec,
                 question=question,
-                config=config,
+                eval_config=config,
                 models=models,
             )
-            context_prefix = prepare_multinews_context_inputs(
+            prepared_inputs = prepare_generation_task_inputs(
+                spec=spec,
                 tokenizer=tokenizer,
                 context=context_text,
+                question=question,
                 device=config.device,
                 max_input_tokens=context_budget,
             )
-            cache_input_ids = context_prefix["input_ids"]
+            cache_input_ids = prepared_inputs["cache_input_ids"]
+            question_cache_ids = prepared_inputs["question_cache_ids"]
+            seed_token = prepared_inputs["seed_token"]
 
-            question_prefix = prepare_multinews_question_prefix(
-                tokenizer=tokenizer,
-                question=question,
-                device=config.device,
-            )
-            question_cache_ids = question_prefix["cache_ids"]
-            seed_token = question_prefix["seed_token"]
-
-            if context_prefix.get("was_truncated") and processed_examples < 3:
+            if prepared_inputs.get("was_truncated") and processed_examples < 3:
+                question_cache_tokens = 0 if question_cache_ids is None else int(question_cache_ids.shape[1])
                 logger.info(
-                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, generation_max_new_tokens=%d)",
+                    "[%s] truncated context to %d tokens to fit model context window (question_cache_tokens=%d, answer_token_budget=%d)",
                     spec.name_for_log,
                     int(cache_input_ids.shape[1]),
-                    int(question_cache_ids.shape[1]),
-                    int(config.generation_max_new_tokens),
+                    question_cache_tokens,
+                    get_answer_token_budget_for_spec(spec, config),
                 )
 
             past_by_node_id = {
@@ -1321,30 +1147,25 @@ def evaluate_generation_dataset(
                     )
                     native_capture_by_target[native_capture_key] = native_capture
 
-                translated_answer_past = append_input_ids_to_past(
+                translated_answer = predict_generation_task_answer(
+                    spec=spec,
                     model=models[edge.dst_id],
+                    tokenizer=tokenizer,
                     past_key_values=mixed_target_past,
-                    input_ids=question_cache_ids,
+                    seed_token=seed_token,
+                    eval_config=config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
                 )
-                native_answer_past = append_input_ids_to_past(
+                native_answer = predict_generation_task_answer(
+                    spec=spec,
                     model=models[edge.dst_id],
+                    tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.dst_id],
-                    input_ids=question_cache_ids,
-                )
-
-                translated_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=translated_answer_past,
                     seed_token=seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
-                )
-                native_answer = generate_greedy_answer(
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=native_answer_past,
-                    seed_token=seed_token,
-                    max_new_tokens=config.generation_max_new_tokens,
+                    eval_config=config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
                 )
 
                 f1 = compute_generation_f1(translated_answer, gold_answers)
@@ -1871,12 +1692,7 @@ def run_eval(
         raise ValueError(f"Unsupported benchmark_mode: {config.benchmark_mode}")
 
     for spec in dataset_specs:
-        if config.benchmark_mode == "multinews_f1":
-            dataloader = build_multinews_eval_dataloader(spec=spec, eval_config=eval_config)
-        # elif config.benchmark_mode == "squad_f1":
-        #     dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
-        else:
-            dataloader = build_eval_dataloader(spec=spec, eval_config=eval_config)
+        dataloader = build_generation_eval_dataloader(spec=spec, eval_config=eval_config)
         dataset_results, dataset_drift = dataset_evaluator(
             spec=spec,
             dataloader=dataloader,
