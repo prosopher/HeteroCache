@@ -2,7 +2,7 @@
   "outputs_path": "outputs",
   "timestamp": null,
   "output_path": null,
-  "model_ids": "gpt2,gpt2-medium",
+  "model_ids": "gpt2-medium,gpt2",
   "max_steps": 500,
   "batch_size": 1,
   "grad_accum_steps": 16,
