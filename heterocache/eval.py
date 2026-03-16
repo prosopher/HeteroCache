@@ -337,11 +337,15 @@ def run_eval(eval_config: EvalConfig) -> Path:
         ),
     ]
 
-    generation_dataset_specs = [
-        # Disabled intentionally for now, but preserved as extractive beam-search config:
-        # get_extractive_squad_generation_dataset_spec(),
-        get_multinews_generation_dataset_spec(),
-    ]
+    generation_dataset_specs = []
+    if eval_config.enable_generation_eval:
+        generation_dataset_specs = [
+            # Disabled intentionally for now, but preserved as extractive beam-search config:
+            # get_extractive_squad_generation_dataset_spec(),
+            get_multinews_generation_dataset_spec(),
+        ]
+    else:
+        logger.info("Skipping generation evaluation datasets (enable_generation_eval=False)")
 
     all_logit_results = {}
     all_generation_results = {}

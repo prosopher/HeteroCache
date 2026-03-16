@@ -22,6 +22,7 @@ class EvalConfig:
 
     # generation QA
     generation_max_new_tokens: int
+    enable_generation_eval: bool = True
 
     # extractive SQuAD-style QA
     extractive_max_answer_tokens: int = 8
@@ -67,30 +68,18 @@ class HFQAPairStream(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
 
     def _load_dataset(self):
-        candidates = [(self.spec.dataset_path, self.spec.dataset_name)]
-
-        last_error = None
-        for dataset_path, dataset_name in candidates:
-            try:
-                if dataset_name is None:
-                    return load_dataset(
-                        dataset_path,
-                        split=self.spec.split,
-                        streaming=self.spec.streaming,
-                    )
-                return load_dataset(
-                    dataset_path,
-                    dataset_name,
-                    split=self.spec.split,
-                    streaming=self.spec.streaming,
-                )
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(
-            f"Failed to load dataset {self.spec.name_for_log} "
-            f"with candidates={candidates}"
-        ) from last_error
+        if self.spec.dataset_name is None:
+            return load_dataset(
+                self.spec.dataset_path,
+                split=self.spec.split,
+                streaming=self.spec.streaming,
+            )
+        return load_dataset(
+            self.spec.dataset_path,
+            self.spec.dataset_name,
+            split=self.spec.split,
+            streaming=self.spec.streaming,
+        )
 
     def __iter__(self):
         dataset = self._load_dataset()
@@ -242,30 +231,18 @@ class HFGenerationExampleStream(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
 
     def _load_dataset(self):
-        candidates = [(self.spec.dataset_path, self.spec.dataset_name)]
-
-        last_error = None
-        for dataset_path, dataset_name in candidates:
-            try:
-                if dataset_name is None:
-                    return load_dataset(
-                        dataset_path,
-                        split=self.spec.split,
-                        streaming=self.spec.streaming,
-                    )
-                return load_dataset(
-                    dataset_path,
-                    dataset_name,
-                    split=self.spec.split,
-                    streaming=self.spec.streaming,
-                )
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(
-            f"Failed to load dataset {self.spec.name_for_log} "
-            f"with candidates={candidates}"
-        ) from last_error
+        if self.spec.dataset_name is None:
+            return load_dataset(
+                self.spec.dataset_path,
+                split=self.spec.split,
+                streaming=self.spec.streaming,
+            )
+        return load_dataset(
+            self.spec.dataset_path,
+            self.spec.dataset_name,
+            split=self.spec.split,
+            streaming=self.spec.streaming,
+        )
 
     def __iter__(self):
         dataset = self._load_dataset()
