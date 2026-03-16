@@ -22,10 +22,11 @@ class EvalConfig:
 
     # generation QA
     generation_max_new_tokens: int
+    enable_generation_eval: bool = True
 
     # extractive SQuAD-style QA
-    extractive_max_answer_tokens: int = 16
-    extractive_beam_size: int = 8
+    extractive_max_answer_tokens: int = 8
+    extractive_beam_size: int = 4
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -67,30 +68,18 @@ class HFQAPairStream(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
 
     def _load_dataset(self):
-        candidates = [(self.spec.dataset_path, self.spec.dataset_name)]
-
-        last_error = None
-        for dataset_path, dataset_name in candidates:
-            try:
-                if dataset_name is None:
-                    return load_dataset(
-                        dataset_path,
-                        split=self.spec.split,
-                        streaming=self.spec.streaming,
-                    )
-                return load_dataset(
-                    dataset_path,
-                    dataset_name,
-                    split=self.spec.split,
-                    streaming=self.spec.streaming,
-                )
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(
-            f"Failed to load dataset {self.spec.name_for_log} "
-            f"with candidates={candidates}"
-        ) from last_error
+        if self.spec.dataset_name is None:
+            return load_dataset(
+                self.spec.dataset_path,
+                split=self.spec.split,
+                streaming=self.spec.streaming,
+            )
+        return load_dataset(
+            self.spec.dataset_path,
+            self.spec.dataset_name,
+            split=self.spec.split,
+            streaming=self.spec.streaming,
+        )
 
     def __iter__(self):
         dataset = self._load_dataset()
@@ -242,30 +231,18 @@ class HFGenerationExampleStream(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
 
     def _load_dataset(self):
-        candidates = [(self.spec.dataset_path, self.spec.dataset_name)]
-
-        last_error = None
-        for dataset_path, dataset_name in candidates:
-            try:
-                if dataset_name is None:
-                    return load_dataset(
-                        dataset_path,
-                        split=self.spec.split,
-                        streaming=self.spec.streaming,
-                    )
-                return load_dataset(
-                    dataset_path,
-                    dataset_name,
-                    split=self.spec.split,
-                    streaming=self.spec.streaming,
-                )
-            except Exception as exc:
-                last_error = exc
-
-        raise RuntimeError(
-            f"Failed to load dataset {self.spec.name_for_log} "
-            f"with candidates={candidates}"
-        ) from last_error
+        if self.spec.dataset_name is None:
+            return load_dataset(
+                self.spec.dataset_path,
+                split=self.spec.split,
+                streaming=self.spec.streaming,
+            )
+        return load_dataset(
+            self.spec.dataset_path,
+            self.spec.dataset_name,
+            split=self.spec.split,
+            streaming=self.spec.streaming,
+        )
 
     def __iter__(self):
         dataset = self._load_dataset()
@@ -305,6 +282,7 @@ def build_generation_eval_dataloader(
         num_workers=eval_config.num_workers,
         collate_fn=lambda batch: batch,
     )
+
 
 
 class RunningAverage:
@@ -662,8 +640,6 @@ def format_question_prefix(
     return "\n".join(prompt_lines)
 
 
-
-
 def format_extractive_context_prefix(context: str) -> str:
     return (
         "Read the passage and answer the question by extracting a contiguous span from the passage.\n\n"
@@ -720,6 +696,7 @@ def prepare_multinews_context_inputs(
 def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
     prefix_text = format_multinews_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
 
 
 @dataclass
@@ -1220,6 +1197,7 @@ def predict_generation_task_answer(
         seed_token=seed_token,
         max_new_tokens=int(getattr(eval_config, "generation_max_new_tokens")),
     )
+
 
 
 @torch.inference_mode()
