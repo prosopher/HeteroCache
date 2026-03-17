@@ -106,7 +106,7 @@ class LayerPositionConfig:
     eval_shuffle_stream: bool = False
     benchmark_mode: str = "squad_f1"
     generation_max_new_tokens: int = 64
-    extractive_max_answer_tokens: int = 8
+    extractive_max_answer_tokens: int = 16
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -2395,7 +2395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-shuffle-stream", action="store_true")
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1", "multinews_f1"], default="squad_f1")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
-    parser.add_argument("--extractive-max-answer-tokens", type=int, default=8)
+    parser.add_argument("--extractive-max-answer-tokens", type=int, default=16)
     return parser.parse_args()
 
 
