@@ -106,6 +106,10 @@ class LayerPositionConfig:
     translator_depth: int = 2
     translator_mlp_ratio: int = 2
 
+    enable_principal_rotation: bool = True
+    principal_rotation_streams: str = "kv"
+    principal_rotation_calibration_steps: int = 32
+
     device: str = "auto"
     dtype: str = "float32"
 
@@ -146,6 +150,104 @@ class LayerPositionConfig:
         #     raise ValueError("extractive_beam_size must be >= 1")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
+        normalized_streams = "".join(sorted(set(str(self.principal_rotation_streams).lower())))
+        if normalized_streams not in {"", "k", "v", "kv"}:
+            raise ValueError("principal_rotation_streams must be one of {'k', 'v', 'kv'}")
+        self.principal_rotation_streams = normalized_streams or "kv"
+        if self.enable_principal_rotation and self.principal_rotation_calibration_steps < 1:
+            raise ValueError("principal_rotation_calibration_steps must be >= 1 when principal rotation is enabled")
+
+
+@dataclass
+class StreamPrincipalRotation:
+    mean: torch.Tensor
+    basis: torch.Tensor
+    top_explained_variance_ratio: float
+
+
+@dataclass
+class DirectionalPrincipalRotations:
+    src_key: List[StreamPrincipalRotation]
+    dst_key: List[StreamPrincipalRotation]
+    src_value: List[StreamPrincipalRotation]
+    dst_value: List[StreamPrincipalRotation]
+
+
+class RunningCovarianceAccumulator:
+    def __init__(self, hidden_size: int) -> None:
+        self.hidden_size = int(hidden_size)
+        self.count = 0
+        self.sum = torch.zeros(self.hidden_size, dtype=torch.float64)
+        self.xtx = torch.zeros(self.hidden_size, self.hidden_size, dtype=torch.float64)
+
+    def update(self, samples: torch.Tensor) -> None:
+        flattened = samples.detach().reshape(-1, samples.shape[-1]).to(device="cpu", dtype=torch.float64)
+        if flattened.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"RunningCovarianceAccumulator expected hidden size {self.hidden_size}, got {flattened.shape[-1]}"
+            )
+        self.count += int(flattened.shape[0])
+        self.sum += flattened.sum(dim=0)
+        self.xtx += flattened.transpose(0, 1) @ flattened
+
+    def finalize(self) -> StreamPrincipalRotation:
+        if self.count < 1:
+            identity = torch.eye(self.hidden_size, dtype=torch.float32)
+            return StreamPrincipalRotation(
+                mean=torch.zeros(self.hidden_size, dtype=torch.float32),
+                basis=identity,
+                top_explained_variance_ratio=0.0,
+            )
+        mean = self.sum / float(self.count)
+        covariance = self.xtx / float(self.count) - torch.outer(mean, mean)
+        covariance = 0.5 * (covariance + covariance.transpose(0, 1))
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        order = torch.argsort(eigenvalues, descending=True)
+        eigenvalues = eigenvalues[order]
+        basis = eigenvectors[:, order]
+        for column_idx in range(basis.shape[1]):
+            pivot_idx = int(torch.argmax(basis[:, column_idx].abs()).item())
+            if basis[pivot_idx, column_idx] < 0:
+                basis[:, column_idx] = -basis[:, column_idx]
+        total_variance = float(eigenvalues.clamp_min(0).sum().item())
+        top_ratio = 0.0 if total_variance <= 0.0 else float(eigenvalues[0].clamp_min(0).item() / total_variance)
+        return StreamPrincipalRotation(
+            mean=mean.to(dtype=torch.float32),
+            basis=basis.to(dtype=torch.float32),
+            top_explained_variance_ratio=top_ratio,
+        )
+
+
+def make_identity_principal_rotation(hidden_size: int) -> StreamPrincipalRotation:
+    return StreamPrincipalRotation(
+        mean=torch.zeros(hidden_size, dtype=torch.float32),
+        basis=torch.eye(hidden_size, dtype=torch.float32),
+        top_explained_variance_ratio=0.0,
+    )
+
+
+def rotate_into_principal_basis(layer_cache: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    centered = layer_cache.float() - mean.to(device=layer_cache.device, dtype=torch.float32)
+    rotated = torch.matmul(centered, basis.to(device=layer_cache.device, dtype=torch.float32))
+    return rotated.to(dtype=layer_cache.dtype)
+
+
+def inverse_rotate_from_principal_basis(rotated_cache: torch.Tensor, mean: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    restored = torch.matmul(
+        rotated_cache.float(),
+        basis.to(device=rotated_cache.device, dtype=torch.float32).transpose(0, 1),
+    )
+    restored = restored + mean.to(device=rotated_cache.device, dtype=torch.float32)
+    return restored.to(dtype=rotated_cache.dtype)
+
+
+def summarize_principal_rotation_stats(stats: List[StreamPrincipalRotation]) -> Dict[str, Any]:
+    ratios = [float(stat.top_explained_variance_ratio) for stat in stats]
+    return {
+        "num_layers": len(stats),
+        "top_explained_variance_ratio": ratios,
+        "average_top_explained_variance_ratio": float(sum(ratios) / len(ratios)) if ratios else float("nan"),
+    }
 
 
 class LayerWindowDirectionalTranslator(nn.Module):
@@ -163,6 +265,8 @@ class LayerWindowDirectionalTranslator(nn.Module):
         if translated_num_layers < 1:
             raise ValueError("translated_num_layers must be >= 1")
         self.translated_num_layers = translated_num_layers
+        self.src_hidden_size = src_hidden_size
+        self.dst_hidden_size = dst_hidden_size
         self.key_layers = nn.ModuleList(
             [
                 PerLayerTranslator(
@@ -189,6 +293,81 @@ class LayerWindowDirectionalTranslator(nn.Module):
                 for _ in range(translated_num_layers)
             ]
         )
+        self.register_buffer("src_key_means", torch.zeros(translated_num_layers, src_hidden_size, dtype=torch.float32))
+        self.register_buffer("dst_key_means", torch.zeros(translated_num_layers, dst_hidden_size, dtype=torch.float32))
+        self.register_buffer(
+            "src_key_bases",
+            torch.eye(src_hidden_size, dtype=torch.float32).unsqueeze(0).repeat(translated_num_layers, 1, 1),
+        )
+        self.register_buffer(
+            "dst_key_bases",
+            torch.eye(dst_hidden_size, dtype=torch.float32).unsqueeze(0).repeat(translated_num_layers, 1, 1),
+        )
+        self.register_buffer("src_value_means", torch.zeros(translated_num_layers, src_hidden_size, dtype=torch.float32))
+        self.register_buffer("dst_value_means", torch.zeros(translated_num_layers, dst_hidden_size, dtype=torch.float32))
+        self.register_buffer(
+            "src_value_bases",
+            torch.eye(src_hidden_size, dtype=torch.float32).unsqueeze(0).repeat(translated_num_layers, 1, 1),
+        )
+        self.register_buffer(
+            "dst_value_bases",
+            torch.eye(dst_hidden_size, dtype=torch.float32).unsqueeze(0).repeat(translated_num_layers, 1, 1),
+        )
+
+    def set_principal_rotations(self, rotations: DirectionalPrincipalRotations) -> None:
+        expected = self.translated_num_layers
+        for stream_name, stats in {
+            "src_key": rotations.src_key,
+            "dst_key": rotations.dst_key,
+            "src_value": rotations.src_value,
+            "dst_value": rotations.dst_value,
+        }.items():
+            if len(stats) != expected:
+                raise ValueError(
+                    f"Directional principal rotation {stream_name} expected {expected} layers, got {len(stats)}"
+                )
+
+        self._copy_principal_rotation_list(self.src_key_means, self.src_key_bases, rotations.src_key)
+        self._copy_principal_rotation_list(self.dst_key_means, self.dst_key_bases, rotations.dst_key)
+        self._copy_principal_rotation_list(self.src_value_means, self.src_value_bases, rotations.src_value)
+        self._copy_principal_rotation_list(self.dst_value_means, self.dst_value_bases, rotations.dst_value)
+
+    def _copy_principal_rotation_list(
+        self,
+        mean_buffer: torch.Tensor,
+        basis_buffer: torch.Tensor,
+        stats: List[StreamPrincipalRotation],
+    ) -> None:
+        means = torch.stack([stat.mean for stat in stats], dim=0).to(device=mean_buffer.device, dtype=mean_buffer.dtype)
+        bases = torch.stack([stat.basis for stat in stats], dim=0).to(device=basis_buffer.device, dtype=basis_buffer.dtype)
+        mean_buffer.copy_(means)
+        basis_buffer.copy_(bases)
+
+    def _translate_stream(
+        self,
+        layer_cache: torch.Tensor,
+        translators: nn.ModuleList,
+        src_means: torch.Tensor,
+        src_bases: torch.Tensor,
+        dst_means: torch.Tensor,
+        dst_bases: torch.Tensor,
+    ) -> torch.Tensor:
+        translated_layers = []
+        for offset in range(self.translated_num_layers):
+            rotated_input = rotate_into_principal_basis(
+                layer_cache[:, :, offset, :],
+                src_means[offset],
+                src_bases[offset],
+            )
+            translated_rotated = translators[offset](rotated_input)
+            translated_layers.append(
+                inverse_rotate_from_principal_basis(
+                    translated_rotated,
+                    dst_means[offset],
+                    dst_bases[offset],
+                ).unsqueeze(2)
+            )
+        return torch.cat(translated_layers, dim=2)
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if key_block.shape != value_block.shape:
@@ -206,12 +385,23 @@ class LayerWindowDirectionalTranslator(nn.Module):
                 f"Expected {self.translated_num_layers} layers in the translation window, got {key_block.shape[2]}"
             )
 
-        translated_key_layers = []
-        translated_value_layers = []
-        for offset in range(self.translated_num_layers):
-            translated_key_layers.append(self.key_layers[offset](key_block[:, :, offset, :]).unsqueeze(2))
-            translated_value_layers.append(self.value_layers[offset](value_block[:, :, offset, :]).unsqueeze(2))
-        return torch.cat(translated_key_layers, dim=2), torch.cat(translated_value_layers, dim=2)
+        translated_key = self._translate_stream(
+            layer_cache=key_block,
+            translators=self.key_layers,
+            src_means=self.src_key_means,
+            src_bases=self.src_key_bases,
+            dst_means=self.dst_key_means,
+            dst_bases=self.dst_key_bases,
+        )
+        translated_value = self._translate_stream(
+            layer_cache=value_block,
+            translators=self.value_layers,
+            src_means=self.src_value_means,
+            src_bases=self.src_value_bases,
+            dst_means=self.dst_value_means,
+            dst_bases=self.dst_value_bases,
+        )
+        return translated_key, translated_value
 
 
 class LayerWindowTranslatorPool(nn.Module):
@@ -246,6 +436,11 @@ class LayerWindowTranslatorPool(nn.Module):
             )
         self.adapters = nn.ModuleDict(adapters)
 
+    def set_principal_rotations(self, direction: str, rotations: DirectionalPrincipalRotations) -> None:
+        if direction not in self.adapters:
+            raise ValueError(f"Unknown direction for principal rotations: {direction}")
+        self.adapters[direction].set_principal_rotations(rotations)
+
     def translate_layer_window(
         self,
         past_key_values: PastKeyValues,
@@ -261,6 +456,154 @@ class LayerWindowTranslatorPool(nn.Module):
         )
         translated_key, translated_value = self.adapters[direction](key_block, value_block)
         return translated_key, translated_value, mapping
+
+
+def principal_rotation_stream_is_enabled(config: LayerPositionConfig, stream_name: str) -> bool:
+    stream_name = stream_name.lower()
+    if stream_name not in {"k", "v"}:
+        raise ValueError(f"Unknown principal rotation stream: {stream_name}")
+    return config.enable_principal_rotation and stream_name in config.principal_rotation_streams
+
+
+def build_principal_rotation_metadata_path(run_dir: Path) -> Path:
+    return run_dir / "principal_rotation_metadata.json"
+
+
+def save_principal_rotation_metadata(run_dir: Path, metadata: Dict[str, Any]) -> Path:
+    metadata_path = build_principal_rotation_metadata_path(run_dir)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w", encoding="utf-8") as fp:
+        json.dump(metadata, fp, indent=2, ensure_ascii=False)
+    return metadata_path
+
+
+def calibrate_principal_rotations(
+    config: LayerPositionConfig,
+    logger: logging.Logger,
+    models: Dict[str, PreTrainedModel],
+    tokenizer: PreTrainedTokenizerBase,
+    nodes: List[Node],
+    edges: List[Edge],
+    translator_pool: LayerWindowTranslatorPool,
+    layer_mappings: Dict[str, LayerMapping],
+) -> Dict[str, Any]:
+    if not config.enable_principal_rotation:
+        return {
+            "enabled": False,
+            "streams": config.principal_rotation_streams,
+            "calibration_steps": 0,
+            "directions": {},
+        }
+
+    logger.info(
+        "[Rotation] calibrating principal-basis rotations with %d batches (streams=%s)",
+        config.principal_rotation_calibration_steps,
+        config.principal_rotation_streams,
+    )
+    calibration_loader = build_training_dataloader(
+        tokenizer=tokenizer,
+        config=SimpleNamespaceConfig(
+            total_tokens=config.total_tokens,
+            batch_size=config.batch_size,
+            shuffle_buffer=config.shuffle_buffer,
+            seed=config.seed,
+        ),
+    )
+    edge_map = build_edge_map(edges)
+    stats: Dict[str, Dict[str, List[RunningCovarianceAccumulator]]] = {}
+    for direction in translator_pool.active_directions:
+        edge = edge_map[direction]
+        mapping = layer_mappings[direction]
+        src_hidden = translator_pool.model_specs[edge.src_id].hidden_size
+        dst_hidden = translator_pool.model_specs[edge.dst_id].hidden_size
+        stats[direction] = {
+            "src_key": [RunningCovarianceAccumulator(src_hidden) for _ in range(mapping.translated_num_layers)],
+            "dst_key": [RunningCovarianceAccumulator(dst_hidden) for _ in range(mapping.translated_num_layers)],
+            "src_value": [RunningCovarianceAccumulator(src_hidden) for _ in range(mapping.translated_num_layers)],
+            "dst_value": [RunningCovarianceAccumulator(dst_hidden) for _ in range(mapping.translated_num_layers)],
+        }
+
+    progress_bar = tqdm(range(config.principal_rotation_calibration_steps), desc="PrincipalRotationCalib")
+    for _ in progress_bar:
+        input_ids = next(calibration_loader).to(config.device)
+        prefix_cache_ids, _, _ = split_prefix_and_suffix_for_exact_next_token_loss(
+            input_ids=input_ids,
+            prefix_tokens=config.prefix_tokens,
+        )
+        with torch.no_grad():
+            past_by_node_id = {
+                node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                for node in nodes
+            }
+
+        for direction in translator_pool.active_directions:
+            edge = edge_map[direction]
+            mapping = layer_mappings[direction]
+            src_key_block, src_value_block = extract_layer_window_blocks(
+                past_key_values=past_by_node_id[edge.src_id],
+                start_layer_idx=mapping.src_layer_idx,
+                num_layers=mapping.translated_num_layers,
+            )
+            dst_key_block, dst_value_block = extract_layer_window_blocks(
+                past_key_values=past_by_node_id[edge.dst_id],
+                start_layer_idx=mapping.dst_layer_idx,
+                num_layers=mapping.translated_num_layers,
+            )
+            for offset in range(mapping.translated_num_layers):
+                if principal_rotation_stream_is_enabled(config, "k"):
+                    stats[direction]["src_key"][offset].update(src_key_block[:, :, offset, :])
+                    stats[direction]["dst_key"][offset].update(dst_key_block[:, :, offset, :])
+                if principal_rotation_stream_is_enabled(config, "v"):
+                    stats[direction]["src_value"][offset].update(src_value_block[:, :, offset, :])
+                    stats[direction]["dst_value"][offset].update(dst_value_block[:, :, offset, :])
+
+    metadata = {
+        "enabled": True,
+        "streams": config.principal_rotation_streams,
+        "calibration_steps": int(config.principal_rotation_calibration_steps),
+        "directions": {},
+    }
+    for direction in translator_pool.active_directions:
+        edge = edge_map[direction]
+        src_hidden = translator_pool.model_specs[edge.src_id].hidden_size
+        dst_hidden = translator_pool.model_specs[edge.dst_id].hidden_size
+        src_key_rotations = (
+            [acc.finalize() for acc in stats[direction]["src_key"]]
+            if principal_rotation_stream_is_enabled(config, "k")
+            else [make_identity_principal_rotation(src_hidden) for _ in stats[direction]["src_key"]]
+        )
+        dst_key_rotations = (
+            [acc.finalize() for acc in stats[direction]["dst_key"]]
+            if principal_rotation_stream_is_enabled(config, "k")
+            else [make_identity_principal_rotation(dst_hidden) for _ in stats[direction]["dst_key"]]
+        )
+        src_value_rotations = (
+            [acc.finalize() for acc in stats[direction]["src_value"]]
+            if principal_rotation_stream_is_enabled(config, "v")
+            else [make_identity_principal_rotation(src_hidden) for _ in stats[direction]["src_value"]]
+        )
+        dst_value_rotations = (
+            [acc.finalize() for acc in stats[direction]["dst_value"]]
+            if principal_rotation_stream_is_enabled(config, "v")
+            else [make_identity_principal_rotation(dst_hidden) for _ in stats[direction]["dst_value"]]
+        )
+        rotations = DirectionalPrincipalRotations(
+            src_key=src_key_rotations,
+            dst_key=dst_key_rotations,
+            src_value=src_value_rotations,
+            dst_value=dst_value_rotations,
+        )
+        translator_pool.set_principal_rotations(direction, rotations)
+        metadata["directions"][direction] = {
+            "src_key": summarize_principal_rotation_stats(src_key_rotations),
+            "dst_key": summarize_principal_rotation_stats(dst_key_rotations),
+            "src_value": summarize_principal_rotation_stats(src_value_rotations),
+            "dst_value": summarize_principal_rotation_stats(dst_value_rotations),
+        }
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return metadata
 
 
 class AccuracyMeter:
@@ -1001,6 +1344,12 @@ def run_train(
 ) -> Tuple[LayerWindowTranslatorPool, Dict[str, ModelSpec], Dict[str, LayerMapping]]:
     logger = setup_logger(f"layer_position_train_{run_dir.name}", build_train_log_path(run_dir))
     logger.info("Starting layer-window position training with target-layer replay")
+    logger.info(
+        "principal_rotation=%s | streams=%s | calibration_steps=%d",
+        config.enable_principal_rotation,
+        config.principal_rotation_streams,
+        config.principal_rotation_calibration_steps,
+    )
     logger.info("experiment_config=%s", asdict(config))
 
     translator_pool, model_specs, layer_mappings = build_translator_pool(
@@ -1010,6 +1359,19 @@ def run_train(
         edges=edges,
         reference_edge=reference_edge,
     )
+    rotation_metadata = calibrate_principal_rotations(
+        config=config,
+        logger=logger,
+        models=models,
+        tokenizer=tokenizer,
+        nodes=nodes,
+        edges=edges,
+        translator_pool=translator_pool,
+        layer_mappings=layer_mappings,
+    )
+    rotation_metadata_path = save_principal_rotation_metadata(run_dir, rotation_metadata)
+    logger.info("[Rotation] metadata saved to %s", rotation_metadata_path)
+
     translator_pool.train()
     log_layer_mappings(logger, nodes, model_specs, layer_mappings)
     logger.info("[Setup] translator trainable params = %s", f"{count_trainable_parameters(translator_pool):,}")
@@ -1840,6 +2202,12 @@ def run_eval(
 ) -> Dict[str, Any]:
     logger = setup_logger(f"layer_position_eval_{run_dir.name}", build_eval_log_path(run_dir))
     logger.info("Starting layer-window position evaluation with target-layer replay")
+    logger.info(
+        "principal_rotation=%s | streams=%s | calibration_steps=%d",
+        config.enable_principal_rotation,
+        config.principal_rotation_streams,
+        config.principal_rotation_calibration_steps,
+    )
     logger.info("experiment_config=%s", asdict(config))
     log_layer_mappings(logger, nodes, model_specs, layer_mappings)
 
@@ -1998,7 +2366,7 @@ def run_eval(
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Task decomposition, logit-KL comparison, and synergy analysis are run automatically as part of the same execution."
+        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Source/target KV caches can be rotated into SVD principal coordinates before translation and inverse-rotated afterward. Task decomposition, logit-KL comparison, and synergy analysis are run automatically as part of the same execution."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
@@ -2027,6 +2395,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translator-heads", type=int, default=4)
     parser.add_argument("--translator-depth", type=int, default=2)
     parser.add_argument("--translator-mlp-ratio", type=int, default=1)
+    parser.add_argument(
+        "--disable-principal-rotation",
+        action="store_true",
+        help="Disable SVD principal-basis rotation before translation and inverse rotation after translation.",
+    )
+    parser.add_argument(
+        "--principal-rotation-streams",
+        choices=["k", "v", "kv"],
+        default="kv",
+        help="Which cache streams to rotate into principal coordinates before translation.",
+    )
+    parser.add_argument(
+        "--principal-rotation-calibration-steps",
+        type=int,
+        default=32,
+        help="Number of prefix batches used to estimate per-direction principal bases.",
+    )
 
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="float32")
@@ -2080,6 +2465,9 @@ def main() -> None:
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,
         translator_mlp_ratio=args.translator_mlp_ratio,
+        enable_principal_rotation=not args.disable_principal_rotation,
+        principal_rotation_streams=args.principal_rotation_streams,
+        principal_rotation_calibration_steps=args.principal_rotation_calibration_steps,
         device=args.device,
         dtype=args.dtype,
         eval_batch_size=args.eval_batch_size,
@@ -2144,6 +2532,7 @@ def main() -> None:
     print(f"Summary CSV: {summary_path}")
     print(f"Metric controls chart: {metric_controls_chart_path}")
     print(f"Control analysis metrics: {analysis_metrics_path}")
+    print(f"Principal rotation metadata: {build_principal_rotation_metadata_path(run_dir)}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
     print(f"Synergy chart: {synergy_chart_path}")
 
