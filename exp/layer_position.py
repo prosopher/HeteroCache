@@ -313,6 +313,170 @@ class F1Meter:
         }
 
 
+class ControlMetricMeter:
+    def __init__(self, metric_name: str) -> None:
+        self.metric_name = metric_name
+        self.native_sum = 0.0
+        self.dir_only_sum = 0.0
+        self.mag_only_sum = 0.0
+        self.full_mix_sum = 0.0
+        self.count = 0
+
+    def update(
+        self,
+        native_value: float,
+        dir_only_value: float,
+        mag_only_value: float,
+        full_mix_value: float,
+        n: int = 1,
+    ) -> None:
+        self.native_sum += float(native_value) * n
+        self.dir_only_sum += float(dir_only_value) * n
+        self.mag_only_sum += float(mag_only_value) * n
+        self.full_mix_sum += float(full_mix_value) * n
+        self.count += n
+
+    def summary(self) -> Dict[str, float]:
+        if self.count == 0:
+            return {
+                self.metric_name: float("nan"),
+                f"native_{self.metric_name}": float("nan"),
+                f"dir_only_{self.metric_name}": float("nan"),
+                f"mag_only_{self.metric_name}": float("nan"),
+                f"full_mix_{self.metric_name}": float("nan"),
+                "delta_dir_only": float("nan"),
+                "delta_mag_only": float("nan"),
+                "delta_full_mix": float("nan"),
+                "synergy": float("nan"),
+                "count": 0,
+            }
+        native_value = self.native_sum / self.count
+        dir_only_value = self.dir_only_sum / self.count
+        mag_only_value = self.mag_only_sum / self.count
+        full_mix_value = self.full_mix_sum / self.count
+        delta_dir_only = dir_only_value - native_value
+        delta_mag_only = mag_only_value - native_value
+        delta_full_mix = full_mix_value - native_value
+        synergy = delta_full_mix - (delta_dir_only + delta_mag_only)
+        return {
+            self.metric_name: full_mix_value,
+            f"native_{self.metric_name}": native_value,
+            f"dir_only_{self.metric_name}": dir_only_value,
+            f"mag_only_{self.metric_name}": mag_only_value,
+            f"full_mix_{self.metric_name}": full_mix_value,
+            "delta_dir_only": delta_dir_only,
+            "delta_mag_only": delta_mag_only,
+            "delta_full_mix": delta_full_mix,
+            "synergy": synergy,
+            "count": self.count,
+        }
+
+
+class LogitKLMeter:
+    def __init__(self) -> None:
+        self.native_to_dir_only_sum = 0.0
+        self.native_to_mag_only_sum = 0.0
+        self.native_to_full_mix_sum = 0.0
+        self.full_mix_to_dir_only_sum = 0.0
+        self.full_mix_to_mag_only_sum = 0.0
+        self.count = 0
+
+    def update(
+        self,
+        native_to_dir_only: float,
+        native_to_mag_only: float,
+        native_to_full_mix: float,
+        full_mix_to_dir_only: float,
+        full_mix_to_mag_only: float,
+        n: int = 1,
+    ) -> None:
+        self.native_to_dir_only_sum += float(native_to_dir_only) * n
+        self.native_to_mag_only_sum += float(native_to_mag_only) * n
+        self.native_to_full_mix_sum += float(native_to_full_mix) * n
+        self.full_mix_to_dir_only_sum += float(full_mix_to_dir_only) * n
+        self.full_mix_to_mag_only_sum += float(full_mix_to_mag_only) * n
+        self.count += n
+
+    def summary(self) -> Dict[str, float]:
+        if self.count == 0:
+            return {
+                "native_to_dir_only_logit_kl": float("nan"),
+                "native_to_mag_only_logit_kl": float("nan"),
+                "native_to_full_mix_logit_kl": float("nan"),
+                "full_mix_to_dir_only_logit_kl": float("nan"),
+                "full_mix_to_mag_only_logit_kl": float("nan"),
+                "count": 0,
+            }
+        return {
+            "native_to_dir_only_logit_kl": self.native_to_dir_only_sum / self.count,
+            "native_to_mag_only_logit_kl": self.native_to_mag_only_sum / self.count,
+            "native_to_full_mix_logit_kl": self.native_to_full_mix_sum / self.count,
+            "full_mix_to_dir_only_logit_kl": self.full_mix_to_dir_only_sum / self.count,
+            "full_mix_to_mag_only_logit_kl": self.full_mix_to_mag_only_sum / self.count,
+            "count": self.count,
+        }
+
+
+def rescale_block_to_reference_norm(source_block: torch.Tensor, reference_block: torch.Tensor) -> torch.Tensor:
+    if source_block.shape != reference_block.shape:
+        raise ValueError(
+            "Source/reference blocks must have identical shapes, "
+            f"got {tuple(source_block.shape)} vs {tuple(reference_block.shape)}"
+        )
+    source_norm = source_block.float().norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    reference_norm = reference_block.float().norm(dim=-1, keepdim=True)
+    scaled = source_block.float() * (reference_norm / source_norm)
+    return scaled.to(dtype=source_block.dtype)
+
+
+def build_direction_only_window(
+    translated_key_block: torch.Tensor,
+    translated_value_block: torch.Tensor,
+    native_key_block: torch.Tensor,
+    native_value_block: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return (
+        rescale_block_to_reference_norm(translated_key_block, native_key_block),
+        rescale_block_to_reference_norm(translated_value_block, native_value_block),
+    )
+
+
+def build_magnitude_only_window(
+    translated_key_block: torch.Tensor,
+    translated_value_block: torch.Tensor,
+    native_key_block: torch.Tensor,
+    native_value_block: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return (
+        rescale_block_to_reference_norm(native_key_block, translated_key_block),
+        rescale_block_to_reference_norm(native_value_block, translated_value_block),
+    )
+
+
+def compute_next_token_log_probs(
+    model: PreTrainedModel,
+    past_key_values: PastKeyValues,
+    seed_token: torch.Tensor,
+) -> torch.Tensor:
+    outputs = model(
+        input_ids=seed_token,
+        past_key_values=past_key_values,
+        use_cache=False,
+    )
+    return F.log_softmax(outputs.logits[:, -1, :].float(), dim=-1)
+
+
+def compute_logit_kl(reference_log_probs: torch.Tensor, candidate_log_probs: torch.Tensor) -> float:
+    if reference_log_probs.shape != candidate_log_probs.shape:
+        raise ValueError(
+            "Reference/candidate log-prob shapes must match, "
+            f"got {tuple(reference_log_probs.shape)} vs {tuple(candidate_log_probs.shape)}"
+        )
+    reference_probs = reference_log_probs.exp()
+    kl = torch.sum(reference_probs * (reference_log_probs - candidate_log_probs), dim=-1)
+    return float(kl.mean().item())
+
+
 class SimpleNamespaceConfig:
     def __init__(self, **kwargs: Any) -> None:
         self.__dict__.update(kwargs)
@@ -489,6 +653,31 @@ def layer_window_blocks_to_past(
         num_heads=num_heads,
         head_dim=head_dim,
     )
+
+
+def build_control_window_variants(
+    native_key_block: torch.Tensor,
+    native_value_block: torch.Tensor,
+    translated_key_block: torch.Tensor,
+    translated_value_block: torch.Tensor,
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    dir_only_key, dir_only_value = build_direction_only_window(
+        translated_key_block=translated_key_block,
+        translated_value_block=translated_value_block,
+        native_key_block=native_key_block,
+        native_value_block=native_value_block,
+    )
+    mag_only_key, mag_only_value = build_magnitude_only_window(
+        translated_key_block=translated_key_block,
+        translated_value_block=translated_value_block,
+        native_key_block=native_key_block,
+        native_value_block=native_value_block,
+    )
+    return {
+        "dir_only": (dir_only_key, dir_only_value),
+        "mag_only": (mag_only_key, mag_only_value),
+        "full_mix": (translated_key_block, translated_value_block),
+    }
 
 
 def require_gpt2_transformer(model: PreTrainedModel):
@@ -939,8 +1128,8 @@ def evaluate_logit_dataset(
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     edge_map = build_edge_map(edges)
-    path_metrics = {direction: AccuracyMeter() for direction in active_directions}
-    path_drift = {direction: DriftMeter() for direction in active_directions}
+    path_metrics = {direction: ControlMetricMeter("accuracy") for direction in active_directions}
+    path_logit_kl = {direction: LogitKLMeter() for direction in active_directions}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
@@ -957,11 +1146,11 @@ def evaluate_logit_dataset(
             candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec, example=example)
             gold_answer = example["answer"]
             prefix_input_ids = prefix["cache_ids"]
+            seed_token = prefix["seed_token"]
             past_by_node_id = {
                 node.id: extract_past_key_values(models[node.id], prefix_input_ids)
                 for node in nodes
             }
-            native_capture_by_target: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
 
             for direction in active_directions:
                 edge = edge_map[direction]
@@ -970,65 +1159,110 @@ def evaluate_logit_dataset(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                translated_capture = replay_target_prefill_with_capture(
+                native_target_past = past_by_node_id[edge.dst_id]
+                native_key_block, native_value_block = extract_layer_window_blocks(
+                    past_key_values=native_target_past,
+                    start_layer_idx=mapping.dst_layer_idx,
+                    num_layers=mapping.translated_num_layers,
+                )
+                control_windows = build_control_window_variants(
+                    native_key_block=native_key_block,
+                    native_value_block=native_value_block,
+                    translated_key_block=translated_key,
+                    translated_value_block=translated_value,
+                )
+                dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
-                    injected_key_block=translated_key,
-                    injected_value_block=translated_value,
+                    injected_key_block=control_windows["dir_only"][0],
+                    injected_value_block=control_windows["dir_only"][1],
                     dst_spec=model_specs[edge.dst_id],
                 )
-                mixed_target_past = translated_capture["past_key_values"]
-
-                native_capture_key = (edge.dst_id, mapping.dst_layer_end_idx)
-                native_capture = native_capture_by_target.get(native_capture_key)
-                if native_capture is None:
-                    native_capture = run_native_prefill_capture(
-                        target_model=models[edge.dst_id],
-                        prefix_input_ids=prefix_input_ids,
-                        capture_layer_idx=mapping.dst_layer_end_idx,
-                    )
-                    native_capture_by_target[native_capture_key] = native_capture
-
-                translated_scores = score_answer_choices(
-                    model=models[edge.dst_id],
-                    past_key_values=mixed_target_past,
-                    seed_token=prefix["seed_token"],
-                    choice_token_ids=candidate_token_ids,
-                    normalize_by_length=True,
+                mag_only_past = replay_target_prefill_with_injected_window(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=prefix_input_ids,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=control_windows["mag_only"][0],
+                    injected_value_block=control_windows["mag_only"][1],
+                    dst_spec=model_specs[edge.dst_id],
                 )
+                full_mix_past = replay_target_prefill_with_injected_window(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=prefix_input_ids,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=control_windows["full_mix"][0],
+                    injected_value_block=control_windows["full_mix"][1],
+                    dst_spec=model_specs[edge.dst_id],
+                )
+
                 native_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    seed_token=prefix["seed_token"],
+                    past_key_values=native_target_past,
+                    seed_token=seed_token,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+                dir_only_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=dir_only_past,
+                    seed_token=seed_token,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+                mag_only_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=mag_only_past,
+                    seed_token=seed_token,
+                    choice_token_ids=candidate_token_ids,
+                    normalize_by_length=True,
+                )
+                full_mix_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=full_mix_past,
+                    seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
 
-                translated_pred = predict_answer_label(translated_scores)
                 native_pred = predict_answer_label(native_scores)
+                dir_only_pred = predict_answer_label(dir_only_scores)
+                mag_only_pred = predict_answer_label(mag_only_scores)
+                full_mix_pred = predict_answer_label(full_mix_scores)
                 path_metrics[direction].update(
-                    accuracy_value=1.0 if translated_pred == gold_answer else 0.0,
-                    native_accuracy_value=1.0 if native_pred == gold_answer else 0.0,
+                    native_value=1.0 if native_pred == gold_answer else 0.0,
+                    dir_only_value=1.0 if dir_only_pred == gold_answer else 0.0,
+                    mag_only_value=1.0 if mag_only_pred == gold_answer else 0.0,
+                    full_mix_value=1.0 if full_mix_pred == gold_answer else 0.0,
                     n=1,
                 )
-                path_drift[direction].update(
-                    injected_cosine=compute_hidden_cosine(
-                        translated_capture["after_injected_window_hidden"],
-                        native_capture["after_injected_window_hidden"],
-                    ),
-                    injected_l2=compute_hidden_l2(
-                        translated_capture["after_injected_window_hidden"],
-                        native_capture["after_injected_window_hidden"],
-                    ),
-                    final_cosine=compute_hidden_cosine(
-                        translated_capture["final_hidden"],
-                        native_capture["final_hidden"],
-                    ),
-                    final_l2=compute_hidden_l2(
-                        translated_capture["final_hidden"],
-                        native_capture["final_hidden"],
-                    ),
+
+                native_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=native_target_past,
+                    seed_token=seed_token,
+                )
+                dir_only_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=dir_only_past,
+                    seed_token=seed_token,
+                )
+                mag_only_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=mag_only_past,
+                    seed_token=seed_token,
+                )
+                full_mix_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=full_mix_past,
+                    seed_token=seed_token,
+                )
+                path_logit_kl[direction].update(
+                    native_to_dir_only=compute_logit_kl(native_log_probs, dir_only_log_probs),
+                    native_to_mag_only=compute_logit_kl(native_log_probs, mag_only_log_probs),
+                    native_to_full_mix=compute_logit_kl(native_log_probs, full_mix_log_probs),
+                    full_mix_to_dir_only=compute_logit_kl(full_mix_log_probs, dir_only_log_probs),
+                    full_mix_to_mag_only=compute_logit_kl(full_mix_log_probs, mag_only_log_probs),
                     n=1,
                 )
 
@@ -1043,19 +1277,8 @@ def evaluate_logit_dataset(
             )
 
     summarized_metrics = {direction: meter.summary() for direction, meter in path_metrics.items()}
-    summarized_drift = {direction: meter.summary() for direction, meter in path_drift.items()}
-    return (
-        {
-            direction: {
-                "accuracy": row["accuracy"],
-                "native_accuracy": row["native_accuracy"],
-                "count": row["count"],
-            }
-            for direction, row in summarized_metrics.items()
-        },
-        {direction: row for direction, row in summarized_drift.items()},
-    )
-
+    summarized_logit_kl = {direction: meter.summary() for direction, meter in path_logit_kl.items()}
+    return summarized_metrics, summarized_logit_kl
 
 
 @torch.inference_mode()
@@ -1075,8 +1298,8 @@ def evaluate_generation_dataset(
     logger: logging.Logger,
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     edge_map = build_edge_map(edges)
-    path_metrics = {direction: F1Meter() for direction in active_directions}
-    path_drift = {direction: DriftMeter() for direction in active_directions}
+    path_metrics = {direction: ControlMetricMeter("f1") for direction in active_directions}
+    path_logit_kl = {direction: LogitKLMeter() for direction in active_directions}
     processed_examples = 0
 
     for batch_idx, batch in enumerate(dataloader, start=1):
@@ -1118,7 +1341,6 @@ def evaluate_generation_dataset(
                 node.id: extract_past_key_values(models[node.id], cache_input_ids)
                 for node in nodes
             }
-            native_capture_by_target: Dict[Tuple[str, int], Dict[str, torch.Tensor]] = {}
 
             for direction in active_directions:
                 edge = edge_map[direction]
@@ -1127,71 +1349,118 @@ def evaluate_generation_dataset(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
-                translated_capture = replay_target_prefill_with_capture(
+                native_target_past = past_by_node_id[edge.dst_id]
+                native_key_block, native_value_block = extract_layer_window_blocks(
+                    past_key_values=native_target_past,
+                    start_layer_idx=mapping.dst_layer_idx,
+                    num_layers=mapping.translated_num_layers,
+                )
+                control_windows = build_control_window_variants(
+                    native_key_block=native_key_block,
+                    native_value_block=native_value_block,
+                    translated_key_block=translated_key,
+                    translated_value_block=translated_value,
+                )
+                dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=cache_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
-                    injected_key_block=translated_key,
-                    injected_value_block=translated_value,
+                    injected_key_block=control_windows["dir_only"][0],
+                    injected_value_block=control_windows["dir_only"][1],
                     dst_spec=model_specs[edge.dst_id],
                 )
-                mixed_target_past = translated_capture["past_key_values"]
-
-                native_capture_key = (edge.dst_id, mapping.dst_layer_end_idx)
-                native_capture = native_capture_by_target.get(native_capture_key)
-                if native_capture is None:
-                    native_capture = run_native_prefill_capture(
-                        target_model=models[edge.dst_id],
-                        prefix_input_ids=cache_input_ids,
-                        capture_layer_idx=mapping.dst_layer_end_idx,
-                    )
-                    native_capture_by_target[native_capture_key] = native_capture
-
-                translated_answer = predict_generation_task_answer(
-                    spec=spec,
-                    model=models[edge.dst_id],
-                    tokenizer=tokenizer,
-                    past_key_values=mixed_target_past,
-                    seed_token=seed_token,
-                    eval_config=config,
-                    context=context_text,
-                    question_cache_ids=question_cache_ids,
+                mag_only_past = replay_target_prefill_with_injected_window(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=cache_input_ids,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=control_windows["mag_only"][0],
+                    injected_value_block=control_windows["mag_only"][1],
+                    dst_spec=model_specs[edge.dst_id],
                 )
+                full_mix_past = replay_target_prefill_with_injected_window(
+                    target_model=models[edge.dst_id],
+                    prefix_input_ids=cache_input_ids,
+                    target_start_layer_idx=mapping.dst_layer_idx,
+                    injected_key_block=control_windows["full_mix"][0],
+                    injected_value_block=control_windows["full_mix"][1],
+                    dst_spec=model_specs[edge.dst_id],
+                )
+
                 native_answer = predict_generation_task_answer(
                     spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    past_key_values=native_target_past,
+                    seed_token=seed_token,
+                    eval_config=config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
+                )
+                dir_only_answer = predict_generation_task_answer(
+                    spec=spec,
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=dir_only_past,
+                    seed_token=seed_token,
+                    eval_config=config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
+                )
+                mag_only_answer = predict_generation_task_answer(
+                    spec=spec,
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=mag_only_past,
+                    seed_token=seed_token,
+                    eval_config=config,
+                    context=context_text,
+                    question_cache_ids=question_cache_ids,
+                )
+                full_mix_answer = predict_generation_task_answer(
+                    spec=spec,
+                    model=models[edge.dst_id],
+                    tokenizer=tokenizer,
+                    past_key_values=full_mix_past,
                     seed_token=seed_token,
                     eval_config=config,
                     context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
 
-                f1 = compute_generation_f1(translated_answer, gold_answers)
-                native_f1 = compute_generation_f1(native_answer, gold_answers)
                 path_metrics[direction].update(
-                    f1_value=f1,
-                    native_f1_value=native_f1,
+                    native_value=compute_generation_f1(native_answer, gold_answers),
+                    dir_only_value=compute_generation_f1(dir_only_answer, gold_answers),
+                    mag_only_value=compute_generation_f1(mag_only_answer, gold_answers),
+                    full_mix_value=compute_generation_f1(full_mix_answer, gold_answers),
                     n=1,
                 )
-                path_drift[direction].update(
-                    injected_cosine=compute_hidden_cosine(
-                        translated_capture["after_injected_window_hidden"],
-                        native_capture["after_injected_window_hidden"],
-                    ),
-                    injected_l2=compute_hidden_l2(
-                        translated_capture["after_injected_window_hidden"],
-                        native_capture["after_injected_window_hidden"],
-                    ),
-                    final_cosine=compute_hidden_cosine(
-                        translated_capture["final_hidden"],
-                        native_capture["final_hidden"],
-                    ),
-                    final_l2=compute_hidden_l2(
-                        translated_capture["final_hidden"],
-                        native_capture["final_hidden"],
-                    ),
+
+                native_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=native_target_past,
+                    seed_token=seed_token,
+                )
+                dir_only_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=dir_only_past,
+                    seed_token=seed_token,
+                )
+                mag_only_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=mag_only_past,
+                    seed_token=seed_token,
+                )
+                full_mix_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=full_mix_past,
+                    seed_token=seed_token,
+                )
+                path_logit_kl[direction].update(
+                    native_to_dir_only=compute_logit_kl(native_log_probs, dir_only_log_probs),
+                    native_to_mag_only=compute_logit_kl(native_log_probs, mag_only_log_probs),
+                    native_to_full_mix=compute_logit_kl(native_log_probs, full_mix_log_probs),
+                    full_mix_to_dir_only=compute_logit_kl(full_mix_log_probs, dir_only_log_probs),
+                    full_mix_to_mag_only=compute_logit_kl(full_mix_log_probs, mag_only_log_probs),
                     n=1,
                 )
 
@@ -1206,19 +1475,8 @@ def evaluate_generation_dataset(
             )
 
     summarized_metrics = {direction: meter.summary() for direction, meter in path_metrics.items()}
-    summarized_drift = {direction: meter.summary() for direction, meter in path_drift.items()}
-    return (
-        {
-            direction: {
-                "f1": row["f1"],
-                "native_f1": row["native_f1"],
-                "count": row["count"],
-            }
-            for direction, row in summarized_metrics.items()
-        },
-        {direction: row for direction, row in summarized_drift.items()},
-    )
-
+    summarized_logit_kl = {direction: meter.summary() for direction, meter in path_logit_kl.items()}
+    return summarized_metrics, summarized_logit_kl
 
 def compute_average_metric(
     logit_results: Dict[str, Dict[str, Dict[str, float]]],
@@ -1248,66 +1506,22 @@ class SummaryRow:
     target_layer_end_idx: int
     average_metric: float
     average_native_metric: float
-    injected_cosine: float
-    injected_l2: float
-    final_cosine: float
-    final_l2: float
+    average_dir_only_metric: float
+    average_mag_only_metric: float
+    average_full_mix_metric: float
+    average_delta_dir_only: float
+    average_delta_mag_only: float
+    average_delta_full_mix: float
+    average_synergy: float
+    average_native_to_dir_only_logit_kl: float
+    average_native_to_mag_only_logit_kl: float
+    average_native_to_full_mix_logit_kl: float
+    average_full_mix_to_dir_only_logit_kl: float
+    average_full_mix_to_mag_only_logit_kl: float
     run_dir: str
-
-
-class DriftMeter:
-    def __init__(self) -> None:
-        self.injected_cosine_sum = 0.0
-        self.injected_l2_sum = 0.0
-        self.final_cosine_sum = 0.0
-        self.final_l2_sum = 0.0
-        self.count = 0
-
-    def update(
-        self,
-        injected_cosine: float,
-        injected_l2: float,
-        final_cosine: float,
-        final_l2: float,
-        n: int = 1,
-    ) -> None:
-        self.injected_cosine_sum += float(injected_cosine) * n
-        self.injected_l2_sum += float(injected_l2) * n
-        self.final_cosine_sum += float(final_cosine) * n
-        self.final_l2_sum += float(final_l2) * n
-        self.count += n
-
-    def summary(self) -> Dict[str, float]:
-        if self.count == 0:
-            return {
-                "injected_cosine": float("nan"),
-                "injected_l2": float("nan"),
-                "final_cosine": float("nan"),
-                "final_l2": float("nan"),
-                "count": 0,
-            }
-        return {
-            "injected_cosine": self.injected_cosine_sum / self.count,
-            "injected_l2": self.injected_l2_sum / self.count,
-            "final_cosine": self.final_cosine_sum / self.count,
-            "final_l2": self.final_l2_sum / self.count,
-            "count": self.count,
-        }
-
-def build_drift_metrics_path(run_dir: Path) -> Path:
-    return run_dir / "drift_metrics.json"
-
 
 def build_summary_csv_path(study_dir: Path) -> Path:
     return study_dir / "summary.csv"
-
-
-def build_drift_cosine_chart_path(study_dir: Path) -> Path:
-    return study_dir / "drift_cosine.png"
-
-
-def build_drift_l2_chart_path(study_dir: Path) -> Path:
-    return study_dir / "drift_l2.png"
 
 
 def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
@@ -1321,122 +1535,6 @@ def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
     raise ValueError(f"Unsupported benchmark_mode: {benchmark_mode}")
 
 
-@torch.inference_mode()
-def run_native_prefill_capture(
-    target_model: PreTrainedModel,
-    prefix_input_ids: torch.Tensor,
-    capture_layer_idx: int,
-) -> Dict[str, torch.Tensor]:
-    transformer = require_gpt2_transformer(target_model)
-    if not (0 <= capture_layer_idx < len(transformer.h)):
-        raise ValueError(f"capture_layer_idx={capture_layer_idx} must be in [0, {len(transformer.h) - 1}]")
-
-    hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-    after_capture_hidden = None
-    for layer_idx, block in enumerate(transformer.h):
-        hidden_states, _ = run_gpt2_block_with_cache(block, hidden_states)
-        if layer_idx == capture_layer_idx:
-            after_capture_hidden = hidden_states.detach().clone()
-
-    if after_capture_hidden is None:
-        raise RuntimeError("Failed to capture native hidden states at the requested layer")
-
-    final_hidden = hidden_states
-    if getattr(transformer, "ln_f", None) is not None:
-        final_hidden = transformer.ln_f(final_hidden)
-
-    return {
-        "after_injected_window_hidden": after_capture_hidden,
-        "final_hidden": final_hidden.detach().clone(),
-    }
-
-
-@torch.inference_mode()
-def replay_target_prefill_with_capture(
-    target_model: PreTrainedModel,
-    prefix_input_ids: torch.Tensor,
-    target_start_layer_idx: int,
-    injected_key_block: torch.Tensor,
-    injected_value_block: torch.Tensor,
-    dst_spec: ModelSpec,
-) -> Dict[str, Any]:
-    injected_window = layer_window_blocks_to_past(
-        injected_key_block,
-        injected_value_block,
-        dst_spec.num_heads,
-        dst_spec.head_dim,
-    )
-    translated_num_layers = len(injected_window)
-
-    transformer = require_gpt2_transformer(target_model)
-    target_end_layer_idx = target_start_layer_idx + translated_num_layers - 1
-    if not (0 <= target_start_layer_idx < len(transformer.h)):
-        raise ValueError(f"target_start_layer_idx={target_start_layer_idx} must be in [0, {len(transformer.h) - 1}]")
-    if target_end_layer_idx >= len(transformer.h):
-        raise ValueError(
-            f"Injected window ending at layer {target_end_layer_idx} exceeds target stack with {len(transformer.h)} layers"
-        )
-
-    hidden_states = build_gpt2_input_hidden_states(target_model, prefix_input_ids)
-    rebuilt_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
-    for lower_idx in range(target_start_layer_idx):
-        hidden_states, present = run_gpt2_block_with_cache(transformer.h[lower_idx], hidden_states)
-        rebuilt_past.append((present[0].detach(), present[1].detach()))
-
-    after_injected_window_hidden = None
-    for offset, injected_present in enumerate(injected_window):
-        layer_idx = target_start_layer_idx + offset
-        hidden_states, present = run_gpt2_block_with_injected_layer(
-            transformer.h[layer_idx],
-            hidden_states,
-            injected_present[0],
-            injected_present[1],
-        )
-        rebuilt_past.append((present[0].detach(), present[1].detach()))
-        if layer_idx == target_end_layer_idx:
-            after_injected_window_hidden = hidden_states.detach().clone()
-
-    if after_injected_window_hidden is None:
-        raise RuntimeError("Failed to capture hidden states after the injected layer window")
-
-    for upper_idx in range(target_end_layer_idx + 1, len(transformer.h)):
-        hidden_states, present = run_gpt2_block_with_cache(transformer.h[upper_idx], hidden_states)
-        rebuilt_past.append((present[0].detach(), present[1].detach()))
-
-    final_hidden = hidden_states
-    if getattr(transformer, "ln_f", None) is not None:
-        final_hidden = transformer.ln_f(final_hidden)
-
-    return {
-        "past_key_values": tuple(rebuilt_past),
-        "after_injected_window_hidden": after_injected_window_hidden,
-        "final_hidden": final_hidden.detach().clone(),
-    }
-
-
-def compute_hidden_cosine(hidden_a: torch.Tensor, hidden_b: torch.Tensor) -> float:
-    if hidden_a.shape != hidden_b.shape:
-        raise ValueError(f"Hidden shapes must match, got {tuple(hidden_a.shape)} vs {tuple(hidden_b.shape)}")
-    hidden_a = hidden_a.float()
-    hidden_b = hidden_b.float()
-    flat_a = hidden_a.reshape(-1, hidden_a.shape[-1])
-    flat_b = hidden_b.reshape(-1, hidden_b.shape[-1])
-    cosine = F.cosine_similarity(flat_a, flat_b, dim=-1)
-    return float(cosine.mean().item())
-
-
-def compute_hidden_l2(hidden_a: torch.Tensor, hidden_b: torch.Tensor) -> float:
-    if hidden_a.shape != hidden_b.shape:
-        raise ValueError(f"Hidden shapes must match, got {tuple(hidden_a.shape)} vs {tuple(hidden_b.shape)}")
-    hidden_a = hidden_a.float()
-    hidden_b = hidden_b.float()
-    l2 = (hidden_a - hidden_b).pow(2).sum(dim=-1).sqrt()
-    return float(l2.mean().item())
-
-
-
-
 def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
     metric_name = str(combined_metrics["metric_name"])
     dataset_results_key = "dataset_accuracies" if metric_name == "accuracy" else "dataset_f1"
@@ -1447,20 +1545,33 @@ def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
         dataset_results_key: combined_metrics[dataset_results_key],
         "average_metric": combined_metrics["average_metric"],
         "average_native_metric": combined_metrics["average_native_metric"],
+        "average_dir_only_metric": combined_metrics["average_dir_only_metric"],
+        "average_mag_only_metric": combined_metrics["average_mag_only_metric"],
+        "average_full_mix_metric": combined_metrics["average_full_mix_metric"],
+        "average_delta_dir_only": combined_metrics["average_delta_dir_only"],
+        "average_delta_mag_only": combined_metrics["average_delta_mag_only"],
+        "average_delta_full_mix": combined_metrics["average_delta_full_mix"],
+        "average_synergy": combined_metrics["average_synergy"],
         f"average_{metric_name}": combined_metrics[f"average_{metric_name}"],
         f"average_native_{metric_name}": combined_metrics[f"average_native_{metric_name}"],
     }
 
 
-def extract_drift_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
+def extract_analysis_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "benchmark_mode": combined_metrics["benchmark_mode"],
+        "metric_name": combined_metrics["metric_name"],
         "layer_mappings": combined_metrics["layer_mappings"],
-        "dataset_drift": combined_metrics["dataset_drift"],
-        "average_injected_cosine": combined_metrics["average_injected_cosine"],
-        "average_injected_l2": combined_metrics["average_injected_l2"],
-        "average_final_cosine": combined_metrics["average_final_cosine"],
-        "average_final_l2": combined_metrics["average_final_l2"],
+        "dataset_logit_kl": combined_metrics["dataset_logit_kl"],
+        "average_native_to_dir_only_logit_kl": combined_metrics["average_native_to_dir_only_logit_kl"],
+        "average_native_to_mag_only_logit_kl": combined_metrics["average_native_to_mag_only_logit_kl"],
+        "average_native_to_full_mix_logit_kl": combined_metrics["average_native_to_full_mix_logit_kl"],
+        "average_full_mix_to_dir_only_logit_kl": combined_metrics["average_full_mix_to_dir_only_logit_kl"],
+        "average_full_mix_to_mag_only_logit_kl": combined_metrics["average_full_mix_to_mag_only_logit_kl"],
+        "average_delta_dir_only": combined_metrics["average_delta_dir_only"],
+        "average_delta_mag_only": combined_metrics["average_delta_mag_only"],
+        "average_delta_full_mix": combined_metrics["average_delta_full_mix"],
+        "average_synergy": combined_metrics["average_synergy"],
     }
 
 
@@ -1482,45 +1593,42 @@ def build_summary_row(
         target_layer_end_idx=int(reference_mapping["dst_layer_end_idx"]),
         average_metric=float(metrics["average_metric"]),
         average_native_metric=float(metrics["average_native_metric"]),
-        injected_cosine=float(metrics["average_injected_cosine"]),
-        injected_l2=float(metrics["average_injected_l2"]),
-        final_cosine=float(metrics["average_final_cosine"]),
-        final_l2=float(metrics["average_final_l2"]),
+        average_dir_only_metric=float(metrics["average_dir_only_metric"]),
+        average_mag_only_metric=float(metrics["average_mag_only_metric"]),
+        average_full_mix_metric=float(metrics["average_full_mix_metric"]),
+        average_delta_dir_only=float(metrics["average_delta_dir_only"]),
+        average_delta_mag_only=float(metrics["average_delta_mag_only"]),
+        average_delta_full_mix=float(metrics["average_delta_full_mix"]),
+        average_synergy=float(metrics["average_synergy"]),
+        average_native_to_dir_only_logit_kl=float(metrics["average_native_to_dir_only_logit_kl"]),
+        average_native_to_mag_only_logit_kl=float(metrics["average_native_to_mag_only_logit_kl"]),
+        average_native_to_full_mix_logit_kl=float(metrics["average_native_to_full_mix_logit_kl"]),
+        average_full_mix_to_dir_only_logit_kl=float(metrics["average_full_mix_to_dir_only_logit_kl"]),
+        average_full_mix_to_mag_only_logit_kl=float(metrics["average_full_mix_to_mag_only_logit_kl"]),
         run_dir=str(run_dir),
     )
-
 
 def read_summary_rows(summary_path: Path) -> List[SummaryRow]:
     rows: List[SummaryRow] = []
     if not summary_path.exists():
         return rows
+    field_names = SummaryRow.__dataclass_fields__
     with summary_path.open("r", encoding="utf-8", newline="") as fp:
         for existing in csv.DictReader(fp):
             try:
-                rows.append(
-                    SummaryRow(
-                        study_id=existing.get("study_id", ""),
-                        benchmark_mode=existing["benchmark_mode"],
-                        metric_name=existing["metric_name"],
-                        position_layer_idx=int(existing["position_layer_idx"]),
-                        translated_num_layers=int(existing["translated_num_layers"]),
-                        source_layer_idx=int(existing["source_layer_idx"]),
-                        source_layer_end_idx=int(existing["source_layer_end_idx"]),
-                        target_layer_idx=int(existing["target_layer_idx"]),
-                        target_layer_end_idx=int(existing["target_layer_end_idx"]),
-                        average_metric=float(existing["average_metric"]),
-                        average_native_metric=float(existing["average_native_metric"]),
-                        injected_cosine=float(existing["injected_cosine"]),
-                        injected_l2=float(existing["injected_l2"]),
-                        final_cosine=float(existing["final_cosine"]),
-                        final_l2=float(existing["final_l2"]),
-                        run_dir=existing["run_dir"],
-                    )
-                )
+                payload = {}
+                for field_name, field_def in field_names.items():
+                    raw_value = existing[field_name]
+                    if field_def.type is int:
+                        payload[field_name] = int(raw_value)
+                    elif field_def.type is float:
+                        payload[field_name] = float(raw_value)
+                    else:
+                        payload[field_name] = raw_value
+                rows.append(SummaryRow(**payload))
             except (KeyError, ValueError):
                 continue
     return rows
-
 
 def write_summary(study_dir: Path, rows: List[SummaryRow]) -> Path:
     summary_path = build_summary_csv_path(study_dir)
@@ -1563,7 +1671,58 @@ def annotate_injected_layer_ranges(ax, rows: List[Any], y_getter) -> None:
         )
 
 
-def plot_drift_summary(summary_path: Path) -> Tuple[Path, Path]:
+def build_analysis_metrics_path(run_dir: Path) -> Path:
+    return run_dir / "control_analysis_metrics.json"
+
+
+def build_metric_controls_chart_path(study_dir: Path, metric_name: str) -> Path:
+    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}_controls.png"
+
+
+def build_logit_kl_chart_path(study_dir: Path) -> Path:
+    return study_dir / "layer_idx_vs_logit_kl.png"
+
+
+def build_synergy_chart_path(study_dir: Path) -> Path:
+    return study_dir / "layer_idx_vs_synergy.png"
+
+
+def plot_metric_controls_summary(summary_path: Path) -> Path:
+    rows = read_summary_rows(summary_path)
+    if not rows:
+        raise ValueError(f"No plottable rows found in {summary_path}")
+
+    rows.sort(key=lambda row: row.position_layer_idx)
+    x_values = [row.position_layer_idx for row in rows]
+    metric_name = rows[0].metric_name or "metric"
+    metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
+    window_title = format_window_title(rows[0].translated_num_layers)
+    study_dir = summary_path.parent
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(9, 5.2))
+    ax = fig.add_subplot(111)
+    ax.plot(x_values, [row.average_native_metric for row in rows], marker="o", label=f"Native {metric_label}")
+    ax.plot(x_values, [row.average_dir_only_metric for row in rows], marker="s", label=f"Dir-only {metric_label}")
+    ax.plot(x_values, [row.average_mag_only_metric for row in rows], marker="^", label=f"Mag-only {metric_label}")
+    ax.plot(x_values, [row.average_full_mix_metric for row in rows], marker="D", label=f"Full-mix {metric_label}")
+    annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_metric)
+    ax.set_xlabel("Reference target layer index")
+    ax.set_ylabel(metric_label)
+    ax.set_title(f"{metric_label} decomposition vs layer index ({window_title})")
+    ax.set_xticks(x_values)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    chart_path = build_metric_controls_chart_path(study_dir, metric_name)
+    fig.savefig(chart_path, dpi=200)
+    plt.close(fig)
+    return chart_path
+
+
+def plot_logit_kl_summary(summary_path: Path) -> Path:
     rows = read_summary_rows(summary_path)
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
@@ -1575,57 +1734,97 @@ def plot_drift_summary(summary_path: Path) -> Tuple[Path, Path]:
 
     import matplotlib.pyplot as plt
 
-    cosine_fig = plt.figure(figsize=(9, 5.2))
-    cosine_ax = cosine_fig.add_subplot(111)
-    cosine_ax.plot(x_values, [row.injected_cosine for row in rows], marker="o", label="Injected window end")
-    cosine_ax.plot(x_values, [row.final_cosine for row in rows], marker="s", label="Final layer")
-    annotate_injected_layer_ranges(cosine_ax, rows, lambda row: row.injected_cosine)
-    cosine_ax.set_xlabel("Reference target layer index")
-    cosine_ax.set_ylabel("Cosine similarity")
-    cosine_ax.set_title(f"Drift cosine vs layer index ({window_title})")
-    cosine_ax.set_xticks(x_values)
-    cosine_ax.grid(True, alpha=0.3)
-    cosine_ax.legend()
-    cosine_fig.tight_layout()
-    cosine_path = build_drift_cosine_chart_path(study_dir)
-    cosine_fig.savefig(cosine_path, dpi=200)
-    plt.close(cosine_fig)
+    fig = plt.figure(figsize=(9, 5.2))
+    ax = fig.add_subplot(111)
+    ax.plot(x_values, [row.average_native_to_dir_only_logit_kl for row in rows], marker="o", label="KL(native || dir-only)")
+    ax.plot(x_values, [row.average_native_to_mag_only_logit_kl for row in rows], marker="s", label="KL(native || mag-only)")
+    ax.plot(x_values, [row.average_native_to_full_mix_logit_kl for row in rows], marker="^", label="KL(native || full-mix)")
+    ax.plot(x_values, [row.average_full_mix_to_dir_only_logit_kl for row in rows], marker="x", label="KL(full-mix || dir-only)")
+    ax.plot(x_values, [row.average_full_mix_to_mag_only_logit_kl for row in rows], marker="d", label="KL(full-mix || mag-only)")
+    ax.set_xlabel("Reference target layer index")
+    ax.set_ylabel("KL divergence")
+    ax.set_title(f"Logit KL comparison vs layer index ({window_title})")
+    ax.set_xticks(x_values)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
 
-    l2_fig = plt.figure(figsize=(9, 5.2))
-    l2_ax = l2_fig.add_subplot(111)
-    l2_ax.plot(x_values, [row.injected_l2 for row in rows], marker="o", label="Injected window end")
-    l2_ax.plot(x_values, [row.final_l2 for row in rows], marker="s", label="Final layer")
-    annotate_injected_layer_ranges(l2_ax, rows, lambda row: row.injected_l2)
-    l2_ax.set_xlabel("Reference target layer index")
-    l2_ax.set_ylabel("L2 distance")
-    l2_ax.set_title(f"Drift L2 vs layer index ({window_title})")
-    l2_ax.set_xticks(x_values)
-    l2_ax.grid(True, alpha=0.3)
-    l2_ax.legend()
-    l2_fig.tight_layout()
-    l2_path = build_drift_l2_chart_path(study_dir)
-    l2_fig.savefig(l2_path, dpi=200)
-    plt.close(l2_fig)
+    chart_path = build_logit_kl_chart_path(study_dir)
+    fig.savefig(chart_path, dpi=200)
+    plt.close(fig)
+    return chart_path
 
-    return cosine_path, l2_path
+
+def plot_synergy_summary(summary_path: Path) -> Path:
+    rows = read_summary_rows(summary_path)
+    if not rows:
+        raise ValueError(f"No plottable rows found in {summary_path}")
+
+    rows.sort(key=lambda row: row.position_layer_idx)
+    x_values = [row.position_layer_idx for row in rows]
+    window_title = format_window_title(rows[0].translated_num_layers)
+    study_dir = summary_path.parent
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(9, 5.2))
+    ax = fig.add_subplot(111)
+    ax.plot(x_values, [row.average_synergy for row in rows], marker="o", label="Synergy")
+    annotate_injected_layer_ranges(ax, rows, lambda row: row.average_synergy)
+    ax.axhline(0.0, linestyle="--", linewidth=1.2)
+    ax.set_xlabel("Reference target layer index")
+    ax.set_ylabel("Synergy score")
+    ax.set_title(f"Synergy vs layer index ({window_title})")
+    ax.set_xticks(x_values)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    chart_path = build_synergy_chart_path(study_dir)
+    fig.savefig(chart_path, dpi=200)
+    plt.close(fig)
+    return chart_path
 
 
 def remove_stale_summary_artifacts(study_dir: Path, run_dir: Path) -> None:
     stale_paths = [
         run_dir / "eval_summary.md",
+        run_dir / "drift_metrics.json",
+        run_dir / "control_analysis_metrics.json",
         study_dir / "drift_summary.md",
         study_dir / "study_summary.csv",
         study_dir / "drift_summary.csv",
+        study_dir / "drift_cosine.png",
+        study_dir / "drift_l2.png",
     ]
     for stale_path in stale_paths:
         if stale_path.exists():
             stale_path.unlink()
 
 
-def save_drift_artifacts(run_dir: Path, metrics: Dict[str, Any]) -> Path:
-    write_json(str(build_drift_metrics_path(run_dir)), metrics)
-    return build_drift_metrics_path(run_dir)
+def save_analysis_artifacts(run_dir: Path, metrics: Dict[str, Any]) -> Path:
+    write_json(str(build_analysis_metrics_path(run_dir)), metrics)
+    return build_analysis_metrics_path(run_dir)
 
+
+def save_run_artifacts(
+    config: LayerPositionConfig,
+    run_dir: Path,
+    layer_mappings: Dict[str, LayerMapping],
+    eval_metrics: Dict[str, Any],
+    combined_metrics: Dict[str, Any],
+) -> Tuple[Path, Path, Path, Path, Path]:
+    study_dir = run_dir.parent
+    study_dir.mkdir(parents=True, exist_ok=True)
+    remove_stale_summary_artifacts(study_dir, run_dir)
+    write_json(str(build_config_path(run_dir)), asdict(config))
+    write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
+    write_json(str(build_metrics_path(run_dir)), eval_metrics)
+    summary_path = update_summary(config, run_dir, combined_metrics)
+    metric_controls_chart_path = plot_metric_controls_summary(summary_path)
+    logit_kl_chart_path = plot_logit_kl_summary(summary_path)
+    synergy_chart_path = plot_synergy_summary(summary_path)
+    return summary_path, build_metrics_path(run_dir), metric_controls_chart_path, logit_kl_chart_path, synergy_chart_path
 
 def run_eval(
     config: LayerPositionConfig,
@@ -1658,7 +1857,7 @@ def run_eval(
     )
 
     dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
-    dataset_drift_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
+    dataset_logit_kl_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     if config.benchmark_mode == "qa_accuracy":
         metric_name = "accuracy"
@@ -1667,19 +1866,12 @@ def run_eval(
         dataset_evaluator = evaluate_logit_dataset
         dataloader_builder = build_eval_dataloader
         progress_log_template = (
-            "[%s] %s | accuracy=%.6f | native_accuracy=%.6f | injected_cosine=%.6f | "
-            "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
+            "[%s] %s | native_%s=%.6f | dir_only_%s=%.6f | mag_only_%s=%.6f | "
+            "full_mix_%s=%.6f | delta_dir_only=%.6f | delta_mag_only=%.6f | "
+            "delta_full_mix=%.6f | synergy=%.6f | kl(native||dir)=%.6f | "
+            "kl(native||mag)=%.6f | kl(native||full)=%.6f | kl(full||dir)=%.6f | "
+            "kl(full||mag)=%.6f | count=%d"
         )
-    # Disabled intentionally for now; preserved as commented code rather than deleted.
-    # elif config.benchmark_mode == "squad_f1":
-    #     metric_name = "f1"
-    #     dataset_results_key = "dataset_f1"
-    #     dataset_specs = SQUAD_DATASET_SPECS
-    #     dataset_evaluator = evaluate_generation_dataset
-    #     progress_log_template = (
-    #         "[%s] %s | f1=%.6f | native_f1=%.6f | injected_cosine=%.6f | "
-    #         "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
-    #     )
     elif config.benchmark_mode == "multinews_f1":
         metric_name = "f1"
         dataset_results_key = "dataset_f1"
@@ -1687,15 +1879,18 @@ def run_eval(
         dataset_evaluator = evaluate_generation_dataset
         dataloader_builder = build_generation_eval_dataloader
         progress_log_template = (
-            "[%s] %s | f1=%.6f | native_f1=%.6f | injected_cosine=%.6f | "
-            "injected_l2=%.6f | final_cosine=%.6f | final_l2=%.6f | count=%d"
+            "[%s] %s | native_%s=%.6f | dir_only_%s=%.6f | mag_only_%s=%.6f | "
+            "full_mix_%s=%.6f | delta_dir_only=%.6f | delta_mag_only=%.6f | "
+            "delta_full_mix=%.6f | synergy=%.6f | kl(native||dir)=%.6f | "
+            "kl(native||mag)=%.6f | kl(native||full)=%.6f | kl(full||dir)=%.6f | "
+            "kl(full||mag)=%.6f | count=%d"
         )
     else:
         raise ValueError(f"Unsupported benchmark_mode: {config.benchmark_mode}")
 
     for spec in dataset_specs:
         dataloader = dataloader_builder(spec=spec, eval_config=eval_config)
-        dataset_results, dataset_drift = dataset_evaluator(
+        dataset_results, dataset_logit_kl = dataset_evaluator(
             spec=spec,
             dataloader=dataloader,
             tokenizer=tokenizer,
@@ -1709,20 +1904,27 @@ def run_eval(
             logger=logger,
         )
         dataset_results_by_name[spec.name_for_log] = dataset_results
-        dataset_drift_by_name[spec.name_for_log] = dataset_drift
+        dataset_logit_kl_by_name[spec.name_for_log] = dataset_logit_kl
         for direction in active_directions:
             metric_row = dataset_results[direction]
-            drift_row = dataset_drift[direction]
+            logit_row = dataset_logit_kl[direction]
             logger.info(
                 progress_log_template,
                 spec.name_for_log,
                 direction,
-                metric_row[metric_name],
-                metric_row[f"native_{metric_name}"],
-                drift_row["injected_cosine"],
-                drift_row["injected_l2"],
-                drift_row["final_cosine"],
-                drift_row["final_l2"],
+                metric_name, metric_row[f"native_{metric_name}"],
+                metric_name, metric_row[f"dir_only_{metric_name}"],
+                metric_name, metric_row[f"mag_only_{metric_name}"],
+                metric_name, metric_row[f"full_mix_{metric_name}"],
+                metric_row["delta_dir_only"],
+                metric_row["delta_mag_only"],
+                metric_row["delta_full_mix"],
+                metric_row["synergy"],
+                logit_row["native_to_dir_only_logit_kl"],
+                logit_row["native_to_mag_only_logit_kl"],
+                logit_row["native_to_full_mix_logit_kl"],
+                logit_row["full_mix_to_dir_only_logit_kl"],
+                logit_row["full_mix_to_mag_only_logit_kl"],
                 int(metric_row["count"]),
             )
         if torch.cuda.is_available():
@@ -1730,117 +1932,73 @@ def run_eval(
 
     average_metric = compute_average_metric(dataset_results_by_name, metric_name)
     average_native_metric = compute_average_metric(dataset_results_by_name, f"native_{metric_name}")
-    average_injected_cosine = compute_average_metric(dataset_drift_by_name, "injected_cosine")
-    average_injected_l2 = compute_average_metric(dataset_drift_by_name, "injected_l2")
-    average_final_cosine = compute_average_metric(dataset_drift_by_name, "final_cosine")
-    average_final_l2 = compute_average_metric(dataset_drift_by_name, "final_l2")
+    average_dir_only_metric = compute_average_metric(dataset_results_by_name, f"dir_only_{metric_name}")
+    average_mag_only_metric = compute_average_metric(dataset_results_by_name, f"mag_only_{metric_name}")
+    average_full_mix_metric = compute_average_metric(dataset_results_by_name, f"full_mix_{metric_name}")
+    average_delta_dir_only = compute_average_metric(dataset_results_by_name, "delta_dir_only")
+    average_delta_mag_only = compute_average_metric(dataset_results_by_name, "delta_mag_only")
+    average_delta_full_mix = compute_average_metric(dataset_results_by_name, "delta_full_mix")
+    average_synergy = compute_average_metric(dataset_results_by_name, "synergy")
+    average_native_to_dir_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_dir_only_logit_kl")
+    average_native_to_mag_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_mag_only_logit_kl")
+    average_native_to_full_mix_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_full_mix_logit_kl")
+    average_full_mix_to_dir_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "full_mix_to_dir_only_logit_kl")
+    average_full_mix_to_mag_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "full_mix_to_mag_only_logit_kl")
 
     logger.info(
-        "[Summary] metric=%s | average_metric=%.6f | average_native_metric=%.6f",
+        "[Summary] metric=%s | native=%.6f | dir_only=%.6f | mag_only=%.6f | full_mix=%.6f",
         metric_name,
-        average_metric,
         average_native_metric,
+        average_dir_only_metric,
+        average_mag_only_metric,
+        average_full_mix_metric,
     )
     logger.info(
-        "[Summary] avg_injected_cosine=%.6f | avg_injected_l2=%.6f | avg_final_cosine=%.6f | avg_final_l2=%.6f",
-        average_injected_cosine,
-        average_injected_l2,
-        average_final_cosine,
-        average_final_l2,
+        "[Summary] delta_dir_only=%.6f | delta_mag_only=%.6f | delta_full_mix=%.6f | synergy=%.6f",
+        average_delta_dir_only,
+        average_delta_mag_only,
+        average_delta_full_mix,
+        average_synergy,
+    )
+    logger.info(
+        "[Summary] avg_kl(native||dir)=%.6f | avg_kl(native||mag)=%.6f | avg_kl(native||full)=%.6f | avg_kl(full||dir)=%.6f | avg_kl(full||mag)=%.6f",
+        average_native_to_dir_only_logit_kl,
+        average_native_to_mag_only_logit_kl,
+        average_native_to_full_mix_logit_kl,
+        average_full_mix_to_dir_only_logit_kl,
+        average_full_mix_to_mag_only_logit_kl,
     )
     return {
         "benchmark_mode": config.benchmark_mode,
         "metric_name": metric_name,
         "layer_mappings": {direction: asdict(mapping) for direction, mapping in layer_mappings.items()},
         dataset_results_key: dataset_results_by_name,
-        "average_metric": average_metric,
+        "average_metric": average_full_mix_metric,
         "average_native_metric": average_native_metric,
-        f"average_{metric_name}": average_metric,
+        "average_dir_only_metric": average_dir_only_metric,
+        "average_mag_only_metric": average_mag_only_metric,
+        "average_full_mix_metric": average_full_mix_metric,
+        "average_delta_dir_only": average_delta_dir_only,
+        "average_delta_mag_only": average_delta_mag_only,
+        "average_delta_full_mix": average_delta_full_mix,
+        "average_synergy": average_synergy,
+        f"average_{metric_name}": average_full_mix_metric,
         f"average_native_{metric_name}": average_native_metric,
-        "dataset_drift": dataset_drift_by_name,
-        "average_injected_cosine": average_injected_cosine,
-        "average_injected_l2": average_injected_l2,
-        "average_final_cosine": average_final_cosine,
-        "average_final_l2": average_final_l2,
+        "dataset_logit_kl": dataset_logit_kl_by_name,
+        "average_native_to_dir_only_logit_kl": average_native_to_dir_only_logit_kl,
+        "average_native_to_mag_only_logit_kl": average_native_to_mag_only_logit_kl,
+        "average_native_to_full_mix_logit_kl": average_native_to_full_mix_logit_kl,
+        "average_full_mix_to_dir_only_logit_kl": average_full_mix_to_dir_only_logit_kl,
+        "average_full_mix_to_mag_only_logit_kl": average_full_mix_to_mag_only_logit_kl,
     }
 
-
-
-
-def plot_study_summary(summary_path: Path) -> Path:
-    rows = read_summary_rows(summary_path)
-    if not rows:
-        raise ValueError(f"No plottable rows found in {summary_path}")
-
-    rows.sort(key=lambda item: int(item.position_layer_idx))
-    x_values = [int(item.position_layer_idx) for item in rows]
-    y_values = [float(item.average_metric) for item in rows]
-    native_values = [float(item.average_native_metric) for item in rows]
-    average_native_metric = sum(native_values) / len(native_values) if native_values else float("nan")
-    metric_name = rows[0].metric_name or "metric"
-    metric_label = metric_name.upper() if metric_name == "f1" else metric_name.capitalize()
-    window_title = format_window_title(rows[0].translated_num_layers)
-    study_dir = summary_path.parent
-
-    import matplotlib.pyplot as plt
-
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, y_values, marker="o", label=f"Translated {metric_label}")
-    if average_native_metric == average_native_metric:
-        ax.axhline(
-            average_native_metric,
-            linestyle="--",
-            linewidth=1.5,
-            label=f"Native {metric_label} Mean ({average_native_metric:.4f})",
-        )
-    for row, x_value, y_value in zip(rows, x_values, y_values):
-        ax.annotate(
-            format_layer_range(int(row.target_layer_idx), int(row.target_layer_end_idx)),
-            (x_value, y_value),
-            textcoords="offset points",
-            xytext=(0, 7),
-            ha="center",
-            fontsize=8,
-        )
-    ax.set_xlabel("Reference target layer index")
-    ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} vs layer index ({window_title})")
-    ax.set_xticks(x_values)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-
-    chart_path = build_chart_path(study_dir, metric_name)
-    fig.savefig(chart_path, dpi=200)
-    plt.close(fig)
-    return chart_path
-
-
-def save_run_artifacts(
-    config: LayerPositionConfig,
-    run_dir: Path,
-    layer_mappings: Dict[str, LayerMapping],
-    eval_metrics: Dict[str, Any],
-    combined_metrics: Dict[str, Any],
-) -> Tuple[Path, Path, Path, Path, Path]:
-    study_dir = run_dir.parent
-    study_dir.mkdir(parents=True, exist_ok=True)
-    remove_stale_summary_artifacts(study_dir, run_dir)
-    write_json(str(build_config_path(run_dir)), asdict(config))
-    write_json(str(build_layer_mapping_path(run_dir)), {direction: asdict(mapping) for direction, mapping in layer_mappings.items()})
-    write_json(str(build_metrics_path(run_dir)), eval_metrics)
-    summary_path = update_summary(config, run_dir, combined_metrics)
-    chart_path = plot_study_summary(summary_path)
-    drift_cosine_chart_path, drift_l2_chart_path = plot_drift_summary(summary_path)
-    return summary_path, build_metrics_path(run_dir), chart_path, drift_cosine_chart_path, drift_l2_chart_path
 
 
 
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Hidden-state drift evaluation is run automatically as part of the same execution."
+        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Task decomposition, logit-KL comparison, and synergy analysis are run automatically as part of the same execution."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
@@ -1970,24 +2128,24 @@ def main() -> None:
         active_directions=active_directions,
     )
     eval_metrics = extract_eval_metrics(combined_metrics)
-    drift_metrics = extract_drift_metrics(combined_metrics)
+    analysis_metrics = extract_analysis_metrics(combined_metrics)
 
-    summary_path, metrics_path, chart_path, drift_cosine_chart_path, drift_l2_chart_path = save_run_artifacts(
+    summary_path, metrics_path, metric_controls_chart_path, logit_kl_chart_path, synergy_chart_path = save_run_artifacts(
         config=config,
         run_dir=run_dir,
         layer_mappings=layer_mappings,
         eval_metrics=eval_metrics,
         combined_metrics=combined_metrics,
     )
-    drift_metrics_path = save_drift_artifacts(run_dir=run_dir, metrics=drift_metrics)
+    analysis_metrics_path = save_analysis_artifacts(run_dir=run_dir, metrics=analysis_metrics)
 
     print(f"Run directory: {run_dir}")
     print(f"Metrics: {metrics_path}")
     print(f"Summary CSV: {summary_path}")
-    print(f"Study chart: {chart_path}")
-    print(f"Drift metrics: {drift_metrics_path}")
-    print(f"Drift cosine chart: {drift_cosine_chart_path}")
-    print(f"Drift L2 chart: {drift_l2_chart_path}")
+    print(f"Metric controls chart: {metric_controls_chart_path}")
+    print(f"Control analysis metrics: {analysis_metrics_path}")
+    print(f"Logit KL chart: {logit_kl_chart_path}")
+    print(f"Synergy chart: {synergy_chart_path}")
 
 
 if __name__ == "__main__":
