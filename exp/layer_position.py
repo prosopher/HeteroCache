@@ -90,21 +90,21 @@ class LayerPositionConfig:
 
     max_steps: int = 500
     batch_size: int = 4
-    grad_accum_steps: int = 1
+    grad_accum_steps: int = 4
     total_tokens: int = 128
     prefix_tokens: int = 64
     learning_rate: float = 1e-4
-    weight_decay: float = 0.01
+    weight_decay: float = 1e-2
     warmup_steps: int = 50
     grad_clip_norm: float = 1.0
-    log_every: int = 10
+    log_every: int = 25
     seed: int = 42
-    shuffle_buffer: int = 10_000
+    shuffle_buffer: int = 50_000
 
-    translator_dim: int = 768
-    translator_heads: int = 12
+    translator_dim: int = 1024
+    translator_heads: int = 16
     translator_depth: int = 2
-    translator_mlp_ratio: int = 2
+    translator_mlp_ratio: int = 4
 
     enable_principal_rotation: bool = True
     principal_rotation_streams: str = "kv"
@@ -117,7 +117,7 @@ class LayerPositionConfig:
     eval_num_workers: int = 0
     eval_max_examples_per_dataset: int = 100
     eval_shuffle_stream: bool = False
-    benchmark_mode: str = "multinews_f1"
+    benchmark_mode: str = "qa_accuracy"
     generation_max_new_tokens: int = 64
     # Legacy SQuAD extractive benchmark knobs are intentionally preserved here in
     # commented form. The benchmark path is disabled for layer_position, but these
@@ -2378,23 +2378,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="outputs/layer_position")
     parser.add_argument("--study-id", default=None)
 
-    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
-    parser.add_argument("--total-tokens", type=int, default=64)
-    parser.add_argument("--prefix-tokens", type=int, default=32)
+    parser.add_argument("--total-tokens", type=int, default=128)
+    parser.add_argument("--prefix-tokens", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=50_000)
 
-    parser.add_argument("--translator-dim", type=int, default=256)
-    parser.add_argument("--translator-heads", type=int, default=4)
+    parser.add_argument("--translator-dim", type=int, default=1024)
+    parser.add_argument("--translator-heads", type=int, default=16)
     parser.add_argument("--translator-depth", type=int, default=2)
-    parser.add_argument("--translator-mlp-ratio", type=int, default=1)
+    parser.add_argument("--translator-mlp-ratio", type=int, default=4)
     parser.add_argument(
         "--disable-principal-rotation",
         action="store_true",
