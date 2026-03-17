@@ -524,6 +524,54 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
     raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
 
+def format_boolq_context_prefix(context: str) -> str:
+    return (
+        "Read the passage and answer the question with yes or no only.\n\n"
+        f"Passage: {context.strip()}\n"
+    )
+
+
+def format_boolq_question_prefix(question: str) -> str:
+    return (
+        f"Question: {question.strip()}\n"
+        "Answer:"
+    )
+
+
+def prepare_boolq_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_boolq_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_boolq_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_boolq_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
+def format_pubmed_qa_context_prefix(context: str) -> str:
+    return (
+        "Read the abstract and answer the biomedical research question with yes, no, or maybe only.\n\n"
+        f"Abstract: {context.strip()}\n"
+    )
+
+
+def format_pubmed_qa_question_prefix(question: str) -> str:
+    return (
+        f"Question: {question.strip()}\n"
+        "Answer:"
+    )
+
+
+def prepare_pubmed_qa_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_pubmed_qa_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_pubmed_qa_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_pubmed_qa_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
 def format_question_prefix(
     question: str,
     choices: Optional[List[str]] = None,
@@ -536,22 +584,12 @@ def format_question_prefix(
     if answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("BoolQ requires passage context.")
-        return (
-            "Read the passage and answer the question with yes or no only.\n\n"
-            f"Passage: {context.strip()}\n"
-            f"Question: {question}\n"
-            "Answer:"
-        )
+        return format_boolq_context_prefix(context=context) + format_boolq_question_prefix(question=question)
 
     if answer_mode == "pubmed_qa":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("PubMedQA requires abstract context.")
-        return (
-            "Read the abstract and answer the biomedical research question with yes, no, or maybe only.\n\n"
-            f"Abstract: {context.strip()}\n"
-            f"Question: {question}\n"
-            "Answer:"
-        )
+        return format_pubmed_qa_context_prefix(context=context) + format_pubmed_qa_question_prefix(question=question)
 
     if not choices:
         return f"Question: {question}\nAnswer:"
@@ -802,6 +840,97 @@ def prepare_generation_task_question_prefix(
     )
 
 
+def prepare_logit_task_question_prefix(
+    spec: HFDatasetSpec,
+    tokenizer,
+    question: str,
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    if spec.answer_mode == "boolq":
+        return prepare_boolq_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+        )
+    if spec.answer_mode == "pubmed_qa":
+        return prepare_pubmed_qa_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+        )
+    return prepare_question_prefix(
+        tokenizer=tokenizer,
+        question=question,
+        device=device,
+    )
+
+
+def prepare_logit_task_inputs(
+    spec: HFDatasetSpec,
+    tokenizer,
+    context: Optional[str],
+    question: str,
+    device: str,
+) -> Dict[str, Any]:
+    if spec.answer_mode == "boolq":
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("BoolQ requires passage context.")
+        context_prefix = prepare_boolq_context_inputs(
+            tokenizer=tokenizer,
+            context=context,
+            device=device,
+        )
+        question_prefix = prepare_boolq_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+        )
+        return {
+            "context_prefix": context_prefix,
+            "question_prefix": question_prefix,
+            "cache_input_ids": context_prefix["input_ids"],
+            "question_cache_ids": question_prefix["cache_ids"],
+            "seed_token": question_prefix["seed_token"],
+            "was_truncated": False,
+        }
+
+    if spec.answer_mode == "pubmed_qa":
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("PubMedQA requires abstract context.")
+        context_prefix = prepare_pubmed_qa_context_inputs(
+            tokenizer=tokenizer,
+            context=context,
+            device=device,
+        )
+        question_prefix = prepare_pubmed_qa_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+        )
+        return {
+            "context_prefix": context_prefix,
+            "question_prefix": question_prefix,
+            "cache_input_ids": context_prefix["input_ids"],
+            "question_cache_ids": question_prefix["cache_ids"],
+            "seed_token": question_prefix["seed_token"],
+            "was_truncated": False,
+        }
+
+    prefix = prepare_question_prefix(
+        tokenizer=tokenizer,
+        question=question,
+        device=device,
+        context=context,
+        answer_mode=spec.answer_mode,
+    )
+    return {
+        "cache_input_ids": prefix["cache_ids"],
+        "question_cache_ids": None,
+        "seed_token": prefix["seed_token"],
+        "was_truncated": False,
+    }
+
+
 def prepare_generation_task_inputs(
     spec: HFDatasetSpec,
     tokenizer,
@@ -995,6 +1124,20 @@ def score_answer_choices(
         )
         for label in choice_token_ids
     }
+
+
+def prepare_answer_scoring_past(
+    model,
+    past_key_values: PastKeyValues,
+    question_cache_ids: Optional[torch.Tensor] = None,
+) -> PastKeyValues:
+    if question_cache_ids is None:
+        return past_key_values
+    return append_input_ids_to_past(
+        model=model,
+        past_key_values=past_key_values,
+        input_ids=question_cache_ids,
+    )
 
 
 def predict_answer_label(choice_scores: Dict[str, float]) -> str:

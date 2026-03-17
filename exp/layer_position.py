@@ -1469,21 +1469,20 @@ def evaluate_logit_dataset(
 
     for batch_idx, batch in enumerate(dataloader, start=1):
         for example in batch:
-            prefix = prepare_question_prefix(
+            prepared_inputs = prepare_logit_task_inputs(
+                spec=spec,
                 tokenizer=tokenizer,
+                context=example.get("context"),
                 question=example["question"],
                 device=config.device,
-                choices=example.get("choices"),
-                subject=example.get("subject"),
-                context=example.get("context"),
-                answer_mode=spec.answer_mode,
             )
             candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec, example=example)
             gold_answer = example["answer"]
-            prefix_input_ids = prefix["cache_ids"]
-            seed_token = prefix["seed_token"]
+            context_input_ids = prepared_inputs["cache_input_ids"]
+            question_cache_ids = prepared_inputs["question_cache_ids"]
+            seed_token = prepared_inputs["seed_token"]
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], prefix_input_ids)
+                node.id: extract_past_key_values(models[node.id], context_input_ids)
                 for node in nodes
             }
 
@@ -1508,7 +1507,7 @@ def evaluate_logit_dataset(
                 )
                 dir_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix_input_ids,
+                    prefix_input_ids=context_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
                     injected_key_block=control_windows["dir_only"][0],
                     injected_value_block=control_windows["dir_only"][1],
@@ -1516,7 +1515,7 @@ def evaluate_logit_dataset(
                 )
                 mag_only_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix_input_ids,
+                    prefix_input_ids=context_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
                     injected_key_block=control_windows["mag_only"][0],
                     injected_value_block=control_windows["mag_only"][1],
@@ -1524,37 +1523,58 @@ def evaluate_logit_dataset(
                 )
                 full_mix_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
-                    prefix_input_ids=prefix_input_ids,
+                    prefix_input_ids=context_input_ids,
                     target_start_layer_idx=mapping.dst_layer_idx,
                     injected_key_block=control_windows["full_mix"][0],
                     injected_value_block=control_windows["full_mix"][1],
                     dst_spec=model_specs[edge.dst_id],
                 )
 
-                native_scores = score_answer_choices(
+                native_scoring_past = prepare_answer_scoring_past(
                     model=models[edge.dst_id],
                     past_key_values=native_target_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                dir_only_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=dir_only_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                mag_only_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=mag_only_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                full_mix_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=full_mix_past,
+                    question_cache_ids=question_cache_ids,
+                )
+
+                native_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 dir_only_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=dir_only_past,
+                    past_key_values=dir_only_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 mag_only_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=mag_only_past,
+                    past_key_values=mag_only_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 full_mix_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=full_mix_past,
+                    past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
@@ -1574,22 +1594,22 @@ def evaluate_logit_dataset(
 
                 native_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=native_target_past,
+                    past_key_values=native_scoring_past,
                     seed_token=seed_token,
                 )
                 dir_only_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=dir_only_past,
+                    past_key_values=dir_only_scoring_past,
                     seed_token=seed_token,
                 )
                 mag_only_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=mag_only_past,
+                    past_key_values=mag_only_scoring_past,
                     seed_token=seed_token,
                 )
                 full_mix_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=full_mix_past,
+                    past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                 )
                 path_logit_kl[direction].update(

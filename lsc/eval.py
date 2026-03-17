@@ -39,18 +39,18 @@ def evaluate_dataset(
         for example in batch:
             question = example["question"]
             gold_answer = example["answer"]
+            context_text = example.get("context")
 
-            prefix = prepare_question_prefix(
+            prepared_inputs = prepare_logit_task_inputs(
+                spec=spec,
                 tokenizer=tokenizer,
+                context=context_text,
                 question=question,
                 device=device,
-                choices=example.get("choices"),
-                subject=example.get("subject"),
-                context=example.get("context"),
-                answer_mode=spec.answer_mode,
             )
-            prefix_cache_ids = prefix["cache_ids"]
-            seed_token = prefix["seed_token"]
+            cache_input_ids = prepared_inputs["cache_input_ids"]
+            question_cache_ids = prepared_inputs["question_cache_ids"]
+            seed_token = prepared_inputs["seed_token"]
 
             candidate_token_ids = build_logit_answer_candidates(
                 tokenizer=tokenizer,
@@ -59,7 +59,7 @@ def evaluate_dataset(
             )
 
             past_by_node_id = {
-                node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+                node.id: extract_past_key_values(models[node.id], cache_input_ids)
                 for node in nodes
             }
 
@@ -83,16 +83,27 @@ def evaluate_dataset(
                     translated_top_past_key_values=translated_top_past,
                 )
 
-                translated_scores = score_answer_choices(
+                translated_scoring_past = prepare_answer_scoring_past(
                     model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                native_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    question_cache_ids=question_cache_ids,
+                )
+
+                translated_scores = score_answer_choices(
+                    model=models[edge.dst_id],
+                    past_key_values=translated_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
                 )
                 native_scores = score_answer_choices(
                     model=models[edge.dst_id],
-                    past_key_values=past_by_node_id[edge.dst_id],
+                    past_key_values=native_scoring_past,
                     seed_token=seed_token,
                     choice_token_ids=candidate_token_ids,
                     normalize_by_length=True,
