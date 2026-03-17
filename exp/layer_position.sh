@@ -88,12 +88,12 @@ done
 
 SUMMARY_ROOT="${OUTPUT_ROOT}/${STUDY_ID}"
 SUMMARY_PATH="${SUMMARY_ROOT}/summary.csv"
-CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}.png"
-DRIFT_COSINE_CHART_PATH="${SUMMARY_ROOT}/drift_cosine.png"
-DRIFT_L2_CHART_PATH="${SUMMARY_ROOT}/drift_l2.png"
+METRIC_CONTROLS_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_${METRIC_NAME}_controls.png"
+LOGIT_KL_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_logit_kl.png"
+SYNERGY_CHART_PATH="${SUMMARY_ROOT}/layer_idx_vs_synergy.png"
 
 echo "[LayerPosition] done"
 echo "[LayerPosition] summary_csv=${SUMMARY_PATH}"
-echo "[LayerPosition] chart_png=${CHART_PATH}"
-echo "[LayerPosition] drift_cosine_chart_png=${DRIFT_COSINE_CHART_PATH}"
-echo "[LayerPosition] drift_l2_chart_png=${DRIFT_L2_CHART_PATH}"
+echo "[LayerPosition] metric_controls_chart_png=${METRIC_CONTROLS_CHART_PATH}"
+echo "[LayerPosition] logit_kl_chart_png=${LOGIT_KL_CHART_PATH}"
+echo "[LayerPosition] synergy_chart_png=${SYNERGY_CHART_PATH}"
