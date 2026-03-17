@@ -24,13 +24,16 @@ class EvalConfig:
     generation_max_new_tokens: int
     enable_generation_eval: bool = True
 
-    # span-selection SQuAD v1.1 QA
-    extractive_max_answer_tokens: int
+    # extractive SQuAD-style QA
+    extractive_max_answer_tokens: int = 8
+    extractive_beam_size: int = 4
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
         if self.extractive_max_answer_tokens < 1:
             raise ValueError("extractive_max_answer_tokens must be >= 1")
+        if self.extractive_beam_size < 1:
+            raise ValueError("extractive_beam_size must be >= 1")
         initialize_eval_output_paths(self)
 
 
@@ -102,9 +105,9 @@ class HFQAPairStream(IterableDataset):
 DEFAULT_MULTINEWS_SUMMARY_TASK = "Summarize the news articles above."
 
 
-def get_squad_v11_dataset_spec() -> HFDatasetSpec:
+def get_extractive_squad_generation_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
-        name_for_log="SQuAD-v1.1/validation",
+        name_for_log="SQuAD/validation",
         dataset_path="rajpurkar/squad",
         dataset_name=None,
         split="validation",
@@ -637,27 +640,27 @@ def format_question_prefix(
     return "\n".join(prompt_lines)
 
 
-def format_squad_v11_context_prefix(context: str) -> str:
+def format_extractive_context_prefix(context: str) -> str:
     return (
-        "Read the passage and answer the question by selecting a contiguous span from the passage.\n\n"
+        "Read the passage and answer the question by extracting a contiguous span from the passage.\n\n"
         f"Passage: {context.strip()}\n"
     )
 
 
-def format_squad_v11_question_prefix(question: str) -> str:
+def format_extractive_question_prefix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
-        "Answer span:"
+        "Extracted answer:"
     )
 
 
-def prepare_squad_v11_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
-    prefix_text = format_squad_v11_context_prefix(context=context)
+def prepare_extractive_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_extractive_context_prefix(context=context)
     return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
 
 
-def prepare_squad_v11_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_squad_v11_question_prefix(question=question)
+def prepare_extractive_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_extractive_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
@@ -695,9 +698,10 @@ def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> 
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
+
 @dataclass
-class SquadSpanTrieNode:
-    children: Dict[int, "SquadSpanTrieNode"]
+class ExtractiveSpanTrieNode:
+    children: Dict[int, "ExtractiveSpanTrieNode"]
     terminal_text: Optional[str] = None
 
     def __init__(self) -> None:
@@ -705,9 +709,18 @@ class SquadSpanTrieNode:
         self.terminal_text = None
 
 
+def _tokenize_extractive_answer_candidate(tokenizer, candidate_text: str) -> List[int]:
+    candidate_text = candidate_text.strip()
+    if not candidate_text:
+        return []
+    return list(tokenizer(" " + candidate_text, add_special_tokens=False).input_ids)
+
+
 @dataclass
-class SquadSpanSearchResult:
-    text: str
+class ExtractiveBeamState:
+    node: ExtractiveSpanTrieNode
+    past_key_values: PastKeyValues
+    input_ids: torch.Tensor
     total_logprob: float
     token_count: int
 
@@ -716,14 +729,7 @@ class SquadSpanSearchResult:
         return self.total_logprob / max(1, self.token_count)
 
 
-def _tokenize_squad_answer_candidate(tokenizer, candidate_text: str) -> List[int]:
-    candidate_text = candidate_text.strip()
-    if not candidate_text:
-        return []
-    return list(tokenizer(" " + candidate_text, add_special_tokens=False).input_ids)
-
-
-def _tokenize_context_for_squad_spans(tokenizer, context: str) -> Tuple[List[int], Optional[List[Tuple[int, int]]]]:
+def _tokenize_context_for_extractive_candidates(tokenizer, context: str) -> Tuple[List[int], Optional[List[Tuple[int, int]]]]:
     try:
         encoded = tokenizer(context, add_special_tokens=False, return_offsets_mapping=True)
         token_ids = list(encoded.get("input_ids", []))
@@ -739,7 +745,7 @@ def _tokenize_context_for_squad_spans(tokenizer, context: str) -> Tuple[List[int
     return list(token_ids), None
 
 
-def _decode_squad_span_text(
+def _decode_extractive_span_text(
     tokenizer,
     context: str,
     context_token_ids: List[int],
@@ -756,22 +762,22 @@ def _decode_squad_span_text(
     return tokenizer.decode(context_token_ids[start_idx:end_idx + 1], skip_special_tokens=True).strip()
 
 
-def build_squad_v11_span_trie(
+def build_extractive_span_trie(
     tokenizer,
     context: str,
     max_answer_tokens: int,
-) -> SquadSpanTrieNode:
+) -> ExtractiveSpanTrieNode:
     if max_answer_tokens < 1:
         raise ValueError("max_answer_tokens must be >= 1")
 
-    context_token_ids, offsets = _tokenize_context_for_squad_spans(tokenizer, context)
-    root = SquadSpanTrieNode()
+    context_token_ids, offsets = _tokenize_context_for_extractive_candidates(tokenizer, context)
+    root = ExtractiveSpanTrieNode()
     num_tokens = len(context_token_ids)
 
     for start_idx in range(num_tokens):
         max_end_idx = min(num_tokens, start_idx + max_answer_tokens)
         for end_idx in range(start_idx, max_end_idx):
-            terminal_text = _decode_squad_span_text(
+            terminal_text = _decode_extractive_span_text(
                 tokenizer=tokenizer,
                 context=context,
                 context_token_ids=context_token_ids,
@@ -782,7 +788,7 @@ def build_squad_v11_span_trie(
             if not terminal_text:
                 continue
 
-            answer_position_token_ids = _tokenize_squad_answer_candidate(
+            answer_position_token_ids = _tokenize_extractive_answer_candidate(
                 tokenizer=tokenizer,
                 candidate_text=terminal_text,
             )
@@ -794,7 +800,7 @@ def build_squad_v11_span_trie(
                 token_id = int(token_id)
                 child = node.children.get(token_id)
                 if child is None:
-                    child = SquadSpanTrieNode()
+                    child = ExtractiveSpanTrieNode()
                     node.children[token_id] = child
                 node = child
             if node.terminal_text is None:
@@ -803,83 +809,22 @@ def build_squad_v11_span_trie(
     return root
 
 
-def _select_better_span_result(
-    incumbent: Optional[SquadSpanSearchResult],
-    candidate: Optional[SquadSpanSearchResult],
-) -> Optional[SquadSpanSearchResult]:
-    if candidate is None:
-        return incumbent
-    if incumbent is None:
-        return candidate
-    if candidate.normalized_score > incumbent.normalized_score:
-        return candidate
-    if candidate.normalized_score < incumbent.normalized_score:
-        return incumbent
-    if candidate.token_count < incumbent.token_count:
-        return candidate
-    if candidate.token_count > incumbent.token_count:
-        return incumbent
-    return candidate if candidate.text < incumbent.text else incumbent
-
-
 @torch.inference_mode()
-def _search_best_squad_span(
-    model,
-    node: SquadSpanTrieNode,
-    past_key_values: PastKeyValues,
-    input_ids: torch.Tensor,
-    total_logprob: float,
-    token_count: int,
-    max_answer_tokens: int,
-) -> Optional[SquadSpanSearchResult]:
-    best_result: Optional[SquadSpanSearchResult] = None
-    if node.terminal_text is not None and token_count > 0:
-        best_result = SquadSpanSearchResult(
-            text=node.terminal_text,
-            total_logprob=total_logprob,
-            token_count=token_count,
-        )
-
-    if token_count >= max_answer_tokens or not node.children:
-        return best_result
-
-    outputs = model(
-        input_ids=input_ids,
-        past_key_values=past_key_values,
-        use_cache=True,
-    )
-    log_probs = F.log_softmax(outputs.logits[:, -1, :], dim=-1).squeeze(0)
-    next_past = outputs.past_key_values
-    device = input_ids.device
-
-    for next_token_id, child in node.children.items():
-        candidate_result = _search_best_squad_span(
-            model=model,
-            node=child,
-            past_key_values=next_past,
-            input_ids=torch.tensor([[next_token_id]], device=device, dtype=torch.long),
-            total_logprob=total_logprob + float(log_probs[next_token_id].item()),
-            token_count=token_count + 1,
-            max_answer_tokens=max_answer_tokens,
-        )
-        best_result = _select_better_span_result(best_result, candidate_result)
-
-    return best_result
-
-
-@torch.inference_mode()
-def predict_squad_v11_answer(
+def predict_extractive_answer(
     model,
     tokenizer,
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
     context: str,
     max_answer_tokens: int,
+    beam_size: int,
 ) -> str:
     if max_answer_tokens < 1:
         raise ValueError("max_answer_tokens must be >= 1")
+    if beam_size < 1:
+        raise ValueError("beam_size must be >= 1")
 
-    trie_root = build_squad_v11_span_trie(
+    trie_root = build_extractive_span_trie(
         tokenizer=tokenizer,
         context=context,
         max_answer_tokens=max_answer_tokens,
@@ -887,16 +832,81 @@ def predict_squad_v11_answer(
     if not trie_root.children:
         return ""
 
-    best_result = _search_best_squad_span(
-        model=model,
-        node=trie_root,
-        past_key_values=past_key_values,
+    root_outputs = model(
         input_ids=seed_token,
-        total_logprob=0.0,
-        token_count=0,
-        max_answer_tokens=max_answer_tokens,
+        past_key_values=past_key_values,
+        use_cache=True,
     )
-    return "" if best_result is None else best_result.text
+    root_log_probs = F.log_softmax(root_outputs.logits[:, -1, :], dim=-1).squeeze(0)
+    root_next_past = root_outputs.past_key_values
+
+    active_beams: List[ExtractiveBeamState] = []
+    completed_beams: List[ExtractiveBeamState] = []
+    device = seed_token.device
+
+    for token_id, child in trie_root.children.items():
+        active_beams.append(
+            ExtractiveBeamState(
+                node=child,
+                past_key_values=root_next_past,
+                input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
+                total_logprob=float(root_log_probs[token_id].item()),
+                token_count=1,
+            )
+        )
+
+    active_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
+    active_beams = active_beams[:beam_size]
+
+    for _ in range(max_answer_tokens):
+        if not active_beams:
+            break
+
+        next_beams: List[ExtractiveBeamState] = []
+        for beam in active_beams:
+            if beam.node.terminal_text is not None:
+                completed_beams.append(beam)
+
+            if beam.token_count >= max_answer_tokens or not beam.node.children:
+                continue
+
+            outputs = model(
+                input_ids=beam.input_ids,
+                past_key_values=beam.past_key_values,
+                use_cache=True,
+            )
+            log_probs = F.log_softmax(outputs.logits[:, -1, :], dim=-1).squeeze(0)
+            next_past = outputs.past_key_values
+
+            child_candidates = []
+            for token_id, child in beam.node.children.items():
+                child_candidates.append((float(log_probs[token_id].item()), token_id, child))
+            child_candidates.sort(key=lambda item: item[0], reverse=True)
+            child_candidates = child_candidates[:beam_size]
+
+            for token_logprob, token_id, child in child_candidates:
+                next_beams.append(
+                    ExtractiveBeamState(
+                        node=child,
+                        past_key_values=next_past,
+                        input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
+                        total_logprob=beam.total_logprob + token_logprob,
+                        token_count=beam.token_count + 1,
+                    )
+                )
+
+        next_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
+        active_beams = next_beams[:beam_size]
+
+    if completed_beams:
+        best_beam = max(completed_beams, key=lambda beam: beam.normalized_score)
+        return best_beam.node.terminal_text or ""
+
+    if active_beams:
+        best_beam = max(active_beams, key=lambda beam: beam.normalized_score)
+        return best_beam.node.terminal_text or ""
+
+    return ""
 
 
 def format_generation_prompt(context: str, question: str) -> str:
@@ -1063,7 +1073,7 @@ def prepare_generation_task_question_prefix(
     device: str,
 ) -> Dict[str, torch.Tensor]:
     if spec.answer_mode == "squad":
-        return prepare_squad_v11_question_prefix(
+        return prepare_extractive_question_prefix(
             tokenizer=tokenizer,
             question=question,
             device=device,
@@ -1090,12 +1100,12 @@ def prepare_generation_task_inputs(
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     if spec.answer_mode == "squad":
-        context_prefix = prepare_squad_v11_context_inputs(
+        context_prefix = prepare_extractive_context_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
         )
-        question_prefix = prepare_squad_v11_question_prefix(
+        question_prefix = prepare_extractive_question_prefix(
             tokenizer=tokenizer,
             question=question,
             device=device,
@@ -1156,19 +1166,20 @@ def predict_generation_task_answer(
 ) -> str:
     if spec.answer_mode == "squad":
         if question_cache_ids is None:
-            raise ValueError("question_cache_ids must be provided for SQuAD v1.1 span evaluation.")
+            raise ValueError("question_cache_ids must be provided for extractive SQuAD evaluation.")
         answer_past = append_input_ids_to_past(
             model=model,
             past_key_values=past_key_values,
             input_ids=question_cache_ids,
         )
-        return predict_squad_v11_answer(
+        return predict_extractive_answer(
             model=model,
             tokenizer=tokenizer,
             past_key_values=answer_past,
             seed_token=seed_token,
             context=context,
             max_answer_tokens=int(getattr(eval_config, "extractive_max_answer_tokens")),
+            beam_size=int(getattr(eval_config, "extractive_beam_size")),
         )
 
     generation_past = past_key_values
