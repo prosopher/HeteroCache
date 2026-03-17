@@ -11,5 +11,5 @@
   "shuffle_eval_stream": true,
   "shuffle_buffer": 10000,
   "generation_max_new_tokens": 32,
-  "extractive_max_answer_tokens": 16
+  "extractive_max_answer_tokens": 8
 }

@@ -12,5 +12,5 @@
   "shuffle_buffer": 8,
   "generation_max_new_tokens": 4,
   "enable_generation_eval": false,
-  "extractive_max_answer_tokens": 16
+  "extractive_max_answer_tokens": 8
 }
