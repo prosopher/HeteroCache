@@ -22,11 +22,10 @@ class EvalConfig:
 
     # generation QA
     generation_max_new_tokens: int
+    enable_generation_eval: bool = True
 
     # span-selection SQuAD v1.1 QA
     extractive_max_answer_tokens: int
-
-    enable_generation_eval: bool = True
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
