@@ -2403,7 +2403,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--principal-rotation-streams",
         choices=["k", "v", "kv"],
-        default="kv",
+        default="k",
         help="Which cache streams to rotate into principal coordinates before translation.",
     )
     parser.add_argument(
