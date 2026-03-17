@@ -229,16 +229,12 @@ def evaluate_generation_dataset(
                     question_cache_ids=question_cache_ids,
                 )
 
-                exact_match = compute_generation_exact_match(translated_answer, gold_answers)
                 f1 = compute_generation_f1(translated_answer, gold_answers)
-                native_exact_match = compute_generation_exact_match(native_answer, gold_answers)
                 native_f1 = compute_generation_f1(native_answer, gold_answers)
 
                 path_metrics[direction].update(
                     cosine_value=cosine_value,
-                    exact_match_value=exact_match,
                     f1_value=f1,
-                    native_exact_match_value=native_exact_match,
                     native_f1_value=native_f1,
                     n=1,
                 )
@@ -331,16 +327,6 @@ def run_eval(eval_config: EvalConfig) -> Path:
             answer_mode="pubmed_qa",
             question_field="question",
             context_field="context",
-            streaming=False,
-        ),
-        HFDatasetSpec(
-            name_for_log="MMLU/all/validation",
-            dataset_path="cais/mmlu",
-            dataset_name="all",
-            split="validation",
-            answer_mode="mmlu",
-            question_field="question",
-            subject_field="subject",
             streaming=False,
         ),
     ]

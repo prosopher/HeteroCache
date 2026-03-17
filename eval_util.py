@@ -310,25 +310,19 @@ class RunningAverage:
 class GenerationRunningAverage:
     def __init__(self) -> None:
         self.cosine_sum = 0.0
-        self.exact_match_sum = 0.0
         self.f1_sum = 0.0
-        self.native_exact_match_sum = 0.0
         self.native_f1_sum = 0.0
         self.count = 0
 
     def update(
         self,
         cosine_value: float,
-        exact_match_value: float,
         f1_value: float,
-        native_exact_match_value: float,
         native_f1_value: float,
         n: int,
     ) -> None:
         self.cosine_sum += float(cosine_value) * n
-        self.exact_match_sum += float(exact_match_value) * n
         self.f1_sum += float(f1_value) * n
-        self.native_exact_match_sum += float(native_exact_match_value) * n
         self.native_f1_sum += float(native_f1_value) * n
         self.count += n
 
@@ -336,17 +330,13 @@ class GenerationRunningAverage:
         if self.count == 0:
             return {
                 "cosine": float("nan"),
-                "exact_match": float("nan"),
                 "f1": float("nan"),
-                "native_exact_match": float("nan"),
                 "native_f1": float("nan"),
                 "count": 0,
             }
         return {
             "cosine": self.cosine_sum / self.count,
-            "exact_match": self.exact_match_sum / self.count,
             "f1": self.f1_sum / self.count,
-            "native_exact_match": self.native_exact_match_sum / self.count,
             "native_f1": self.native_f1_sum / self.count,
             "count": self.count,
         }
@@ -496,44 +486,6 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             "answer": normalized_answer,
         }
 
-    if spec.answer_mode == "mmlu":
-        choices = example.get("choices", None)
-        if not isinstance(choices, list) or len(choices) != 4:
-            return None
-
-        normalized_choices = [
-            choice.strip()
-            for choice in choices
-            if isinstance(choice, str) and choice.strip()
-        ]
-        if len(normalized_choices) != 4:
-            return None
-
-        answer_value = example.get("answer", None)
-        if isinstance(answer_value, int):
-            if answer_value < 0 or answer_value >= 4:
-                return None
-            normalized_answer = chr(ord("A") + answer_value)
-        elif isinstance(answer_value, str):
-            normalized_answer = answer_value.strip().upper()
-            if normalized_answer not in {"A", "B", "C", "D"}:
-                return None
-        else:
-            return None
-
-        qa_example = {
-            "question": question.strip(),
-            "choices": normalized_choices,
-            "answer": normalized_answer,
-        }
-
-        subject_field = spec.subject_field or "subject"
-        subject = example.get(subject_field, None)
-        if isinstance(subject, str) and subject.strip():
-            qa_example["subject"] = subject.strip()
-
-        return qa_example
-
     if spec.answer_mode == "squad":
         context_field = spec.context_field or "context"
         answers_field = spec.answers_field or "answers"
@@ -600,27 +552,6 @@ def format_question_prefix(
             f"Question: {question}\n"
             "Answer:"
         )
-
-    if answer_mode == "mmlu":
-        if not choices or len(choices) != 4:
-            raise ValueError("MMLU requires exactly 4 choices.")
-
-        prompt_lines = []
-        if isinstance(subject, str) and subject.strip():
-            prompt_lines.append(
-                "The following is a multiple choice question about "
-                f"{subject.strip().replace('_', ' ')}."
-            )
-            prompt_lines.append("")
-
-        prompt_lines.append(f"Question: {question}")
-        prompt_lines.append("Choices:")
-        for idx, choice in enumerate(choices):
-            label = chr(ord("A") + idx)
-            prompt_lines.append(f"{label}. {choice.strip()}")
-        prompt_lines.append("Answer with the exact option text only.")
-        prompt_lines.append("Answer:")
-        return "\n".join(prompt_lines)
 
     if not choices:
         return f"Question: {question}\nAnswer:"
@@ -1015,19 +946,6 @@ def build_logit_answer_candidates(
             {"yes": "yes", "no": "no", "maybe": "maybe"},
         )
 
-    if spec.answer_mode == "mmlu":
-        choices = example.get("choices", None)
-        if not isinstance(choices, list) or len(choices) != 4:
-            raise ValueError("MMLU example must contain exactly 4 choices.")
-
-        return build_text_candidate_token_ids(
-            tokenizer,
-            {
-                chr(ord("A") + idx): choice
-                for idx, choice in enumerate(choices)
-            },
-        )
-
     raise ValueError(f"Unsupported answer_mode for logit scoring: {spec.answer_mode}")
 
 
@@ -1148,14 +1066,6 @@ def normalize_qa_text(text: str) -> str:
     return white_space_fix(remove_articles(remove_punc(lower(text))))
 
 
-def compute_generation_exact_match(prediction: str, gold_answers: List[str]) -> float:
-    normalized_prediction = normalize_qa_text(prediction)
-    for gold_answer in gold_answers:
-        if normalized_prediction == normalize_qa_text(gold_answer):
-            return 1.0
-    return 0.0
-
-
 def _compute_pair_f1(prediction: str, gold_answer: str) -> float:
     pred_tokens = normalize_qa_text(prediction).split()
     gold_tokens = normalize_qa_text(gold_answer).split()
@@ -1243,12 +1153,10 @@ def log_generation_dataset_result(
         row = results[direction]
         pretty_name = build_direction_pretty_name(direction, nodes, edges)
         logger.info(
-            "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
+            "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
             row["cosine"],
-            row["exact_match"],
             row["f1"],
-            row["native_exact_match"],
             row["native_f1"],
             int(row["count"]),
         )
@@ -1292,7 +1200,6 @@ def build_direction_summary_markdown_table(
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
-        ("MMLU", "MMLU/all/validation"),
     ]
     multinews_dataset_key = "MultiNews/validation"
 
@@ -1305,17 +1212,14 @@ def build_direction_summary_markdown_table(
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
         logit_rows["PubMedQA"].get("cosine", float("nan")),
-        logit_rows["MMLU"].get("cosine", float("nan")),
     ])
     translated_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("accuracy", float("nan")),
         logit_rows["PubMedQA"].get("accuracy", float("nan")),
-        logit_rows["MMLU"].get("accuracy", float("nan")),
     ])
     native_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("native_accuracy", float("nan")),
         logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
-        logit_rows["MMLU"].get("native_accuracy", float("nan")),
     ])
 
     if edge is None:
@@ -1329,13 +1233,12 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU | Acc Avg | MultiNews |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | MultiNews |",
+        "|---|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['MMLU'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(native_accuracy_avg)} | "
             f"{_format_summary_float(multinews_row.get('native_f1', float('nan')))} |"
         ),
@@ -1344,7 +1247,6 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_float(translated_cosine_avg)} | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['MMLU'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(translated_accuracy_avg)} | "
             f"{_format_summary_float(multinews_row.get('f1', float('nan')))} |"
         ),
