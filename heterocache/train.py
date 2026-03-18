@@ -65,19 +65,24 @@ class SelfAttentionBlock(nn.Module):
         return hidden
 
 
-class PerLayerTranslator(nn.Module):
+class CrossLayerWindowTranslator(nn.Module):
     def __init__(
         self,
         src_hidden_size: int,
         dst_hidden_size: int,
+        num_layers: int,
         translator_dim: int,
         translator_heads: int,
         translator_depth: int,
         mlp_ratio: int,
     ) -> None:
         super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        self.num_layers = num_layers
         self.input_norm = nn.LayerNorm(src_hidden_size)
         self.input_proj = nn.Linear(src_hidden_size, translator_dim)
+        self.layer_embeddings = nn.Parameter(torch.zeros(1, 1, num_layers, translator_dim))
         self.blocks = nn.ModuleList(
             [
                 SelfAttentionBlock(
@@ -90,12 +95,29 @@ class PerLayerTranslator(nn.Module):
         )
         self.output_norm = nn.LayerNorm(translator_dim)
         self.output_proj = nn.Linear(translator_dim, dst_hidden_size)
+        nn.init.normal_(self.layer_embeddings, mean=0.0, std=0.02)
 
-    def forward(self, layer_cache: torch.Tensor) -> torch.Tensor:
-        hidden = F.gelu(self.input_proj(self.input_norm(layer_cache)))
+    def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
+        if layer_window_cache.ndim != 4:
+            raise ValueError(
+                "CrossLayerWindowTranslator expects [batch, seq, num_layers, hidden], "
+                f"got {tuple(layer_window_cache.shape)}"
+            )
+        if layer_window_cache.shape[2] != self.num_layers:
+            raise ValueError(
+                f"CrossLayerWindowTranslator expected {self.num_layers} layers, got {layer_window_cache.shape[2]}"
+            )
+
+        hidden = F.gelu(self.input_proj(self.input_norm(layer_window_cache)))
+        hidden = hidden + self.layer_embeddings.to(device=hidden.device, dtype=hidden.dtype)
+        batch_size, seq_len, num_layers, hidden_dim = hidden.shape
+        hidden = hidden.transpose(1, 2).contiguous().view(batch_size, seq_len * num_layers, hidden_dim)
         for block in self.blocks:
             hidden = block(hidden)
-        return self.output_proj(self.output_norm(hidden))
+        hidden = self.output_proj(self.output_norm(hidden))
+        output_dim = hidden.shape[-1]
+        hidden = hidden.view(batch_size, num_layers, seq_len, output_dim).transpose(1, 2).contiguous()
+        return hidden
 
 
 class TopLayerDirectionalTranslator(nn.Module):
@@ -111,41 +133,28 @@ class TopLayerDirectionalTranslator(nn.Module):
     ) -> None:
         super().__init__()
         self.top_layers_to_translate = top_layers_to_translate
-        self.key_layers = nn.ModuleList(
-            [
-                PerLayerTranslator(
-                    src_hidden_size=src_hidden_size,
-                    dst_hidden_size=dst_hidden_size,
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(top_layers_to_translate)
-            ]
+        self.key_translator = CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=top_layers_to_translate,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
         )
-        self.value_layers = nn.ModuleList(
-            [
-                PerLayerTranslator(
-                    src_hidden_size=src_hidden_size,
-                    dst_hidden_size=dst_hidden_size,
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(top_layers_to_translate)
-            ]
+        self.value_translator = CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=top_layers_to_translate,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
         )
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        key_outputs = []
-        value_outputs = []
-        for layer_idx in range(self.top_layers_to_translate):
-            key_outputs.append(self.key_layers[layer_idx](key_block[:, :, layer_idx, :]).unsqueeze(2))
-            value_outputs.append(self.value_layers[layer_idx](value_block[:, :, layer_idx, :]).unsqueeze(2))
-        translated_key = torch.cat(key_outputs, dim=2)
-        translated_value = torch.cat(value_outputs, dim=2)
+        translated_key = self.key_translator(key_block)
+        translated_value = self.value_translator(value_block)
         return translated_key, translated_value
 
 

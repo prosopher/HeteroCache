@@ -244,31 +244,23 @@ class LayerWindowDirectionalTranslator(nn.Module):
         self.translated_num_layers = translated_num_layers
         self.src_hidden_size = src_hidden_size
         self.dst_hidden_size = dst_hidden_size
-        self.key_layers = nn.ModuleList(
-            [
-                PerLayerTranslator(
-                    src_hidden_size=src_hidden_size,
-                    dst_hidden_size=dst_hidden_size,
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(translated_num_layers)
-            ]
+        self.key_translator = CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=translated_num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
         )
-        self.value_layers = nn.ModuleList(
-            [
-                PerLayerTranslator(
-                    src_hidden_size=src_hidden_size,
-                    dst_hidden_size=dst_hidden_size,
-                    translator_dim=translator_dim,
-                    translator_heads=translator_heads,
-                    translator_depth=translator_depth,
-                    mlp_ratio=mlp_ratio,
-                )
-                for _ in range(translated_num_layers)
-            ]
+        self.value_translator = CrossLayerWindowTranslator(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=translated_num_layers,
+            translator_dim=translator_dim,
+            translator_heads=translator_heads,
+            translator_depth=translator_depth,
+            mlp_ratio=mlp_ratio,
         )
         self.register_buffer("src_key_means", torch.zeros(translated_num_layers, src_hidden_size, dtype=torch.float32))
         self.register_buffer("dst_key_means", torch.zeros(translated_num_layers, dst_hidden_size, dtype=torch.float32))
@@ -320,31 +312,52 @@ class LayerWindowDirectionalTranslator(nn.Module):
         mean_buffer.copy_(means)
         basis_buffer.copy_(bases)
 
+    def _rotate_layer_window_into_basis(
+        self,
+        layer_cache: torch.Tensor,
+        means: torch.Tensor,
+        bases: torch.Tensor,
+    ) -> torch.Tensor:
+        rotated_layers = []
+        for offset in range(self.translated_num_layers):
+            rotated_layers.append(
+                rotate_into_principal_basis(
+                    layer_cache[:, :, offset, :],
+                    means[offset],
+                    bases[offset],
+                ).unsqueeze(2)
+            )
+        return torch.cat(rotated_layers, dim=2)
+
+    def _inverse_rotate_layer_window_from_basis(
+        self,
+        rotated_cache: torch.Tensor,
+        means: torch.Tensor,
+        bases: torch.Tensor,
+    ) -> torch.Tensor:
+        restored_layers = []
+        for offset in range(self.translated_num_layers):
+            restored_layers.append(
+                inverse_rotate_from_principal_basis(
+                    rotated_cache[:, :, offset, :],
+                    means[offset],
+                    bases[offset],
+                ).unsqueeze(2)
+            )
+        return torch.cat(restored_layers, dim=2)
+
     def _translate_stream(
         self,
         layer_cache: torch.Tensor,
-        translators: nn.ModuleList,
+        translator: nn.Module,
         src_means: torch.Tensor,
         src_bases: torch.Tensor,
         dst_means: torch.Tensor,
         dst_bases: torch.Tensor,
     ) -> torch.Tensor:
-        translated_layers = []
-        for offset in range(self.translated_num_layers):
-            rotated_input = rotate_into_principal_basis(
-                layer_cache[:, :, offset, :],
-                src_means[offset],
-                src_bases[offset],
-            )
-            translated_rotated = translators[offset](rotated_input)
-            translated_layers.append(
-                inverse_rotate_from_principal_basis(
-                    translated_rotated,
-                    dst_means[offset],
-                    dst_bases[offset],
-                ).unsqueeze(2)
-            )
-        return torch.cat(translated_layers, dim=2)
+        rotated_input = self._rotate_layer_window_into_basis(layer_cache, src_means, src_bases)
+        translated_rotated = translator(rotated_input)
+        return self._inverse_rotate_layer_window_from_basis(translated_rotated, dst_means, dst_bases)
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if key_block.shape != value_block.shape:
@@ -364,7 +377,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
 
         translated_key = self._translate_stream(
             layer_cache=key_block,
-            translators=self.key_layers,
+            translator=self.key_translator,
             src_means=self.src_key_means,
             src_bases=self.src_key_bases,
             dst_means=self.dst_key_means,
@@ -372,7 +385,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
         )
         translated_value = self._translate_stream(
             layer_cache=value_block,
-            translators=self.value_layers,
+            translator=self.value_translator,
             src_means=self.src_value_means,
             src_bases=self.src_value_bases,
             dst_means=self.dst_value_means,
@@ -1472,7 +1485,7 @@ def evaluate_logit_dataset(
                 question=example["question"],
                 device=config.device,
             )
-            candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec, example=example)
+            candidate_token_ids = build_logit_answer_candidates(tokenizer=tokenizer, spec=spec)
             gold_answer = example["answer"]
             context_input_ids = prepared_inputs["cache_input_ids"]
             question_cache_ids = prepared_inputs["question_cache_ids"]
