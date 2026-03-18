@@ -94,8 +94,8 @@ class LayerPositionConfig:
     translator_mlp_ratio: int = 4
 
     enable_principal_rotation: bool = True
-    principal_rotation_streams: str = "kv"
-    principal_rotation_calibration_steps: int = 32
+    principal_rotation_streams: str = "k"
+    principal_rotation_calibration_steps: int = 512
 
     device: str = "auto"
     dtype: str = "float32"
@@ -2420,7 +2420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--principal-rotation-calibration-steps",
         type=int,
-        default=32,
+        default=512,
         help="Number of prefix batches used to estimate per-direction principal bases.",
     )
 
