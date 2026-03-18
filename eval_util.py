@@ -889,7 +889,7 @@ def prepare_generation_task_question_prefix(
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode == "squad":
+    if spec.answer_mode in {"squad", "paired_list_qa"}:
         return prepare_squad_v11_question_prefix(
             tokenizer=tokenizer,
             question=question,
@@ -1007,7 +1007,7 @@ def prepare_generation_task_inputs(
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if spec.answer_mode == "squad":
+    if spec.answer_mode in {"squad", "paired_list_qa"}:
         context_prefix = prepare_squad_v11_context_inputs(
             tokenizer=tokenizer,
             context=context,
