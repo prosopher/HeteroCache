@@ -344,10 +344,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
 
     generation_dataset_specs = []
     if eval_config.enable_generation_eval:
-        generation_dataset_specs = [
-            get_squad_v11_dataset_spec(),
-            get_multinews_generation_dataset_spec(),
-        ]
+        generation_dataset_specs = get_default_generation_dataset_specs()
     else:
         logger.info("Skipping generation evaluation datasets (enable_generation_eval=False)")
 

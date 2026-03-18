@@ -112,6 +112,20 @@ def get_squad_v11_dataset_spec() -> HFDatasetSpec:
     )
 
 
+def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="NewsQA/validation",
+        dataset_path="tau/mrqa",
+        dataset_name="newsqa",
+        split="validation",
+        answer_mode="squad",
+        question_field="question",
+        context_field="context",
+        answers_field="answers",
+        streaming=False,
+    )
+
+
 def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
         name_for_log="MultiNews/validation",
@@ -123,6 +137,17 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
         answers_field="summary",
         streaming=False,
     )
+
+
+GENERATION_BENCHMARK_SPECS = [
+    get_squad_v11_dataset_spec,
+    get_newsqa_generation_dataset_spec,
+    get_multinews_generation_dataset_spec,
+]
+
+
+def get_default_generation_dataset_specs() -> List[HFDatasetSpec]:
+    return [factory() for factory in GENERATION_BENCHMARK_SPECS]
 
 
 def _normalize_answer_texts(raw_value: Any) -> List[str]:
@@ -1355,13 +1380,20 @@ def build_direction_summary_markdown_table(
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
     ]
-    multinews_dataset_key = "MultiNews/validation"
+    generation_dataset_keys = [
+        ("SQuAD", "SQuAD-v1.1/validation"),
+        ("NewsQA", "NewsQA/validation"),
+        ("MultiNews", "MultiNews/validation"),
+    ]
 
     logit_rows = {
         display_name: all_logit_results.get(dataset_key, {}).get(direction, {})
         for display_name, dataset_key in logit_dataset_keys
     }
-    multinews_row = all_generation_results.get(multinews_dataset_key, {}).get(direction, {})
+    generation_rows = {
+        display_name: all_generation_results.get(dataset_key, {}).get(direction, {})
+        for display_name, dataset_key in generation_dataset_keys
+    }
 
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
@@ -1375,6 +1407,16 @@ def build_direction_summary_markdown_table(
         logit_rows["BoolQ"].get("native_accuracy", float("nan")),
         logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
     ])
+    translated_generation_f1_avg = _summary_mean([
+        generation_rows["SQuAD"].get("f1", float("nan")),
+        generation_rows["NewsQA"].get("f1", float("nan")),
+        generation_rows["MultiNews"].get("f1", float("nan")),
+    ])
+    native_generation_f1_avg = _summary_mean([
+        generation_rows["SQuAD"].get("native_f1", float("nan")),
+        generation_rows["NewsQA"].get("native_f1", float("nan")),
+        generation_rows["MultiNews"].get("native_f1", float("nan")),
+    ])
 
     if edge is None:
         target_model_id = "target"
@@ -1387,14 +1429,17 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | MultiNews |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | MultiNews | Gen F1 Avg |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(native_accuracy_avg)} | "
-            f"{_format_summary_float(multinews_row.get('native_f1', float('nan')))} |"
+            f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
+            f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
+            f"{_format_summary_float(generation_rows['MultiNews'].get('native_f1', float('nan')))} | "
+            f"{_format_summary_float(native_generation_f1_avg)} |"
         ),
         (
             f"| {alg} | "
@@ -1402,7 +1447,10 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(translated_accuracy_avg)} | "
-            f"{_format_summary_float(multinews_row.get('f1', float('nan')))} |"
+            f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
+            f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
+            f"{_format_summary_float(generation_rows['MultiNews'].get('f1', float('nan')))} | "
+            f"{_format_summary_float(translated_generation_f1_avg)} |"
         ),
     ]
     return "\n".join(lines)

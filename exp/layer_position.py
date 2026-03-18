@@ -42,6 +42,10 @@ SQUAD_DATASET_SPECS = [
     get_squad_v11_dataset_spec(),
 ]
 
+NEWSQA_DATASET_SPECS = [
+    get_newsqa_generation_dataset_spec(),
+]
+
 MULTINEWS_DATASET_SPECS = [
     get_multinews_generation_dataset_spec(),
 ]
@@ -119,8 +123,8 @@ class LayerPositionConfig:
             raise ValueError("position_layer_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
-        if self.benchmark_mode not in {"qa_accuracy", "squad_f1", "multinews_f1"}:
-            raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1', 'multinews_f1'}")
+        if self.benchmark_mode not in {"qa_accuracy", "squad_f1", "newsqa_f1", "multinews_f1"}:
+            raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1', 'newsqa_f1', 'multinews_f1'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
         normalized_streams = "".join(sorted(set(str(self.principal_rotation_streams).lower())))
@@ -1903,6 +1907,8 @@ def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
         return LOGIT_QA_DATASET_SPECS
     if benchmark_mode == "squad_f1":
         return SQUAD_DATASET_SPECS
+    if benchmark_mode == "newsqa_f1":
+        return NEWSQA_DATASET_SPECS
     if benchmark_mode == "multinews_f1":
         return MULTINEWS_DATASET_SPECS
     raise ValueError(f"Unsupported benchmark_mode: {benchmark_mode}")
@@ -2251,10 +2257,15 @@ def run_eval(
             "kl(native||mag)=%.6f | kl(native||full)=%.6f | kl(full||dir)=%.6f | "
             "kl(full||mag)=%.6f | count=%d"
         )
-    elif config.benchmark_mode in {"squad_f1", "multinews_f1"}:
+    elif config.benchmark_mode in {"squad_f1", "newsqa_f1", "multinews_f1"}:
         metric_name = "f1"
         dataset_results_key = "dataset_f1"
-        dataset_specs = SQUAD_DATASET_SPECS if config.benchmark_mode == "squad_f1" else MULTINEWS_DATASET_SPECS
+        if config.benchmark_mode == "squad_f1":
+            dataset_specs = SQUAD_DATASET_SPECS
+        elif config.benchmark_mode == "newsqa_f1":
+            dataset_specs = NEWSQA_DATASET_SPECS
+        else:
+            dataset_specs = MULTINEWS_DATASET_SPECS
         dataset_evaluator = evaluate_generation_dataset
         dataloader_builder = build_generation_eval_dataloader
         progress_log_template = (
@@ -2431,7 +2442,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1", "multinews_f1"], default="squad_f1")
+    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1", "newsqa_f1", "multinews_f1"], default="squad_f1")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
     return parser.parse_args()
 
