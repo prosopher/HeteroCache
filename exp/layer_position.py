@@ -1788,24 +1788,45 @@ def evaluate_generation_dataset(
                     n=1,
                 )
 
-                native_log_probs = compute_next_token_log_probs(
+                native_scoring_past = prepare_answer_scoring_past(
                     model=models[edge.dst_id],
                     past_key_values=native_target_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                dir_only_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=dir_only_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                mag_only_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=mag_only_past,
+                    question_cache_ids=question_cache_ids,
+                )
+                full_mix_scoring_past = prepare_answer_scoring_past(
+                    model=models[edge.dst_id],
+                    past_key_values=full_mix_past,
+                    question_cache_ids=question_cache_ids,
+                )
+
+                native_log_probs = compute_next_token_log_probs(
+                    model=models[edge.dst_id],
+                    past_key_values=native_scoring_past,
                     seed_token=seed_token,
                 )
                 dir_only_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=dir_only_past,
+                    past_key_values=dir_only_scoring_past,
                     seed_token=seed_token,
                 )
                 mag_only_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=mag_only_past,
+                    past_key_values=mag_only_scoring_past,
                     seed_token=seed_token,
                 )
                 full_mix_log_probs = compute_next_token_log_probs(
                     model=models[edge.dst_id],
-                    past_key_values=full_mix_past,
+                    past_key_values=full_mix_scoring_past,
                     seed_token=seed_token,
                 )
                 path_logit_kl[direction].update(
