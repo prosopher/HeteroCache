@@ -776,13 +776,6 @@ def prepare_generation_prefix(tokenizer, context: str, question: str, device: st
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
-def format_generation_context_prefix(context: str) -> str:
-    return (
-        "Read the passage and answer the question briefly.\n\n"
-        f"Context: {context.strip()}\n"
-    )
-
-
 def format_generation_question_prefix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
@@ -813,21 +806,6 @@ def prepare_full_text_inputs(
     }
 
 
-def prepare_generation_context_inputs(
-    tokenizer,
-    context: str,
-    device: str,
-    max_input_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    prefix_text = format_generation_context_prefix(context=context)
-    return prepare_full_text_inputs(
-        tokenizer=tokenizer,
-        text=prefix_text,
-        device=device,
-        max_input_tokens=max_input_tokens,
-    )
-
-
 def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
     prefix_text = format_generation_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
@@ -851,7 +829,7 @@ def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrain
     return min(limits)
 
 
-def get_answer_token_budget_for_spec(spec: HFDatasetSpec, eval_config) -> int:
+def get_answer_token_budget(eval_config) -> int:
     return int(getattr(eval_config, "generation_max_new_tokens"))
 
 
@@ -872,7 +850,7 @@ def compute_benchmark_context_budget(
     reserved_tokens = (
         int(question_prefix["cache_ids"].shape[1])
         + int(question_prefix["seed_token"].shape[1])
-        + get_answer_token_budget_for_spec(spec, eval_config)
+        + get_answer_token_budget(eval_config)
     )
     budget = shared_limit - reserved_tokens
     if budget < 16:
@@ -902,31 +880,6 @@ def prepare_generation_task_question_prefix(
             device=device,
         )
     return prepare_generation_question_prefix(
-        tokenizer=tokenizer,
-        question=question,
-        device=device,
-    )
-
-
-def prepare_logit_task_question_prefix(
-    spec: HFDatasetSpec,
-    tokenizer,
-    question: str,
-    device: str,
-) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode == "boolq":
-        return prepare_boolq_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
-    if spec.answer_mode == "pubmed_qa":
-        return prepare_pubmed_qa_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
-    return prepare_question_prefix(
         tokenizer=tokenizer,
         question=question,
         device=device,
@@ -1064,13 +1017,11 @@ def prepare_generation_task_inputs(
 
 
 def predict_generation_task_answer(
-    spec: HFDatasetSpec,
     model,
     tokenizer,
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
     eval_config,
-    context: str,
     question_cache_ids: Optional[torch.Tensor] = None,
 ) -> str:
     generation_past = past_key_values
@@ -1130,7 +1081,6 @@ def build_text_candidate_token_ids(
 def build_logit_answer_candidates(
     tokenizer,
     spec: HFDatasetSpec,
-    example: Dict[str, Any],
 ) -> Dict[str, torch.Tensor]:
     if spec.answer_mode == "boolq":
         return build_text_candidate_token_ids(
@@ -1211,13 +1161,6 @@ def prepare_answer_scoring_past(
 
 def predict_answer_label(choice_scores: Dict[str, float]) -> str:
     return max(choice_scores.items(), key=lambda item: item[1])[0]
-
-
-def format_choice_scores(choice_scores: Dict[str, float]) -> str:
-    return " | ".join(
-        f"{label}={score:.6f}"
-        for label, score in choice_scores.items()
-    )
 
 
 @torch.inference_mode()

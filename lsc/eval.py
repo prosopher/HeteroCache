@@ -55,7 +55,6 @@ def evaluate_dataset(
             candidate_token_ids = build_logit_answer_candidates(
                 tokenizer=tokenizer,
                 spec=spec,
-                example=example,
             )
 
             past_by_node_id = {
@@ -191,7 +190,7 @@ def evaluate_generation_dataset(
                     spec.name_for_log,
                     int(cache_input_ids.shape[1]),
                     question_cache_tokens,
-                    get_answer_token_budget_for_spec(spec, eval_config),
+                    get_answer_token_budget(eval_config),
                 )
 
             past_by_node_id = {
@@ -220,23 +219,19 @@ def evaluate_generation_dataset(
                 )
 
                 translated_answer = predict_generation_task_answer(
-                    spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=mixed_target_past,
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
                 native_answer = predict_generation_task_answer(
-                    spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=past_by_node_id[edge.dst_id],
                     seed_token=seed_token,
                     eval_config=eval_config,
-                    context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
 

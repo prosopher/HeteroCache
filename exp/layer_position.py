@@ -667,7 +667,6 @@ class ControlMetricMeter:
                 "delta_dir_only": float("nan"),
                 "delta_mag_only": float("nan"),
                 "delta_full_mix": float("nan"),
-                "synergy": float("nan"),
                 "count": 0,
             }
         native_value = self.native_sum / self.count
@@ -677,7 +676,6 @@ class ControlMetricMeter:
         delta_dir_only = dir_only_value - native_value
         delta_mag_only = mag_only_value - native_value
         delta_full_mix = full_mix_value - native_value
-        synergy = delta_full_mix - (delta_dir_only + delta_mag_only)
         return {
             self.metric_name: full_mix_value,
             f"native_{self.metric_name}": native_value,
@@ -687,7 +685,6 @@ class ControlMetricMeter:
             "delta_dir_only": delta_dir_only,
             "delta_mag_only": delta_mag_only,
             "delta_full_mix": delta_full_mix,
-            "synergy": synergy,
             "count": self.count,
         }
 
@@ -909,7 +906,6 @@ def build_layer_mappings(
             f"start={reference_target_layer_idx}, end={reference_target_layer_end_idx}, "
             f"last_layer={reference_target_spec.num_layers - 1}"
         )
-    reference_translated_num_layers = requested_window_size
 
     relative_depth = relative_depth_from_layer_index(reference_target_layer_idx, reference_target_spec.num_layers)
 
@@ -1214,10 +1210,6 @@ def build_layer_mapping_path(run_dir: Path) -> Path:
 
 def build_metrics_path(run_dir: Path) -> Path:
     return run_dir / "target_injection_evaluation_metrics.json"
-
-def build_chart_path(study_dir: Path, metric_name: str) -> Path:
-    return study_dir / f"layer_idx_vs_{sanitize_slug(metric_name)}.png"
-
 
 def log_layer_mappings(
     logger: logging.Logger,
@@ -1691,7 +1683,7 @@ def evaluate_generation_dataset(
                     spec.name_for_log,
                     int(cache_input_ids.shape[1]),
                     question_cache_tokens,
-                    get_answer_token_budget_for_spec(spec, config),
+                    get_answer_token_budget(config),
                 )
 
             past_by_node_id = {
@@ -1744,43 +1736,35 @@ def evaluate_generation_dataset(
                 )
 
                 native_answer = predict_generation_task_answer(
-                    spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=native_target_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
                 dir_only_answer = predict_generation_task_answer(
-                    spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=dir_only_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
                 mag_only_answer = predict_generation_task_answer(
-                    spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=mag_only_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
                 full_mix_answer = predict_generation_task_answer(
-                    spec=spec,
                     model=models[edge.dst_id],
                     tokenizer=tokenizer,
                     past_key_values=full_mix_past,
                     seed_token=seed_token,
                     eval_config=config,
-                    context=context_text,
                     question_cache_ids=question_cache_ids,
                 )
 
@@ -1890,7 +1874,6 @@ class SummaryRow:
     average_delta_dir_only: float
     average_delta_mag_only: float
     average_delta_full_mix: float
-    average_synergy: float
     average_native_to_dir_only_logit_kl: float
     average_native_to_mag_only_logit_kl: float
     average_native_to_full_mix_logit_kl: float
@@ -1900,18 +1883,6 @@ class SummaryRow:
 
 def build_summary_csv_path(study_dir: Path) -> Path:
     return study_dir / "summary.csv"
-
-
-def resolve_dataset_specs(benchmark_mode: str) -> List[HFDatasetSpec]:
-    if benchmark_mode == "qa_accuracy":
-        return LOGIT_QA_DATASET_SPECS
-    if benchmark_mode == "squad_f1":
-        return SQUAD_DATASET_SPECS
-    if benchmark_mode == "newsqa_f1":
-        return NEWSQA_DATASET_SPECS
-    if benchmark_mode == "multinews_f1":
-        return MULTINEWS_DATASET_SPECS
-    raise ValueError(f"Unsupported benchmark_mode: {benchmark_mode}")
 
 
 def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1930,7 +1901,6 @@ def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
         "average_delta_dir_only": combined_metrics["average_delta_dir_only"],
         "average_delta_mag_only": combined_metrics["average_delta_mag_only"],
         "average_delta_full_mix": combined_metrics["average_delta_full_mix"],
-        "average_synergy": combined_metrics["average_synergy"],
         f"average_{metric_name}": combined_metrics[f"average_{metric_name}"],
         f"average_native_{metric_name}": combined_metrics[f"average_native_{metric_name}"],
     }
@@ -1950,7 +1920,6 @@ def extract_analysis_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]
         "average_delta_dir_only": combined_metrics["average_delta_dir_only"],
         "average_delta_mag_only": combined_metrics["average_delta_mag_only"],
         "average_delta_full_mix": combined_metrics["average_delta_full_mix"],
-        "average_synergy": combined_metrics["average_synergy"],
     }
 
 
@@ -1978,7 +1947,6 @@ def build_summary_row(
         average_delta_dir_only=float(metrics["average_delta_dir_only"]),
         average_delta_mag_only=float(metrics["average_delta_mag_only"]),
         average_delta_full_mix=float(metrics["average_delta_full_mix"]),
-        average_synergy=float(metrics["average_synergy"]),
         average_native_to_dir_only_logit_kl=float(metrics["average_native_to_dir_only_logit_kl"]),
         average_native_to_mag_only_logit_kl=float(metrics["average_native_to_mag_only_logit_kl"]),
         average_native_to_full_mix_logit_kl=float(metrics["average_native_to_full_mix_logit_kl"]),
@@ -2062,10 +2030,6 @@ def build_logit_kl_chart_path(study_dir: Path) -> Path:
     return study_dir / "layer_idx_vs_logit_kl.png"
 
 
-def build_synergy_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_synergy.png"
-
-
 def plot_metric_controls_summary(summary_path: Path) -> Path:
     rows = read_summary_rows(summary_path)
     if not rows:
@@ -2134,37 +2098,6 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     return chart_path
 
 
-def plot_synergy_summary(summary_path: Path) -> Path:
-    rows = read_summary_rows(summary_path)
-    if not rows:
-        raise ValueError(f"No plottable rows found in {summary_path}")
-
-    rows.sort(key=lambda row: row.position_layer_idx)
-    x_values = [row.position_layer_idx for row in rows]
-    window_title = format_window_title(rows[0].translated_num_layers)
-    study_dir = summary_path.parent
-
-    import matplotlib.pyplot as plt
-
-    fig = plt.figure(figsize=(9, 5.2))
-    ax = fig.add_subplot(111)
-    ax.plot(x_values, [row.average_synergy for row in rows], marker="o", label="Synergy")
-    annotate_injected_layer_ranges(ax, rows, lambda row: row.average_synergy)
-    ax.axhline(0.0, linestyle="--", linewidth=1.2)
-    ax.set_xlabel("Reference target layer index")
-    ax.set_ylabel("Synergy score")
-    ax.set_title(f"Synergy vs layer index ({window_title})")
-    ax.set_xticks(x_values)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-
-    chart_path = build_synergy_chart_path(study_dir)
-    fig.savefig(chart_path, dpi=200)
-    plt.close(fig)
-    return chart_path
-
-
 def remove_stale_summary_artifacts(study_dir: Path, run_dir: Path) -> None:
     stale_paths = [
         run_dir / "eval_summary.md",
@@ -2192,7 +2125,7 @@ def save_run_artifacts(
     layer_mappings: Dict[str, LayerMapping],
     eval_metrics: Dict[str, Any],
     combined_metrics: Dict[str, Any],
-) -> Tuple[Path, Path, Path, Path, Path]:
+) -> Tuple[Path, Path, Path, Path]:
     study_dir = run_dir.parent
     study_dir.mkdir(parents=True, exist_ok=True)
     remove_stale_summary_artifacts(study_dir, run_dir)
@@ -2202,8 +2135,7 @@ def save_run_artifacts(
     summary_path = update_summary(config, run_dir, combined_metrics)
     metric_controls_chart_path = plot_metric_controls_summary(summary_path)
     logit_kl_chart_path = plot_logit_kl_summary(summary_path)
-    synergy_chart_path = plot_synergy_summary(summary_path)
-    return summary_path, build_metrics_path(run_dir), metric_controls_chart_path, logit_kl_chart_path, synergy_chart_path
+    return summary_path, build_metrics_path(run_dir), metric_controls_chart_path, logit_kl_chart_path
 
 def run_eval(
     config: LayerPositionConfig,
@@ -2253,7 +2185,7 @@ def run_eval(
         progress_log_template = (
             "[%s] %s | native_%s=%.6f | dir_only_%s=%.6f | mag_only_%s=%.6f | "
             "full_mix_%s=%.6f | delta_dir_only=%.6f | delta_mag_only=%.6f | "
-            "delta_full_mix=%.6f | synergy=%.6f | kl(native||dir)=%.6f | "
+            "delta_full_mix=%.6f | kl(native||dir)=%.6f | "
             "kl(native||mag)=%.6f | kl(native||full)=%.6f | kl(full||dir)=%.6f | "
             "kl(full||mag)=%.6f | count=%d"
         )
@@ -2271,7 +2203,7 @@ def run_eval(
         progress_log_template = (
             "[%s] %s | native_%s=%.6f | dir_only_%s=%.6f | mag_only_%s=%.6f | "
             "full_mix_%s=%.6f | delta_dir_only=%.6f | delta_mag_only=%.6f | "
-            "delta_full_mix=%.6f | synergy=%.6f | kl(native||dir)=%.6f | "
+            "delta_full_mix=%.6f | kl(native||dir)=%.6f | "
             "kl(native||mag)=%.6f | kl(native||full)=%.6f | kl(full||dir)=%.6f | "
             "kl(full||mag)=%.6f | count=%d"
         )
@@ -2309,7 +2241,6 @@ def run_eval(
                 metric_row["delta_dir_only"],
                 metric_row["delta_mag_only"],
                 metric_row["delta_full_mix"],
-                metric_row["synergy"],
                 logit_row["native_to_dir_only_logit_kl"],
                 logit_row["native_to_mag_only_logit_kl"],
                 logit_row["native_to_full_mix_logit_kl"],
@@ -2320,7 +2251,6 @@ def run_eval(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    average_metric = compute_average_metric(dataset_results_by_name, metric_name)
     average_native_metric = compute_average_metric(dataset_results_by_name, f"native_{metric_name}")
     average_dir_only_metric = compute_average_metric(dataset_results_by_name, f"dir_only_{metric_name}")
     average_mag_only_metric = compute_average_metric(dataset_results_by_name, f"mag_only_{metric_name}")
@@ -2328,7 +2258,6 @@ def run_eval(
     average_delta_dir_only = compute_average_metric(dataset_results_by_name, "delta_dir_only")
     average_delta_mag_only = compute_average_metric(dataset_results_by_name, "delta_mag_only")
     average_delta_full_mix = compute_average_metric(dataset_results_by_name, "delta_full_mix")
-    average_synergy = compute_average_metric(dataset_results_by_name, "synergy")
     average_native_to_dir_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_dir_only_logit_kl")
     average_native_to_mag_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_mag_only_logit_kl")
     average_native_to_full_mix_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_full_mix_logit_kl")
@@ -2344,11 +2273,10 @@ def run_eval(
         average_full_mix_metric,
     )
     logger.info(
-        "[Summary] delta_dir_only=%.6f | delta_mag_only=%.6f | delta_full_mix=%.6f | synergy=%.6f",
+        "[Summary] delta_dir_only=%.6f | delta_mag_only=%.6f | delta_full_mix=%.6f",
         average_delta_dir_only,
         average_delta_mag_only,
         average_delta_full_mix,
-        average_synergy,
     )
     logger.info(
         "[Summary] avg_kl(native||dir)=%.6f | avg_kl(native||mag)=%.6f | avg_kl(native||full)=%.6f | avg_kl(full||dir)=%.6f | avg_kl(full||mag)=%.6f",
@@ -2371,7 +2299,6 @@ def run_eval(
         "average_delta_dir_only": average_delta_dir_only,
         "average_delta_mag_only": average_delta_mag_only,
         "average_delta_full_mix": average_delta_full_mix,
-        "average_synergy": average_synergy,
         f"average_{metric_name}": average_full_mix_metric,
         f"average_native_{metric_name}": average_native_metric,
         "dataset_logit_kl": dataset_logit_kl_by_name,
@@ -2383,12 +2310,10 @@ def run_eval(
     }
 
 
-
-
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Source/target KV caches can be rotated into SVD principal coordinates before translation and inverse-rotated afterward. Task decomposition, logit-KL comparison, and synergy analysis are run automatically as part of the same execution."
+        description="Train and evaluate a translated layer window anchored at a chosen reference-target layer position by replaying target prefill below the window, injecting the translated window, and continuing above it. Source/target KV caches can be rotated into SVD principal coordinates before translation and inverse-rotated afterward. Task decomposition and logit-KL comparison are run automatically as part of the same execution."
     )
     parser.add_argument("--model-ids", default="gpt2,gpt2")
     parser.add_argument("--model-directions", default="A_to_B")
@@ -2445,7 +2370,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1", "newsqa_f1", "multinews_f1"], default="squad_f1")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
     return parser.parse_args()
-
 
 
 def main() -> None:
@@ -2530,7 +2454,7 @@ def main() -> None:
     eval_metrics = extract_eval_metrics(combined_metrics)
     analysis_metrics = extract_analysis_metrics(combined_metrics)
 
-    summary_path, metrics_path, metric_controls_chart_path, logit_kl_chart_path, synergy_chart_path = save_run_artifacts(
+    summary_path, metrics_path, metric_controls_chart_path, logit_kl_chart_path = save_run_artifacts(
         config=config,
         run_dir=run_dir,
         layer_mappings=layer_mappings,
@@ -2546,7 +2470,6 @@ def main() -> None:
     print(f"Control analysis metrics: {analysis_metrics_path}")
     print(f"Principal rotation metadata: {build_principal_rotation_metadata_path(run_dir)}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
-    print(f"Synergy chart: {synergy_chart_path}")
 
 
 if __name__ == "__main__":
