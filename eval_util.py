@@ -118,7 +118,7 @@ def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
         dataset_path="gabrieltorresgamez/newsqa",
         dataset_name=None,
         split="validation",
-        answer_mode="paired_list_qa",
+        answer_mode="newsqa",
         question_field="questions",
         context_field="paragraph",
         answers_field="answers",
@@ -205,7 +205,7 @@ def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) ->
             "answers": answer_texts,
         }]
 
-    if spec.answer_mode == "paired_list_qa":
+    if spec.answer_mode == "newsqa":
         context_field = spec.context_field or "paragraph"
         question_field = spec.question_field or "questions"
         answers_field = spec.answers_field or "answers"
@@ -889,7 +889,7 @@ def prepare_generation_task_question_prefix(
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode in {"squad", "paired_list_qa"}:
+    if spec.answer_mode in {"squad", "newsqa"}:
         return prepare_squad_v11_question_prefix(
             tokenizer=tokenizer,
             question=question,
@@ -1007,7 +1007,7 @@ def prepare_generation_task_inputs(
     device: str,
     max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if spec.answer_mode in {"squad", "paired_list_qa"}:
+    if spec.answer_mode in {"squad", "newsqa"}:
         context_prefix = prepare_squad_v11_context_inputs(
             tokenizer=tokenizer,
             context=context,
