@@ -115,12 +115,12 @@ def get_squad_v11_dataset_spec() -> HFDatasetSpec:
 def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
         name_for_log="NewsQA/validation",
-        dataset_path="tau/mrqa",
-        dataset_name="newsqa",
+        dataset_path="gabrieltorresgamez/newsqa",
+        dataset_name=None,
         split="validation",
-        answer_mode="squad",
-        question_field="question",
-        context_field="context",
+        answer_mode="paired_list_qa",
+        question_field="questions",
+        context_field="paragraph",
         answers_field="answers",
         streaming=False,
     )
@@ -182,28 +182,60 @@ def normalize_multinews_context_text(raw_value: Any) -> Optional[str]:
     return normalized or None
 
 
-def extract_generation_example(spec: HFDatasetSpec, example: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) -> List[Dict[str, Any]]:
     if spec.answer_mode == "squad":
         question = example.get(spec.question_field, "")
         if not isinstance(question, str) or not question.strip():
-            return None
+            return []
 
         context_field = spec.context_field or "context"
         answers_field = spec.answers_field or "answers"
 
         context = example.get(context_field, "")
         if not isinstance(context, str) or not context.strip():
-            return None
+            return []
 
         answer_texts = _normalize_answer_texts(example.get(answers_field, None))
         if not answer_texts:
-            return None
+            return []
 
-        return {
+        return [{
             "question": question.strip(),
             "context": context.strip(),
             "answers": answer_texts,
-        }
+        }]
+
+    if spec.answer_mode == "paired_list_qa":
+        context_field = spec.context_field or "paragraph"
+        question_field = spec.question_field or "questions"
+        answers_field = spec.answers_field or "answers"
+
+        context = normalize_context_text(example.get(context_field, None))
+        if context is None:
+            return []
+
+        raw_questions = example.get(question_field, None)
+        raw_answers = example.get(answers_field, None)
+        if not isinstance(raw_questions, list) or not isinstance(raw_answers, list):
+            return []
+
+        generation_examples: List[Dict[str, Any]] = []
+        for raw_question, raw_answer in zip(raw_questions, raw_answers):
+            if not isinstance(raw_question, str) or not raw_question.strip():
+                continue
+
+            answer_texts = _normalize_answer_texts(raw_answer)
+            if not answer_texts and isinstance(raw_answer, str) and raw_answer.strip():
+                answer_texts = [raw_answer.strip()]
+            if not answer_texts:
+                continue
+
+            generation_examples.append({
+                "question": raw_question.strip(),
+                "context": context,
+                "answers": answer_texts,
+            })
+        return generation_examples
 
     if spec.answer_mode == "multinews":
         question_value = example.get(spec.question_field, None)
@@ -217,17 +249,17 @@ def extract_generation_example(spec: HFDatasetSpec, example: Dict[str, Any]) -> 
 
         context = normalize_multinews_context_text(example.get(context_field, None))
         if context is None:
-            return None
+            return []
 
         answer_texts = _normalize_answer_texts(example.get(answers_field, None))
         if not answer_texts:
-            return None
+            return []
 
-        return {
+        return [{
             "question": question,
             "context": context,
             "answers": answer_texts,
-        }
+        }]
 
     raise ValueError(f"Unsupported generation answer_mode: {spec.answer_mode}")
 
@@ -273,14 +305,15 @@ class HFGenerationExampleStream(IterableDataset):
         emitted = 0
 
         for example in dataset:
-            generation_example = extract_generation_example(self.spec, example)
-            if generation_example is None:
+            generation_examples = extract_generation_examples(self.spec, example)
+            if not generation_examples:
                 continue
 
-            yield generation_example
-            emitted += 1
-            if emitted >= self.max_examples:
-                return
+            for generation_example in generation_examples:
+                yield generation_example
+                emitted += 1
+                if emitted >= self.max_examples:
+                    return
 
 
 def build_generation_eval_dataloader(
