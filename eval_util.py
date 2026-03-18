@@ -967,7 +967,7 @@ def prepare_generation_task_inputs(
             "cache_input_ids": context_prefix["input_ids"],
             "question_cache_ids": question_prefix["cache_ids"],
             "seed_token": question_prefix["seed_token"],
-            "was_truncated": False,
+            "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
     if spec.answer_mode == "multinews":
