@@ -163,7 +163,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             context_budget = None
-            if spec.answer_mode == "multinews":
+            if spec.answer_mode in {"squad", "multinews"}:
                 context_budget = compute_benchmark_context_budget(
                     tokenizer=tokenizer,
                     spec=spec,

@@ -616,9 +616,19 @@ def format_squad_v11_question_prefix(question: str) -> str:
     )
 
 
-def prepare_squad_v11_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+def prepare_squad_v11_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
     prefix_text = format_squad_v11_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
 def prepare_squad_v11_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
@@ -944,6 +954,7 @@ def prepare_generation_task_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
+            max_input_tokens=max_input_tokens,
         )
         question_prefix = prepare_squad_v11_question_prefix(
             tokenizer=tokenizer,
