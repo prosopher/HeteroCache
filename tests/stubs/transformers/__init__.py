@@ -20,18 +20,34 @@ class TinyTokenizer(PreTrainedTokenizerBase):
         self.pad_token_id = 0
         self.eos_token_id = 1
         self.padding_side = "right"
+        self.model_max_length = 128
         self._vocab_size = 128
 
     def _encode_text(self, text: str) -> List[int]:
-        # Simple byte-ish tokenizer: stable, fast, and guaranteed to emit >=1 token
+        # Simple byte-ish tokenizer: stable, fast, and guaranteed to emit >=1 token.
         if not text:
             return [self.eos_token_id]
         return [2 + (ord(ch) % (self._vocab_size - 2)) for ch in text]
 
-    def __call__(self, text: str, return_tensors: str | None = None, add_special_tokens: bool = True, verbose: bool = False):
+    def __call__(
+        self,
+        text: str,
+        return_tensors: str | None = None,
+        add_special_tokens: bool = True,
+        verbose: bool = False,
+        truncation: bool = False,
+        max_length: int | None = None,
+        **_: object,
+    ):
+        del verbose
+
         token_ids = self._encode_text(text)
         if add_special_tokens:
             token_ids = token_ids + [self.eos_token_id]
+
+        if truncation and max_length is not None:
+            token_ids = token_ids[:max_length]
+
         if return_tensors == "pt":
             return SimpleNamespace(input_ids=torch.tensor([token_ids], dtype=torch.long))
         return SimpleNamespace(input_ids=token_ids)

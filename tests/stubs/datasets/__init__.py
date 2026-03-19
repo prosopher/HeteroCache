@@ -69,16 +69,36 @@ def load_dataset(dataset_path: str, dataset_name: str | None = None, split: str 
         return FakeMapDataset(items)
 
     if key == ("rajpurkar/squad", None, "validation"):
+        long_prefix = " ".join(["context"] * 80)
         items = [
             {
                 "question": "What color is the sky?",
-                "context": "On a clear day, the sky looks blue.",
+                "context": f"{long_prefix} On a clear day, the sky looks blue.",
                 "answers": {"text": ["blue"]},
             },
             {
                 "question": "What do bees make?",
                 "context": "Bees are known for making honey.",
                 "answers": {"text": ["honey"]},
+            },
+        ]
+        return FakeMapDataset(items)
+
+    if key == ("gabrieltorresgamez/newsqa", None, "validation"):
+        long_prefix = " ".join(["news"] * 90)
+        items = [
+            {
+                "paragraph": f"{long_prefix} The answer hidden in the report is blue.",
+                "questions": ["What color is mentioned in the report?", "Which animal is discussed?"],
+                "answers": [
+                    {"text": ["blue"]},
+                    {"text": ["fox"]},
+                ],
+            },
+            {
+                "paragraph": "The short article says the baker sold bread.",
+                "questions": ["What did the baker sell?"],
+                "answers": [{"text": ["bread"]}],
             },
         ]
         return FakeMapDataset(items)
