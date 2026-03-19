@@ -22,18 +22,10 @@ class EvalConfig:
 
     # generation QA
     generation_max_new_tokens: int
-    enable_generation_eval: bool = True
 
-    # extractive SQuAD-style QA
-    extractive_max_answer_tokens: int = 8
-    extractive_beam_size: int = 4
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
-        if self.extractive_max_answer_tokens < 1:
-            raise ValueError("extractive_max_answer_tokens must be >= 1")
-        if self.extractive_beam_size < 1:
-            raise ValueError("extractive_beam_size must be >= 1")
         initialize_eval_output_paths(self)
 
 
@@ -105,15 +97,55 @@ class HFQAPairStream(IterableDataset):
 DEFAULT_MULTINEWS_SUMMARY_TASK = "Summarize the news articles above."
 
 
-def get_extractive_squad_generation_dataset_spec() -> HFDatasetSpec:
+def get_boolq_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
-        name_for_log="SQuAD/validation",
+        name_for_log="BoolQ/validation",
+        dataset_path="google/boolq",
+        dataset_name=None,
+        split="validation",
+        answer_mode="boolq",
+        question_field="question",
+        context_field="passage",
+        streaming=False,
+    )
+
+
+def get_pubmedqa_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="PubMedQA/pqa_labeled/train",
+        dataset_path="qiaojin/PubMedQA",
+        dataset_name="pqa_labeled",
+        split="train",
+        answer_mode="pubmed_qa",
+        question_field="question",
+        context_field="context",
+        streaming=False,
+    )
+
+
+def get_squad_v11_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="SQuAD-v1.1/validation",
         dataset_path="rajpurkar/squad",
         dataset_name=None,
         split="validation",
         answer_mode="squad",
         question_field="question",
         context_field="context",
+        answers_field="answers",
+        streaming=False,
+    )
+
+
+def get_newsqa_generation_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="NewsQA/validation",
+        dataset_path="gabrieltorresgamez/newsqa",
+        dataset_name=None,
+        split="validation",
+        answer_mode="newsqa",
+        question_field="questions",
+        context_field="paragraph",
         answers_field="answers",
         streaming=False,
     )
@@ -130,6 +162,38 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
         answers_field="summary",
         streaming=False,
     )
+
+
+LOGIT_QA_SPEC_GROUP_FACTORIES = [
+    get_boolq_dataset_spec,
+    get_pubmedqa_dataset_spec,
+]
+
+GEN_QA_SPEC_GROUP_FACTORIES = [
+    get_squad_v11_dataset_spec,
+    get_newsqa_generation_dataset_spec,
+]
+
+EVAL_SPEC_GROUP_FACTORIES = {
+    "logit_qa": LOGIT_QA_SPEC_GROUP_FACTORIES,
+    "gen_qa": GEN_QA_SPEC_GROUP_FACTORIES,
+}
+
+
+def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
+    try:
+        factories = EVAL_SPEC_GROUP_FACTORIES[group_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported eval spec group: {group_name}") from exc
+    return [factory() for factory in factories]
+
+
+def get_default_logit_qa_dataset_specs() -> List[HFDatasetSpec]:
+    return get_eval_spec_group("logit_qa")
+
+
+def get_default_gen_qa_dataset_specs() -> List[HFDatasetSpec]:
+    return get_eval_spec_group("gen_qa")
 
 
 def _normalize_answer_texts(raw_value: Any) -> List[str]:
@@ -164,52 +228,85 @@ def normalize_multinews_context_text(raw_value: Any) -> Optional[str]:
     return normalized or None
 
 
-def extract_generation_example(spec: HFDatasetSpec, example: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) -> List[Dict[str, Any]]:
     if spec.answer_mode == "squad":
         question = example.get(spec.question_field, "")
         if not isinstance(question, str) or not question.strip():
-            return None
+            return []
 
         context_field = spec.context_field or "context"
         answers_field = spec.answers_field or "answers"
 
         context = example.get(context_field, "")
         if not isinstance(context, str) or not context.strip():
-            return None
+            return []
 
         answer_texts = _normalize_answer_texts(example.get(answers_field, None))
         if not answer_texts:
-            return None
+            return []
 
-        return {
+        return [{
             "question": question.strip(),
             "context": context.strip(),
             "answers": answer_texts,
-        }
+        }]
 
-    if spec.answer_mode == "multinews":
-        question_value = example.get(spec.question_field, None)
-        if isinstance(question_value, str) and question_value.strip():
-            question = question_value.strip()
-        else:
-            question = DEFAULT_MULTINEWS_SUMMARY_TASK
+    if spec.answer_mode == "newsqa":
+        context_field = spec.context_field or "paragraph"
+        question_field = spec.question_field or "questions"
+        answers_field = spec.answers_field or "answers"
 
-        context_field = spec.context_field or "document"
-        answers_field = spec.answers_field or "summary"
-
-        context = normalize_multinews_context_text(example.get(context_field, None))
+        context = normalize_context_text(example.get(context_field, None))
         if context is None:
-            return None
+            return []
 
-        answer_texts = _normalize_answer_texts(example.get(answers_field, None))
-        if not answer_texts:
-            return None
+        raw_questions = example.get(question_field, None)
+        raw_answers = example.get(answers_field, None)
+        if not isinstance(raw_questions, list) or not isinstance(raw_answers, list):
+            return []
 
-        return {
-            "question": question,
-            "context": context,
-            "answers": answer_texts,
-        }
+        generation_examples: List[Dict[str, Any]] = []
+        for raw_question, raw_answer in zip(raw_questions, raw_answers):
+            if not isinstance(raw_question, str) or not raw_question.strip():
+                continue
+
+            answer_texts = _normalize_answer_texts(raw_answer)
+            if not answer_texts and isinstance(raw_answer, str) and raw_answer.strip():
+                answer_texts = [raw_answer.strip()]
+            if not answer_texts:
+                continue
+
+            generation_examples.append({
+                "question": raw_question.strip(),
+                "context": context,
+                "answers": answer_texts,
+            })
+        return generation_examples
+
+
+    # if spec.answer_mode == "multinews":
+    #     question_value = example.get(spec.question_field, None)
+    #     if isinstance(question_value, str) and question_value.strip():
+    #         question = question_value.strip()
+    #     else:
+    #         question = DEFAULT_MULTINEWS_SUMMARY_TASK
+    #
+    #     context_field = spec.context_field or "document"
+    #     answers_field = spec.answers_field or "summary"
+    #
+    #     context = normalize_multinews_context_text(example.get(context_field, None))
+    #     if context is None:
+    #         return []
+    #
+    #     answer_texts = _normalize_answer_texts(example.get(answers_field, None))
+    #     if not answer_texts:
+    #         return []
+    #
+    #     return [{
+    #         "question": question,
+    #         "context": context,
+    #         "answers": answer_texts,
+    #     }]
 
     raise ValueError(f"Unsupported generation answer_mode: {spec.answer_mode}")
 
@@ -255,14 +352,15 @@ class HFGenerationExampleStream(IterableDataset):
         emitted = 0
 
         for example in dataset:
-            generation_example = extract_generation_example(self.spec, example)
-            if generation_example is None:
+            generation_examples = extract_generation_examples(self.spec, example)
+            if not generation_examples:
                 continue
 
-            yield generation_example
-            emitted += 1
-            if emitted >= self.max_examples:
-                return
+            for generation_example in generation_examples:
+                yield generation_example
+                emitted += 1
+                if emitted >= self.max_examples:
+                    return
 
 
 def build_generation_eval_dataloader(
@@ -317,25 +415,19 @@ class RunningAverage:
 class GenerationRunningAverage:
     def __init__(self) -> None:
         self.cosine_sum = 0.0
-        self.exact_match_sum = 0.0
         self.f1_sum = 0.0
-        self.native_exact_match_sum = 0.0
         self.native_f1_sum = 0.0
         self.count = 0
 
     def update(
         self,
         cosine_value: float,
-        exact_match_value: float,
         f1_value: float,
-        native_exact_match_value: float,
         native_f1_value: float,
         n: int,
     ) -> None:
         self.cosine_sum += float(cosine_value) * n
-        self.exact_match_sum += float(exact_match_value) * n
         self.f1_sum += float(f1_value) * n
-        self.native_exact_match_sum += float(native_exact_match_value) * n
         self.native_f1_sum += float(native_f1_value) * n
         self.count += n
 
@@ -343,17 +435,13 @@ class GenerationRunningAverage:
         if self.count == 0:
             return {
                 "cosine": float("nan"),
-                "exact_match": float("nan"),
                 "f1": float("nan"),
-                "native_exact_match": float("nan"),
                 "native_f1": float("nan"),
                 "count": 0,
             }
         return {
             "cosine": self.cosine_sum / self.count,
-            "exact_match": self.exact_match_sum / self.count,
             "f1": self.f1_sum / self.count,
-            "native_exact_match": self.native_exact_match_sum / self.count,
             "native_f1": self.native_f1_sum / self.count,
             "count": self.count,
         }
@@ -503,44 +591,6 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
             "answer": normalized_answer,
         }
 
-    if spec.answer_mode == "mmlu":
-        choices = example.get("choices", None)
-        if not isinstance(choices, list) or len(choices) != 4:
-            return None
-
-        normalized_choices = [
-            choice.strip()
-            for choice in choices
-            if isinstance(choice, str) and choice.strip()
-        ]
-        if len(normalized_choices) != 4:
-            return None
-
-        answer_value = example.get("answer", None)
-        if isinstance(answer_value, int):
-            if answer_value < 0 or answer_value >= 4:
-                return None
-            normalized_answer = chr(ord("A") + answer_value)
-        elif isinstance(answer_value, str):
-            normalized_answer = answer_value.strip().upper()
-            if normalized_answer not in {"A", "B", "C", "D"}:
-                return None
-        else:
-            return None
-
-        qa_example = {
-            "question": question.strip(),
-            "choices": normalized_choices,
-            "answer": normalized_answer,
-        }
-
-        subject_field = spec.subject_field or "subject"
-        subject = example.get(subject_field, None)
-        if isinstance(subject, str) and subject.strip():
-            qa_example["subject"] = subject.strip()
-
-        return qa_example
-
     if spec.answer_mode == "squad":
         context_field = spec.context_field or "context"
         answers_field = spec.answers_field or "answers"
@@ -579,6 +629,54 @@ def extract_question_and_answer(spec: HFDatasetSpec, example: Dict) -> Optional[
     raise ValueError(f"Unsupported answer_mode: {spec.answer_mode}")
 
 
+def format_boolq_context_prefix(context: str) -> str:
+    return (
+        "Read the passage and answer the question with yes or no only.\n\n"
+        f"Passage: {context.strip()}\n"
+    )
+
+
+def format_boolq_question_prefix(question: str) -> str:
+    return (
+        f"Question: {question.strip()}\n"
+        "Answer:"
+    )
+
+
+def prepare_boolq_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_boolq_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_boolq_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_boolq_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
+def format_pubmed_qa_context_prefix(context: str) -> str:
+    return (
+        "Read the abstract and answer the biomedical research question with yes, no, or maybe only.\n\n"
+        f"Abstract: {context.strip()}\n"
+    )
+
+
+def format_pubmed_qa_question_prefix(question: str) -> str:
+    return (
+        f"Question: {question.strip()}\n"
+        "Answer:"
+    )
+
+
+def prepare_pubmed_qa_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
+    prefix_text = format_pubmed_qa_context_prefix(context=context)
+    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+
+
+def prepare_pubmed_qa_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_pubmed_qa_question_prefix(question=question)
+    return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
+
+
 def format_question_prefix(
     question: str,
     choices: Optional[List[str]] = None,
@@ -591,43 +689,12 @@ def format_question_prefix(
     if answer_mode == "boolq":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("BoolQ requires passage context.")
-        return (
-            "Read the passage and answer the question with yes or no only.\n\n"
-            f"Passage: {context.strip()}\n"
-            f"Question: {question}\n"
-            "Answer:"
-        )
+        return format_boolq_context_prefix(context=context) + format_boolq_question_prefix(question=question)
 
     if answer_mode == "pubmed_qa":
         if not isinstance(context, str) or not context.strip():
             raise ValueError("PubMedQA requires abstract context.")
-        return (
-            "Read the abstract and answer the biomedical research question with yes, no, or maybe only.\n\n"
-            f"Abstract: {context.strip()}\n"
-            f"Question: {question}\n"
-            "Answer:"
-        )
-
-    if answer_mode == "mmlu":
-        if not choices or len(choices) != 4:
-            raise ValueError("MMLU requires exactly 4 choices.")
-
-        prompt_lines = []
-        if isinstance(subject, str) and subject.strip():
-            prompt_lines.append(
-                "The following is a multiple choice question about "
-                f"{subject.strip().replace('_', ' ')}."
-            )
-            prompt_lines.append("")
-
-        prompt_lines.append(f"Question: {question}")
-        prompt_lines.append("Choices:")
-        for idx, choice in enumerate(choices):
-            label = chr(ord("A") + idx)
-            prompt_lines.append(f"{label}. {choice.strip()}")
-        prompt_lines.append("Answer with the exact option text only.")
-        prompt_lines.append("Answer:")
-        return "\n".join(prompt_lines)
+        return format_pubmed_qa_context_prefix(context=context) + format_pubmed_qa_question_prefix(question=question)
 
     if not choices:
         return f"Question: {question}\nAnswer:"
@@ -640,27 +707,37 @@ def format_question_prefix(
     return "\n".join(prompt_lines)
 
 
-def format_extractive_context_prefix(context: str) -> str:
+def format_squad_v11_context_prefix(context: str) -> str:
     return (
-        "Read the passage and answer the question by extracting a contiguous span from the passage.\n\n"
+        "Read the passage and answer the question briefly. Use a short phrase from the passage when possible.\n\n"
         f"Passage: {context.strip()}\n"
     )
 
 
-def format_extractive_question_prefix(question: str) -> str:
+def format_squad_v11_question_prefix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
-        "Extracted answer:"
+        "Answer:"
     )
 
 
-def prepare_extractive_context_inputs(tokenizer, context: str, device: str) -> Dict[str, Any]:
-    prefix_text = format_extractive_context_prefix(context=context)
-    return prepare_full_text_inputs(tokenizer=tokenizer, text=prefix_text, device=device)
+def prepare_squad_v11_context_inputs(
+    tokenizer,
+    context: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    prefix_text = format_squad_v11_context_prefix(context=context)
+    return prepare_full_text_inputs(
+        tokenizer=tokenizer,
+        text=prefix_text,
+        device=device,
+        max_input_tokens=max_input_tokens,
+    )
 
 
-def prepare_extractive_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
-    prefix_text = format_extractive_question_prefix(question=question)
+def prepare_squad_v11_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
+    prefix_text = format_squad_v11_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
@@ -696,217 +773,6 @@ def prepare_multinews_context_inputs(
 def prepare_multinews_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
     prefix_text = format_multinews_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
-
-
-
-@dataclass
-class ExtractiveSpanTrieNode:
-    children: Dict[int, "ExtractiveSpanTrieNode"]
-    terminal_text: Optional[str] = None
-
-    def __init__(self) -> None:
-        self.children = {}
-        self.terminal_text = None
-
-
-def _tokenize_extractive_answer_candidate(tokenizer, candidate_text: str) -> List[int]:
-    candidate_text = candidate_text.strip()
-    if not candidate_text:
-        return []
-    return list(tokenizer(" " + candidate_text, add_special_tokens=False).input_ids)
-
-
-@dataclass
-class ExtractiveBeamState:
-    node: ExtractiveSpanTrieNode
-    past_key_values: PastKeyValues
-    input_ids: torch.Tensor
-    total_logprob: float
-    token_count: int
-
-    @property
-    def normalized_score(self) -> float:
-        return self.total_logprob / max(1, self.token_count)
-
-
-def _tokenize_context_for_extractive_candidates(tokenizer, context: str) -> Tuple[List[int], Optional[List[Tuple[int, int]]]]:
-    try:
-        encoded = tokenizer(context, add_special_tokens=False, return_offsets_mapping=True)
-        token_ids = list(encoded.get("input_ids", []))
-        offsets = encoded.get("offset_mapping", None)
-        if offsets is not None:
-            offsets = [tuple(pair) for pair in offsets]
-        if token_ids:
-            return token_ids, offsets
-    except Exception:
-        pass
-
-    token_ids = tokenizer(context, add_special_tokens=False).input_ids
-    return list(token_ids), None
-
-
-def _decode_extractive_span_text(
-    tokenizer,
-    context: str,
-    context_token_ids: List[int],
-    offsets: Optional[List[Tuple[int, int]]],
-    start_idx: int,
-    end_idx: int,
-) -> str:
-    if offsets is not None and 0 <= start_idx <= end_idx < len(offsets):
-        start_char = int(offsets[start_idx][0])
-        end_char = int(offsets[end_idx][1])
-        text = context[start_char:end_char].strip()
-        if text:
-            return text
-    return tokenizer.decode(context_token_ids[start_idx:end_idx + 1], skip_special_tokens=True).strip()
-
-
-def build_extractive_span_trie(
-    tokenizer,
-    context: str,
-    max_answer_tokens: int,
-) -> ExtractiveSpanTrieNode:
-    if max_answer_tokens < 1:
-        raise ValueError("max_answer_tokens must be >= 1")
-
-    context_token_ids, offsets = _tokenize_context_for_extractive_candidates(tokenizer, context)
-    root = ExtractiveSpanTrieNode()
-    num_tokens = len(context_token_ids)
-
-    for start_idx in range(num_tokens):
-        max_end_idx = min(num_tokens, start_idx + max_answer_tokens)
-        for end_idx in range(start_idx, max_end_idx):
-            terminal_text = _decode_extractive_span_text(
-                tokenizer=tokenizer,
-                context=context,
-                context_token_ids=context_token_ids,
-                offsets=offsets,
-                start_idx=start_idx,
-                end_idx=end_idx,
-            )
-            if not terminal_text:
-                continue
-
-            answer_position_token_ids = _tokenize_extractive_answer_candidate(
-                tokenizer=tokenizer,
-                candidate_text=terminal_text,
-            )
-            if not answer_position_token_ids or len(answer_position_token_ids) > max_answer_tokens:
-                continue
-
-            node = root
-            for token_id in answer_position_token_ids:
-                token_id = int(token_id)
-                child = node.children.get(token_id)
-                if child is None:
-                    child = ExtractiveSpanTrieNode()
-                    node.children[token_id] = child
-                node = child
-            if node.terminal_text is None:
-                node.terminal_text = terminal_text
-
-    return root
-
-
-@torch.inference_mode()
-def predict_extractive_answer(
-    model,
-    tokenizer,
-    past_key_values: PastKeyValues,
-    seed_token: torch.Tensor,
-    context: str,
-    max_answer_tokens: int,
-    beam_size: int,
-) -> str:
-    if max_answer_tokens < 1:
-        raise ValueError("max_answer_tokens must be >= 1")
-    if beam_size < 1:
-        raise ValueError("beam_size must be >= 1")
-
-    trie_root = build_extractive_span_trie(
-        tokenizer=tokenizer,
-        context=context,
-        max_answer_tokens=max_answer_tokens,
-    )
-    if not trie_root.children:
-        return ""
-
-    root_outputs = model(
-        input_ids=seed_token,
-        past_key_values=past_key_values,
-        use_cache=True,
-    )
-    root_log_probs = F.log_softmax(root_outputs.logits[:, -1, :], dim=-1).squeeze(0)
-    root_next_past = root_outputs.past_key_values
-
-    active_beams: List[ExtractiveBeamState] = []
-    completed_beams: List[ExtractiveBeamState] = []
-    device = seed_token.device
-
-    for token_id, child in trie_root.children.items():
-        active_beams.append(
-            ExtractiveBeamState(
-                node=child,
-                past_key_values=root_next_past,
-                input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
-                total_logprob=float(root_log_probs[token_id].item()),
-                token_count=1,
-            )
-        )
-
-    active_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
-    active_beams = active_beams[:beam_size]
-
-    for _ in range(max_answer_tokens):
-        if not active_beams:
-            break
-
-        next_beams: List[ExtractiveBeamState] = []
-        for beam in active_beams:
-            if beam.node.terminal_text is not None:
-                completed_beams.append(beam)
-
-            if beam.token_count >= max_answer_tokens or not beam.node.children:
-                continue
-
-            outputs = model(
-                input_ids=beam.input_ids,
-                past_key_values=beam.past_key_values,
-                use_cache=True,
-            )
-            log_probs = F.log_softmax(outputs.logits[:, -1, :], dim=-1).squeeze(0)
-            next_past = outputs.past_key_values
-
-            child_candidates = []
-            for token_id, child in beam.node.children.items():
-                child_candidates.append((float(log_probs[token_id].item()), token_id, child))
-            child_candidates.sort(key=lambda item: item[0], reverse=True)
-            child_candidates = child_candidates[:beam_size]
-
-            for token_logprob, token_id, child in child_candidates:
-                next_beams.append(
-                    ExtractiveBeamState(
-                        node=child,
-                        past_key_values=next_past,
-                        input_ids=torch.tensor([[token_id]], device=device, dtype=torch.long),
-                        total_logprob=beam.total_logprob + token_logprob,
-                        token_count=beam.token_count + 1,
-                    )
-                )
-
-        next_beams.sort(key=lambda beam: beam.normalized_score, reverse=True)
-        active_beams = next_beams[:beam_size]
-
-    if completed_beams:
-        best_beam = max(completed_beams, key=lambda beam: beam.normalized_score)
-        return best_beam.node.terminal_text or ""
-
-    if active_beams:
-        best_beam = max(active_beams, key=lambda beam: beam.normalized_score)
-        return best_beam.node.terminal_text or ""
-
-    return ""
 
 
 def format_generation_prompt(context: str, question: str) -> str:
@@ -957,13 +823,6 @@ def prepare_generation_prefix(tokenizer, context: str, question: str, device: st
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
 
 
-def format_generation_context_prefix(context: str) -> str:
-    return (
-        "Read the passage and answer the question briefly.\n\n"
-        f"Context: {context.strip()}\n"
-    )
-
-
 def format_generation_question_prefix(question: str) -> str:
     return (
         f"Question: {question.strip()}\n"
@@ -994,21 +853,6 @@ def prepare_full_text_inputs(
     }
 
 
-def prepare_generation_context_inputs(
-    tokenizer,
-    context: str,
-    device: str,
-    max_input_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
-    prefix_text = format_generation_context_prefix(context=context)
-    return prepare_full_text_inputs(
-        tokenizer=tokenizer,
-        text=prefix_text,
-        device=device,
-        max_input_tokens=max_input_tokens,
-    )
-
-
 def prepare_generation_question_prefix(tokenizer, question: str, device: str) -> Dict[str, torch.Tensor]:
     prefix_text = format_generation_question_prefix(question=question)
     return prepare_text_prefix(tokenizer=tokenizer, prefix_text=prefix_text, device=device)
@@ -1032,9 +876,7 @@ def get_model_context_limit(model: PreTrainedModel, tokenizer: Optional[PreTrain
     return min(limits)
 
 
-def get_answer_token_budget_for_spec(spec: HFDatasetSpec, eval_config) -> int:
-    if spec.answer_mode == "squad":
-        return int(getattr(eval_config, "extractive_max_answer_tokens"))
+def get_answer_token_budget(eval_config) -> int:
     return int(getattr(eval_config, "generation_max_new_tokens"))
 
 
@@ -1055,7 +897,7 @@ def compute_benchmark_context_budget(
     reserved_tokens = (
         int(question_prefix["cache_ids"].shape[1])
         + int(question_prefix["seed_token"].shape[1])
-        + get_answer_token_budget_for_spec(spec, eval_config)
+        + get_answer_token_budget(eval_config)
     )
     budget = shared_limit - reserved_tokens
     if budget < 16:
@@ -1072,18 +914,18 @@ def prepare_generation_task_question_prefix(
     question: str,
     device: str,
 ) -> Dict[str, torch.Tensor]:
-    if spec.answer_mode == "squad":
-        return prepare_extractive_question_prefix(
+    if spec.answer_mode in {"squad", "newsqa"}:
+        return prepare_squad_v11_question_prefix(
             tokenizer=tokenizer,
             question=question,
             device=device,
         )
-    if spec.answer_mode == "multinews":
-        return prepare_multinews_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
+    # if spec.answer_mode == "multinews":
+    #     return prepare_multinews_question_prefix(
+    #         tokenizer=tokenizer,
+    #         question=question,
+    #         device=device,
+    #     )
     return prepare_generation_question_prefix(
         tokenizer=tokenizer,
         question=question,
@@ -1091,21 +933,22 @@ def prepare_generation_task_question_prefix(
     )
 
 
-def prepare_generation_task_inputs(
+def prepare_logit_task_inputs(
     spec: HFDatasetSpec,
     tokenizer,
-    context: str,
+    context: Optional[str],
     question: str,
     device: str,
-    max_input_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if spec.answer_mode == "squad":
-        context_prefix = prepare_extractive_context_inputs(
+    if spec.answer_mode == "boolq":
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("BoolQ requires passage context.")
+        context_prefix = prepare_boolq_context_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
         )
-        question_prefix = prepare_extractive_question_prefix(
+        question_prefix = prepare_boolq_question_prefix(
             tokenizer=tokenizer,
             question=question,
             device=device,
@@ -1119,14 +962,59 @@ def prepare_generation_task_inputs(
             "was_truncated": False,
         }
 
-    if spec.answer_mode == "multinews":
-        context_prefix = prepare_multinews_context_inputs(
+    if spec.answer_mode == "pubmed_qa":
+        if not isinstance(context, str) or not context.strip():
+            raise ValueError("PubMedQA requires abstract context.")
+        context_prefix = prepare_pubmed_qa_context_inputs(
+            tokenizer=tokenizer,
+            context=context,
+            device=device,
+        )
+        question_prefix = prepare_pubmed_qa_question_prefix(
+            tokenizer=tokenizer,
+            question=question,
+            device=device,
+        )
+        return {
+            "context_prefix": context_prefix,
+            "question_prefix": question_prefix,
+            "cache_input_ids": context_prefix["input_ids"],
+            "question_cache_ids": question_prefix["cache_ids"],
+            "seed_token": question_prefix["seed_token"],
+            "was_truncated": False,
+        }
+
+    prefix = prepare_question_prefix(
+        tokenizer=tokenizer,
+        question=question,
+        device=device,
+        context=context,
+        answer_mode=spec.answer_mode,
+    )
+    return {
+        "cache_input_ids": prefix["cache_ids"],
+        "question_cache_ids": None,
+        "seed_token": prefix["seed_token"],
+        "was_truncated": False,
+    }
+
+
+def prepare_generation_task_inputs(
+    spec: HFDatasetSpec,
+    tokenizer,
+    context: str,
+    question: str,
+    device: str,
+    max_input_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    if spec.answer_mode in {"squad", "newsqa"}:
+        context_prefix = prepare_squad_v11_context_inputs(
             tokenizer=tokenizer,
             context=context,
             device=device,
             max_input_tokens=max_input_tokens,
         )
-        question_prefix = prepare_multinews_question_prefix(
+        question_prefix = prepare_squad_v11_question_prefix(
             tokenizer=tokenizer,
             question=question,
             device=device,
@@ -1139,6 +1027,27 @@ def prepare_generation_task_inputs(
             "seed_token": question_prefix["seed_token"],
             "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
+
+    # if spec.answer_mode == "multinews":
+    #     context_prefix = prepare_multinews_context_inputs(
+    #         tokenizer=tokenizer,
+    #         context=context,
+    #         device=device,
+    #         max_input_tokens=max_input_tokens,
+    #     )
+    #     question_prefix = prepare_multinews_question_prefix(
+    #         tokenizer=tokenizer,
+    #         question=question,
+    #         device=device,
+    #     )
+    #     return {
+    #         "context_prefix": context_prefix,
+    #         "question_prefix": question_prefix,
+    #         "cache_input_ids": context_prefix["input_ids"],
+    #         "question_cache_ids": question_prefix["cache_ids"],
+    #         "seed_token": question_prefix["seed_token"],
+    #         "was_truncated": bool(context_prefix.get("was_truncated", False)),
+    #     }
 
     prefix = prepare_generation_prefix(
         tokenizer=tokenizer,
@@ -1155,33 +1064,13 @@ def prepare_generation_task_inputs(
 
 
 def predict_generation_task_answer(
-    spec: HFDatasetSpec,
     model,
     tokenizer,
     past_key_values: PastKeyValues,
     seed_token: torch.Tensor,
     eval_config,
-    context: str,
     question_cache_ids: Optional[torch.Tensor] = None,
 ) -> str:
-    if spec.answer_mode == "squad":
-        if question_cache_ids is None:
-            raise ValueError("question_cache_ids must be provided for extractive SQuAD evaluation.")
-        answer_past = append_input_ids_to_past(
-            model=model,
-            past_key_values=past_key_values,
-            input_ids=question_cache_ids,
-        )
-        return predict_extractive_answer(
-            model=model,
-            tokenizer=tokenizer,
-            past_key_values=answer_past,
-            seed_token=seed_token,
-            context=context,
-            max_answer_tokens=int(getattr(eval_config, "extractive_max_answer_tokens")),
-            beam_size=int(getattr(eval_config, "extractive_beam_size")),
-        )
-
     generation_past = past_key_values
     if question_cache_ids is not None:
         generation_past = append_input_ids_to_past(
@@ -1239,7 +1128,6 @@ def build_text_candidate_token_ids(
 def build_logit_answer_candidates(
     tokenizer,
     spec: HFDatasetSpec,
-    example: Dict[str, Any],
 ) -> Dict[str, torch.Tensor]:
     if spec.answer_mode == "boolq":
         return build_text_candidate_token_ids(
@@ -1251,19 +1139,6 @@ def build_logit_answer_candidates(
         return build_text_candidate_token_ids(
             tokenizer,
             {"yes": "yes", "no": "no", "maybe": "maybe"},
-        )
-
-    if spec.answer_mode == "mmlu":
-        choices = example.get("choices", None)
-        if not isinstance(choices, list) or len(choices) != 4:
-            raise ValueError("MMLU example must contain exactly 4 choices.")
-
-        return build_text_candidate_token_ids(
-            tokenizer,
-            {
-                chr(ord("A") + idx): choice
-                for idx, choice in enumerate(choices)
-            },
         )
 
     raise ValueError(f"Unsupported answer_mode for logit scoring: {spec.answer_mode}")
@@ -1317,15 +1192,22 @@ def score_answer_choices(
     }
 
 
+def prepare_answer_scoring_past(
+    model,
+    past_key_values: PastKeyValues,
+    question_cache_ids: Optional[torch.Tensor] = None,
+) -> PastKeyValues:
+    if question_cache_ids is None:
+        return past_key_values
+    return append_input_ids_to_past(
+        model=model,
+        past_key_values=past_key_values,
+        input_ids=question_cache_ids,
+    )
+
+
 def predict_answer_label(choice_scores: Dict[str, float]) -> str:
     return max(choice_scores.items(), key=lambda item: item[1])[0]
-
-
-def format_choice_scores(choice_scores: Dict[str, float]) -> str:
-    return " | ".join(
-        f"{label}={score:.6f}"
-        for label, score in choice_scores.items()
-    )
 
 
 @torch.inference_mode()
@@ -1384,14 +1266,6 @@ def normalize_qa_text(text: str) -> str:
         return value.lower()
 
     return white_space_fix(remove_articles(remove_punc(lower(text))))
-
-
-def compute_generation_exact_match(prediction: str, gold_answers: List[str]) -> float:
-    normalized_prediction = normalize_qa_text(prediction)
-    for gold_answer in gold_answers:
-        if normalized_prediction == normalize_qa_text(gold_answer):
-            return 1.0
-    return 0.0
 
 
 def _compute_pair_f1(prediction: str, gold_answer: str) -> float:
@@ -1481,12 +1355,10 @@ def log_generation_dataset_result(
         row = results[direction]
         pretty_name = build_direction_pretty_name(direction, nodes, edges)
         logger.info(
-            "%s | cosine=%.6f | exact_match=%.6f | f1=%.6f | native_exact_match=%.6f | native_f1=%.6f | count=%d",
+            "%s | cosine=%.6f | f1=%.6f | native_f1=%.6f | count=%d",
             pretty_name,
             row["cosine"],
-            row["exact_match"],
             row["f1"],
-            row["native_exact_match"],
             row["native_f1"],
             int(row["count"]),
         )
@@ -1530,30 +1402,40 @@ def build_direction_summary_markdown_table(
     logit_dataset_keys = [
         ("BoolQ", "BoolQ/validation"),
         ("PubMedQA", "PubMedQA/pqa_labeled/train"),
-        ("MMLU", "MMLU/all/validation"),
     ]
-    multinews_dataset_key = "MultiNews/validation"
+    generation_dataset_keys = [
+        ("SQuAD", "SQuAD-v1.1/validation"),
+        ("NewsQA", "NewsQA/validation"),
+    ]
 
     logit_rows = {
         display_name: all_logit_results.get(dataset_key, {}).get(direction, {})
         for display_name, dataset_key in logit_dataset_keys
     }
-    multinews_row = all_generation_results.get(multinews_dataset_key, {}).get(direction, {})
+    generation_rows = {
+        display_name: all_generation_results.get(dataset_key, {}).get(direction, {})
+        for display_name, dataset_key in generation_dataset_keys
+    }
 
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
         logit_rows["PubMedQA"].get("cosine", float("nan")),
-        logit_rows["MMLU"].get("cosine", float("nan")),
     ])
     translated_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("accuracy", float("nan")),
         logit_rows["PubMedQA"].get("accuracy", float("nan")),
-        logit_rows["MMLU"].get("accuracy", float("nan")),
     ])
     native_accuracy_avg = _summary_mean([
         logit_rows["BoolQ"].get("native_accuracy", float("nan")),
         logit_rows["PubMedQA"].get("native_accuracy", float("nan")),
-        logit_rows["MMLU"].get("native_accuracy", float("nan")),
+    ])
+    translated_generation_f1_avg = _summary_mean([
+        generation_rows["SQuAD"].get("f1", float("nan")),
+        generation_rows["NewsQA"].get("f1", float("nan")),
+    ])
+    native_generation_f1_avg = _summary_mean([
+        generation_rows["SQuAD"].get("native_f1", float("nan")),
+        generation_rows["NewsQA"].get("native_f1", float("nan")),
     ])
 
     if edge is None:
@@ -1567,24 +1449,26 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | MMLU | Acc Avg | MultiNews |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('native_accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['MMLU'].get('native_accuracy', float('nan')))} | "
             f"{_format_summary_percent(native_accuracy_avg)} | "
-            f"{_format_summary_float(multinews_row.get('native_f1', float('nan')))} |"
+            f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
+            f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
+            f"{_format_summary_float(native_generation_f1_avg)} |"
         ),
         (
             f"| {alg} | "
             f"{_format_summary_float(translated_cosine_avg)} | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(logit_rows['PubMedQA'].get('accuracy', float('nan')))} | "
-            f"{_format_summary_percent(logit_rows['MMLU'].get('accuracy', float('nan')))} | "
             f"{_format_summary_percent(translated_accuracy_avg)} | "
-            f"{_format_summary_float(multinews_row.get('f1', float('nan')))} |"
+            f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
+            f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
+            f"{_format_summary_float(translated_generation_f1_avg)} |"
         ),
     ]
     return "\n".join(lines)
