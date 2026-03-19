@@ -15,41 +15,6 @@ from train_util import *
 from transformers import AutoConfig
 
 
-LOGIT_QA_DATASET_SPECS = [
-    HFDatasetSpec(
-        name_for_log="BoolQ/validation",
-        dataset_path="google/boolq",
-        dataset_name=None,
-        split="validation",
-        answer_mode="boolq",
-        question_field="question",
-        context_field="passage",
-        streaming=False,
-    ),
-    HFDatasetSpec(
-        name_for_log="PubMedQA/pqa_labeled/train",
-        dataset_path="qiaojin/PubMedQA",
-        dataset_name="pqa_labeled",
-        split="train",
-        answer_mode="pubmed_qa",
-        question_field="question",
-        context_field="context",
-        streaming=False,
-    ),
-]
-
-SQUAD_DATASET_SPECS = [
-    get_squad_v11_dataset_spec(),
-]
-
-NEWSQA_DATASET_SPECS = [
-    get_newsqa_generation_dataset_spec(),
-]
-
-MULTINEWS_DATASET_SPECS = [
-    get_multinews_generation_dataset_spec(),
-]
-
 
 @dataclass(frozen=True)
 class LayerMapping:
@@ -108,7 +73,7 @@ class LayerPositionConfig:
     eval_num_workers: int = 0
     eval_max_examples_per_dataset: int = 100
     eval_shuffle_stream: bool = False
-    benchmark_mode: str = "qa_accuracy"
+    benchmark_mode: str = "gen_qa"
     generation_max_new_tokens: int = 64
 
     def __post_init__(self) -> None:
@@ -123,8 +88,8 @@ class LayerPositionConfig:
             raise ValueError("position_layer_idx must be >= 0")
         if self.injection_window_size < 1:
             raise ValueError("injection_window_size must be >= 1")
-        if self.benchmark_mode not in {"qa_accuracy", "squad_f1", "newsqa_f1", "multinews_f1"}:
-            raise ValueError("benchmark_mode must be one of {'qa_accuracy', 'squad_f1', 'newsqa_f1', 'multinews_f1'}")
+        if self.benchmark_mode not in {"logit_qa", "gen_qa"}:
+            raise ValueError("benchmark_mode must be one of {'logit_qa', 'gen_qa'}")
         if self.translator_dim % self.translator_heads != 0:
             raise ValueError("translator_dim must be divisible by translator_heads")
         normalized_streams = "".join(sorted(set(str(self.principal_rotation_streams).lower())))
@@ -2189,10 +2154,10 @@ def run_eval(
     dataset_results_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
     dataset_logit_kl_by_name: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-    if config.benchmark_mode == "qa_accuracy":
+    if config.benchmark_mode == "logit_qa":
         metric_name = "accuracy"
         dataset_results_key = "dataset_accuracies"
-        dataset_specs = LOGIT_QA_DATASET_SPECS
+        dataset_specs = get_eval_spec_group("logit_qa")
         dataset_evaluator = evaluate_logit_dataset
         dataloader_builder = build_eval_dataloader
         progress_log_template = (
@@ -2202,15 +2167,10 @@ def run_eval(
             "kl(native||mag)=%.6f | kl(native||full)=%.6f | kl(full||dir)=%.6f | "
             "kl(full||mag)=%.6f | count=%d"
         )
-    elif config.benchmark_mode in {"squad_f1", "newsqa_f1", "multinews_f1"}:
+    elif config.benchmark_mode == "gen_qa":
         metric_name = "f1"
         dataset_results_key = "dataset_f1"
-        if config.benchmark_mode == "squad_f1":
-            dataset_specs = SQUAD_DATASET_SPECS
-        elif config.benchmark_mode == "newsqa_f1":
-            dataset_specs = NEWSQA_DATASET_SPECS
-        else:
-            dataset_specs = MULTINEWS_DATASET_SPECS
+        dataset_specs = get_eval_spec_group("gen_qa")
         dataset_evaluator = evaluate_generation_dataset
         dataloader_builder = build_generation_eval_dataloader
         progress_log_template = (
@@ -2380,7 +2340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-num-workers", type=int, default=0)
     parser.add_argument("--eval-max-examples-per-dataset", type=int, default=100)
     parser.add_argument("--eval-shuffle-stream", action="store_true")
-    parser.add_argument("--benchmark-mode", choices=["qa_accuracy", "squad_f1", "newsqa_f1", "multinews_f1"], default="squad_f1")
+    parser.add_argument("--benchmark-mode", choices=["logit_qa", "gen_qa"], default="logit_qa")
     parser.add_argument("--generation-max-new-tokens", type=int, default=64)
     return parser.parse_args()
 

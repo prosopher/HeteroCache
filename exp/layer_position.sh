@@ -10,7 +10,7 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-outputs/layer_position}
 COMMON_ARGS=("$@")
 
 INJECTION_WINDOW_SIZE=1
-BENCHMARK_MODE=qa_accuracy
+BENCHMARK_MODE=logit_qa
 for ((i=1; i<=$#; i++)); do
   arg="${!i}"
   if [[ "${arg}" == --injection-window-size ]]; then
@@ -43,10 +43,8 @@ if ! [[ "${INJECTION_WINDOW_SIZE}" =~ ^[0-9]+$ ]] || (( INJECTION_WINDOW_SIZE < 
 fi
 
 case "${BENCHMARK_MODE}" in
-  qa_accuracy) METRIC_NAME=accuracy ;;
-  squad_f1) METRIC_NAME=f1 ;;
-  newsqa_f1) METRIC_NAME=f1 ;;
-  multinews_f1) METRIC_NAME=f1 ;;
+  logit_qa) METRIC_NAME=accuracy ;;
+  gen_qa) METRIC_NAME=f1 ;;
   *)
     echo "Unsupported --benchmark-mode: ${BENCHMARK_MODE}" >&2
     exit 1

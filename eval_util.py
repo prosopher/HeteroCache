@@ -22,7 +22,6 @@ class EvalConfig:
 
     # generation QA
     generation_max_new_tokens: int
-    enable_generation_eval: bool = True
 
 
     def __post_init__(self) -> None:
@@ -98,6 +97,32 @@ class HFQAPairStream(IterableDataset):
 DEFAULT_MULTINEWS_SUMMARY_TASK = "Summarize the news articles above."
 
 
+def get_boolq_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="BoolQ/validation",
+        dataset_path="google/boolq",
+        dataset_name=None,
+        split="validation",
+        answer_mode="boolq",
+        question_field="question",
+        context_field="passage",
+        streaming=False,
+    )
+
+
+def get_pubmedqa_dataset_spec() -> HFDatasetSpec:
+    return HFDatasetSpec(
+        name_for_log="PubMedQA/pqa_labeled/train",
+        dataset_path="qiaojin/PubMedQA",
+        dataset_name="pqa_labeled",
+        split="train",
+        answer_mode="pubmed_qa",
+        question_field="question",
+        context_field="context",
+        streaming=False,
+    )
+
+
 def get_squad_v11_dataset_spec() -> HFDatasetSpec:
     return HFDatasetSpec(
         name_for_log="SQuAD-v1.1/validation",
@@ -139,15 +164,36 @@ def get_multinews_generation_dataset_spec() -> HFDatasetSpec:
     )
 
 
-GENERATION_BENCHMARK_SPECS = [
-    get_squad_v11_dataset_spec,
-    get_newsqa_generation_dataset_spec,
-    get_multinews_generation_dataset_spec,
+LOGIT_QA_SPEC_GROUP_FACTORIES = [
+    get_boolq_dataset_spec,
+    get_pubmedqa_dataset_spec,
 ]
 
+GEN_QA_SPEC_GROUP_FACTORIES = [
+    get_squad_v11_dataset_spec,
+    get_newsqa_generation_dataset_spec,
+]
 
-def get_default_generation_dataset_specs() -> List[HFDatasetSpec]:
-    return [factory() for factory in GENERATION_BENCHMARK_SPECS]
+EVAL_SPEC_GROUP_FACTORIES = {
+    "logit_qa": LOGIT_QA_SPEC_GROUP_FACTORIES,
+    "gen_qa": GEN_QA_SPEC_GROUP_FACTORIES,
+}
+
+
+def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
+    try:
+        factories = EVAL_SPEC_GROUP_FACTORIES[group_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported eval spec group: {group_name}") from exc
+    return [factory() for factory in factories]
+
+
+def get_default_logit_qa_dataset_specs() -> List[HFDatasetSpec]:
+    return get_eval_spec_group("logit_qa")
+
+
+def get_default_gen_qa_dataset_specs() -> List[HFDatasetSpec]:
+    return get_eval_spec_group("gen_qa")
 
 
 def _normalize_answer_texts(raw_value: Any) -> List[str]:
@@ -237,29 +283,30 @@ def extract_generation_examples(spec: HFDatasetSpec, example: Dict[str, Any]) ->
             })
         return generation_examples
 
-    if spec.answer_mode == "multinews":
-        question_value = example.get(spec.question_field, None)
-        if isinstance(question_value, str) and question_value.strip():
-            question = question_value.strip()
-        else:
-            question = DEFAULT_MULTINEWS_SUMMARY_TASK
 
-        context_field = spec.context_field or "document"
-        answers_field = spec.answers_field or "summary"
-
-        context = normalize_multinews_context_text(example.get(context_field, None))
-        if context is None:
-            return []
-
-        answer_texts = _normalize_answer_texts(example.get(answers_field, None))
-        if not answer_texts:
-            return []
-
-        return [{
-            "question": question,
-            "context": context,
-            "answers": answer_texts,
-        }]
+    # if spec.answer_mode == "multinews":
+    #     question_value = example.get(spec.question_field, None)
+    #     if isinstance(question_value, str) and question_value.strip():
+    #         question = question_value.strip()
+    #     else:
+    #         question = DEFAULT_MULTINEWS_SUMMARY_TASK
+    #
+    #     context_field = spec.context_field or "document"
+    #     answers_field = spec.answers_field or "summary"
+    #
+    #     context = normalize_multinews_context_text(example.get(context_field, None))
+    #     if context is None:
+    #         return []
+    #
+    #     answer_texts = _normalize_answer_texts(example.get(answers_field, None))
+    #     if not answer_texts:
+    #         return []
+    #
+    #     return [{
+    #         "question": question,
+    #         "context": context,
+    #         "answers": answer_texts,
+    #     }]
 
     raise ValueError(f"Unsupported generation answer_mode: {spec.answer_mode}")
 
@@ -873,12 +920,12 @@ def prepare_generation_task_question_prefix(
             question=question,
             device=device,
         )
-    if spec.answer_mode == "multinews":
-        return prepare_multinews_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
+    # if spec.answer_mode == "multinews":
+    #     return prepare_multinews_question_prefix(
+    #         tokenizer=tokenizer,
+    #         question=question,
+    #         device=device,
+    #     )
     return prepare_generation_question_prefix(
         tokenizer=tokenizer,
         question=question,
@@ -981,26 +1028,26 @@ def prepare_generation_task_inputs(
             "was_truncated": bool(context_prefix.get("was_truncated", False)),
         }
 
-    if spec.answer_mode == "multinews":
-        context_prefix = prepare_multinews_context_inputs(
-            tokenizer=tokenizer,
-            context=context,
-            device=device,
-            max_input_tokens=max_input_tokens,
-        )
-        question_prefix = prepare_multinews_question_prefix(
-            tokenizer=tokenizer,
-            question=question,
-            device=device,
-        )
-        return {
-            "context_prefix": context_prefix,
-            "question_prefix": question_prefix,
-            "cache_input_ids": context_prefix["input_ids"],
-            "question_cache_ids": question_prefix["cache_ids"],
-            "seed_token": question_prefix["seed_token"],
-            "was_truncated": bool(context_prefix.get("was_truncated", False)),
-        }
+    # if spec.answer_mode == "multinews":
+    #     context_prefix = prepare_multinews_context_inputs(
+    #         tokenizer=tokenizer,
+    #         context=context,
+    #         device=device,
+    #         max_input_tokens=max_input_tokens,
+    #     )
+    #     question_prefix = prepare_multinews_question_prefix(
+    #         tokenizer=tokenizer,
+    #         question=question,
+    #         device=device,
+    #     )
+    #     return {
+    #         "context_prefix": context_prefix,
+    #         "question_prefix": question_prefix,
+    #         "cache_input_ids": context_prefix["input_ids"],
+    #         "question_cache_ids": question_prefix["cache_ids"],
+    #         "seed_token": question_prefix["seed_token"],
+    #         "was_truncated": bool(context_prefix.get("was_truncated", False)),
+    #     }
 
     prefix = prepare_generation_prefix(
         tokenizer=tokenizer,
@@ -1359,7 +1406,6 @@ def build_direction_summary_markdown_table(
     generation_dataset_keys = [
         ("SQuAD", "SQuAD-v1.1/validation"),
         ("NewsQA", "NewsQA/validation"),
-        ("MultiNews", "MultiNews/validation"),
     ]
 
     logit_rows = {
@@ -1386,12 +1432,10 @@ def build_direction_summary_markdown_table(
     translated_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("f1", float("nan")),
         generation_rows["NewsQA"].get("f1", float("nan")),
-        generation_rows["MultiNews"].get("f1", float("nan")),
     ])
     native_generation_f1_avg = _summary_mean([
         generation_rows["SQuAD"].get("native_f1", float("nan")),
         generation_rows["NewsQA"].get("native_f1", float("nan")),
-        generation_rows["MultiNews"].get("native_f1", float("nan")),
     ])
 
     if edge is None:
@@ -1405,8 +1449,8 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | MultiNews | Gen F1 Avg |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
@@ -1414,7 +1458,6 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_percent(native_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
-            f"{_format_summary_float(generation_rows['MultiNews'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(native_generation_f1_avg)} |"
         ),
         (
@@ -1425,7 +1468,6 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_percent(translated_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
-            f"{_format_summary_float(generation_rows['MultiNews'].get('f1', float('nan')))} | "
             f"{_format_summary_float(translated_generation_f1_avg)} |"
         ),
     ]

@@ -160,7 +160,7 @@ def evaluate_generation_dataset(
             gold_answers = example["answers"]
 
             context_budget = None
-            if spec.answer_mode in {"squad", "newsqa", "multinews"}:
+            if spec.answer_mode in {"squad", "newsqa"}:
                 context_budget = compute_benchmark_context_budget(
                     tokenizer=tokenizer,
                     spec=spec,
@@ -306,38 +306,10 @@ def run_eval(eval_config: EvalConfig) -> Path:
     logger.info("translation_mode=replace_top_layers_after_target_forward")
     logger.info("qa_eval_log_path=%s", log_path)
 
-    logit_dataset_specs = [
-        HFDatasetSpec(
-            name_for_log="BoolQ/validation",
-            dataset_path="google/boolq",
-            dataset_name=None,
-            split="validation",
-            answer_mode="boolq",
-            question_field="question",
-            context_field="passage",
-            streaming=False,
-        ),
-        HFDatasetSpec(
-            name_for_log="PubMedQA/pqa_labeled/train",
-            dataset_path="qiaojin/PubMedQA",
-            dataset_name="pqa_labeled",
-            split="train",
-            answer_mode="pubmed_qa",
-            question_field="question",
-            context_field="context",
-            streaming=False,
-        ),
-    ]
-
-    generation_dataset_specs = []
-    if eval_config.enable_generation_eval:
-        generation_dataset_specs = get_default_generation_dataset_specs()
-    else:
-        logger.info("Skipping generation evaluation datasets (enable_generation_eval=False)")
-
     all_logit_results = {}
     all_generation_results = {}
 
+    logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:
         logger.info("Preparing dataloader for %s", spec.name_for_log)
         dataloader = build_eval_dataloader(
@@ -373,6 +345,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    generation_dataset_specs = get_default_gen_qa_dataset_specs()
     for spec in generation_dataset_specs:
         logger.info("Preparing generation dataloader for %s", spec.name_for_log)
         dataloader = build_generation_eval_dataloader(
