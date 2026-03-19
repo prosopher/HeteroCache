@@ -1,3 +1,5 @@
+from typing import Callable
+
 from common import *
 
 
@@ -179,6 +181,270 @@ EVAL_SPEC_GROUP_FACTORIES = {
     "gen_qa": GEN_QA_SPEC_GROUP_FACTORIES,
 }
 
+
+def build_openwebtext_eval_dataloader(
+    tokenizer: PreTrainedTokenizerBase,
+    config,
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    seed: Optional[int] = None,
+    shuffle_buffer: Optional[int] = None,
+    seed_offset: int = 10_000,
+) -> DataLoader:
+    dataset = OpenWebTextSequenceStream(
+        tokenizer=tokenizer,
+        sequence_length=config.total_tokens,
+        split="train",
+        shuffle=shuffle,
+        shuffle_buffer=config.shuffle_buffer if shuffle_buffer is None else int(shuffle_buffer),
+        seed=(int(config.seed) if seed is None else int(seed)) + int(seed_offset),
+    )
+    return DataLoader(dataset, batch_size=batch_size, num_workers=num_workers)
+
+
+
+def _loss_to_perplexity(loss_value: float) -> float:
+    if not math.isfinite(loss_value):
+        return float("nan")
+    return float(math.exp(min(loss_value, 80.0)))
+
+
+
+def summarize_openwebtext_named_losses(
+    average_losses: Dict[str, float],
+    count: int,
+    *,
+    primary_name: str,
+    loss_field_by_name: Optional[Dict[str, str]] = None,
+    ppl_field_by_name: Optional[Dict[str, str]] = None,
+    ppl_delta_reference_name: Optional[str] = None,
+    ppl_delta_field_by_name: Optional[Dict[str, str]] = None,
+) -> Dict[str, float]:
+    loss_field_by_name = dict(loss_field_by_name or {})
+    ppl_field_by_name = dict(ppl_field_by_name or {})
+    ppl_delta_field_by_name = dict(ppl_delta_field_by_name or {})
+
+    metric_names = set(loss_field_by_name) | set(ppl_field_by_name)
+    metric_names.add(primary_name)
+    if ppl_delta_reference_name is not None:
+        metric_names.add(ppl_delta_reference_name)
+    metric_names.update(ppl_delta_field_by_name)
+
+    summary: Dict[str, float] = {"count": int(count)}
+
+    for name in sorted(metric_names):
+        average_loss = float(average_losses.get(name, float("nan"))) if count > 0 else float("nan")
+        if name == primary_name:
+            summary["loss"] = average_loss
+            summary["ppl"] = _loss_to_perplexity(average_loss)
+
+        loss_field = loss_field_by_name.get(name)
+        if loss_field is not None:
+            summary[loss_field] = average_loss
+
+        ppl_field = ppl_field_by_name.get(name)
+        if ppl_field is not None:
+            summary[ppl_field] = _loss_to_perplexity(average_loss)
+
+    if ppl_delta_reference_name is not None:
+        if ppl_delta_reference_name == primary_name:
+            reference_ppl = float(summary.get("ppl", float("nan")))
+        else:
+            reference_ppl = float(summary.get(ppl_field_by_name.get(ppl_delta_reference_name, ""), float("nan")))
+
+        for name, delta_field in ppl_delta_field_by_name.items():
+            if name == primary_name:
+                candidate_ppl = float(summary.get("ppl", float("nan")))
+            else:
+                candidate_ppl = float(summary.get(ppl_field_by_name.get(name, ""), float("nan")))
+
+            if math.isfinite(reference_ppl) and math.isfinite(candidate_ppl):
+                summary[delta_field] = candidate_ppl - reference_ppl
+            else:
+                summary[delta_field] = float("nan")
+
+    return summary
+
+
+@torch.inference_mode()
+def evaluate_openwebtext_validation_loss_metrics(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    config,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    seed: int,
+    shuffle_buffer: int,
+    max_examples: int,
+    models,
+    nodes,
+    edges,
+    active_directions,
+    logger: logging.Logger,
+    evaluate_direction_losses_fn: Callable[..., Dict[str, float]],
+    summarize_direction_fn: Callable[[Dict[str, float], int], Dict[str, float]],
+) -> Dict[str, Dict[str, float]]:
+    dataloader = build_openwebtext_eval_dataloader(
+        tokenizer=tokenizer,
+        config=config,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        seed=seed,
+        shuffle_buffer=shuffle_buffer,
+    )
+    device = config.device
+    edge_map = build_edge_map(edges)
+    max_examples = max(1, int(max_examples))
+
+    loss_sums = {direction: {} for direction in active_directions}
+    counts = {direction: 0 for direction in active_directions}
+
+    processed_examples = 0
+    for batch_idx, input_ids in enumerate(dataloader, start=1):
+        if processed_examples >= max_examples:
+            break
+
+        remaining_examples = max_examples - processed_examples
+        if input_ids.shape[0] > remaining_examples:
+            input_ids = input_ids[:remaining_examples]
+        input_ids = input_ids.to(device)
+
+        prefix_cache_ids, lm_input_ids, lm_labels = split_prefix_and_suffix_for_exact_next_token_loss(
+            input_ids=input_ids,
+            prefix_tokens=config.prefix_tokens,
+        )
+        past_by_node_id = {
+            node.id: extract_past_key_values(models[node.id], prefix_cache_ids)
+            for node in nodes
+        }
+
+        batch_examples = int(input_ids.shape[0])
+        for direction in active_directions:
+            edge = edge_map[direction]
+            direction_losses = evaluate_direction_losses_fn(
+                direction=direction,
+                edge=edge,
+                prefix_cache_ids=prefix_cache_ids,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+                past_by_node_id=past_by_node_id,
+            )
+            if not direction_losses:
+                continue
+            for metric_name, loss_value in direction_losses.items():
+                loss_sums[direction][metric_name] = (
+                    float(loss_sums[direction].get(metric_name, 0.0))
+                    + float(loss_value) * batch_examples
+                )
+            counts[direction] += batch_examples
+
+        processed_examples += batch_examples
+        if batch_idx % 25 == 0:
+            logger.info(
+                "[OpenWebText/validation] progress: %d/%d sequences",
+                processed_examples,
+                max_examples,
+            )
+
+    summaries = {}
+    for direction in active_directions:
+        count = int(counts[direction])
+        if count > 0:
+            average_losses = {
+                metric_name: float(total_loss / count)
+                for metric_name, total_loss in loss_sums[direction].items()
+            }
+        else:
+            average_losses = {}
+        summaries[direction] = summarize_direction_fn(average_losses, count)
+
+    return summaries
+
+
+@torch.inference_mode()
+def evaluate_openwebtext_validation_ppl(
+    tokenizer,
+    train_config,
+    eval_config: EvalConfig,
+    translator_pool,
+    dst_model_specs: Dict[str, ModelSpec],
+    models,
+    nodes,
+    edges,
+    active_directions,
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, float]]:
+    def evaluate_direction_losses_fn(
+        *,
+        direction: str,
+        edge: Edge,
+        prefix_cache_ids: torch.Tensor,
+        lm_input_ids: torch.Tensor,
+        lm_labels: torch.Tensor,
+        past_by_node_id,
+    ) -> Dict[str, float]:
+        translated_top_past = translator_pool.translate_top_layers(
+            past_key_values=past_by_node_id[edge.src_id],
+            src_name=edge.src_id,
+            dst_name=edge.dst_id,
+            dst_spec=dst_model_specs[edge.dst_id],
+        )
+        mixed_target_past = replace_top_layers(
+            base_past_key_values=past_by_node_id[edge.dst_id],
+            translated_top_past_key_values=translated_top_past,
+        )
+        translated_loss = float(
+            compute_suffix_lm_loss(
+                target_model=models[edge.dst_id],
+                past_key_values=mixed_target_past,
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        native_loss = float(
+            compute_suffix_lm_loss(
+                target_model=models[edge.dst_id],
+                past_key_values=past_by_node_id[edge.dst_id],
+                lm_input_ids=lm_input_ids,
+                lm_labels=lm_labels,
+            ).item()
+        )
+        return {
+            "translated": translated_loss,
+            "native": native_loss,
+        }
+
+    return evaluate_openwebtext_validation_loss_metrics(
+        tokenizer=tokenizer,
+        config=train_config,
+        batch_size=eval_config.batch_size,
+        num_workers=eval_config.num_workers,
+        shuffle=eval_config.shuffle_eval_stream,
+        seed=eval_config.seed,
+        shuffle_buffer=eval_config.shuffle_buffer,
+        max_examples=eval_config.max_examples_per_dataset,
+        models=models,
+        nodes=nodes,
+        edges=edges,
+        active_directions=active_directions,
+        logger=logger,
+        evaluate_direction_losses_fn=evaluate_direction_losses_fn,
+        summarize_direction_fn=lambda average_losses, count: summarize_openwebtext_named_losses(
+            average_losses,
+            count,
+            primary_name="translated",
+            loss_field_by_name={
+                "native": "native_loss",
+            },
+            ppl_field_by_name={
+                "native": "native_ppl",
+            },
+        ),
+    )
 
 def get_eval_spec_group(group_name: str) -> List[HFDatasetSpec]:
     try:
@@ -1394,6 +1660,7 @@ def build_direction_summary_markdown_table(
     edges: List[Edge],
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
+    openwebtext_ppl_results: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> str:
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
@@ -1416,6 +1683,7 @@ def build_direction_summary_markdown_table(
         display_name: all_generation_results.get(dataset_key, {}).get(direction, {})
         for display_name, dataset_key in generation_dataset_keys
     }
+    ppl_row = (openwebtext_ppl_results or {}).get(direction, {})
 
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
@@ -1449,8 +1717,8 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val PPL |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
             f"{_format_summary_percent(logit_rows['BoolQ'].get('native_accuracy', float('nan')))} | "
@@ -1458,7 +1726,8 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_percent(native_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
-            f"{_format_summary_float(native_generation_f1_avg)} |"
+            f"{_format_summary_float(native_generation_f1_avg)} | "
+            f"{_format_summary_float(ppl_row.get('native_ppl', float('nan')))} |"
         ),
         (
             f"| {alg} | "
@@ -1468,7 +1737,8 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_percent(translated_accuracy_avg)} | "
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
-            f"{_format_summary_float(translated_generation_f1_avg)} |"
+            f"{_format_summary_float(translated_generation_f1_avg)} | "
+            f"{_format_summary_float(ppl_row.get('ppl', float('nan')))} |"
         ),
     ]
     return "\n".join(lines)
@@ -1481,6 +1751,7 @@ def build_final_summary_markdown(
     active_directions,
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
+    openwebtext_ppl_results: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> str:
     sections = []
 
@@ -1493,6 +1764,7 @@ def build_final_summary_markdown(
                 edges=edges,
                 all_logit_results=all_logit_results,
                 all_generation_results=all_generation_results,
+                openwebtext_ppl_results=openwebtext_ppl_results,
             )
         )
 

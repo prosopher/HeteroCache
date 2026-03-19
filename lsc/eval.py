@@ -317,6 +317,31 @@ def run_eval(eval_config: EvalConfig) -> Path:
     all_logit_results = {}
     all_generation_results = {}
 
+    logger.info("Preparing validation dataloader for OpenWebText/validation")
+    openwebtext_ppl_results = evaluate_openwebtext_validation_ppl(
+        tokenizer=tokenizer,
+        train_config=train_config,
+        eval_config=eval_config,
+        translator_pool=translator_pool,
+        dst_model_specs=translated_model_specs,
+        models=models,
+        nodes=nodes,
+        edges=edges,
+        active_directions=active_directions,
+        logger=logger,
+    )
+    for direction in active_directions:
+        row = openwebtext_ppl_results[direction]
+        logger.info(
+            "[OpenWebText/validation] %s | native_loss=%.6f | translated_loss=%.6f | native_ppl=%.6f | translated_ppl=%.6f | count=%d",
+            direction,
+            row["native_loss"],
+            row["loss"],
+            row["native_ppl"],
+            row["ppl"],
+            int(row["count"]),
+        )
+
     logit_dataset_specs = get_default_logit_qa_dataset_specs()
     for spec in logit_dataset_specs:
         logger.info("Preparing dataloader for %s", spec.name_for_log)
@@ -398,6 +423,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
         active_directions=active_directions,
         all_logit_results=all_logit_results,
         all_generation_results=all_generation_results,
+        openwebtext_ppl_results=openwebtext_ppl_results,
     )
     logger.info("===== FINAL MARKDOWN SUMMARY =====\n%s", final_summary_markdown)
 

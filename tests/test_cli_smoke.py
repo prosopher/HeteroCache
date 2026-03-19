@@ -97,9 +97,12 @@ def test_train_and_eval_cli_smoke(alg: str, train_config_name: str, tmp_path: Pa
 
     assert "Starting training" in train_log
     assert "Starting evaluation" in eval_log
+    assert "Preparing validation dataloader for OpenWebText/validation" in eval_log
+    assert "[OpenWebText/validation]" in eval_log
     assert "Preparing dataloader for BoolQ/validation" in eval_log
     assert "Preparing dataloader for PubMedQA/pqa_labeled/train" in eval_log
     assert "Preparing generation dataloader for SQuAD-v1.1/validation" in eval_log
     assert "Preparing generation dataloader for NewsQA/validation" in eval_log
     assert "truncated context to" in eval_log
     assert "FINAL MARKDOWN SUMMARY" in eval_log
+    assert "OWT Val PPL" in eval_log

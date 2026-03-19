@@ -1,66 +1,6 @@
 from common import *
 
 
-class OpenWebTextSequenceStream(IterableDataset):
-    """
-    Streams OpenWebText and yields fixed-length token chunks.
-
-    This behaves like a rolling token buffer, which is usually a better fit for
-    language-model experiments than per-document truncation.
-    """
-
-    def __init__(
-        self,
-        tokenizer: PreTrainedTokenizerBase,
-        sequence_length: int,
-        shuffle_buffer: int = 10_000,
-        seed: int = 42,
-    ) -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.sequence_length = sequence_length
-        self.shuffle_buffer = shuffle_buffer
-        self.seed = seed
-
-    def __iter__(self) -> Iterable[torch.Tensor]:
-        stream = load_dataset("openwebtext", split="train", streaming=True)
-        stream = stream.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
-        token_buffer: List[int] = []
-        eos_token_id = self.tokenizer.eos_token_id
-        for example in stream:
-            text = example.get("text", "")
-            if not text or text.isspace():
-                continue
-            token_ids = self.tokenizer(text, add_special_tokens=False, verbose=False).input_ids
-            if len(token_ids) < 8:
-                continue
-            token_buffer.extend(token_ids)
-            token_buffer.append(eos_token_id)
-            while len(token_buffer) >= self.sequence_length:
-                chunk = token_buffer[: self.sequence_length]
-                token_buffer = token_buffer[self.sequence_length :]
-                yield torch.tensor(chunk, dtype=torch.long)
-
-
-def compute_suffix_lm_loss(
-    target_model: PreTrainedModel,
-    past_key_values: PastKeyValues,
-    lm_input_ids: torch.Tensor,
-    lm_labels: torch.Tensor,
-) -> torch.Tensor:
-    outputs = target_model(
-        input_ids=lm_input_ids,
-        past_key_values=past_key_values,
-        use_cache=False,
-    )
-    logits = outputs.logits
-    vocab_size = logits.shape[-1]
-    return F.cross_entropy(
-        logits.reshape(-1, vocab_size),
-        lm_labels.reshape(-1),
-        reduction="mean",
-    )
-
 
 class InfiniteDataLoader:
     def __init__(self, dataloader: DataLoader) -> None:
@@ -82,6 +22,8 @@ def build_training_dataloader(tokenizer: PreTrainedTokenizerBase, config) -> Inf
     dataset = OpenWebTextSequenceStream(
         tokenizer=tokenizer,
         sequence_length=config.total_tokens,
+        split="train",
+        shuffle=True,
         shuffle_buffer=config.shuffle_buffer,
         seed=config.seed,
     )
@@ -89,16 +31,6 @@ def build_training_dataloader(tokenizer: PreTrainedTokenizerBase, config) -> Inf
     return InfiniteDataLoader(dataloader)
 
 
-def split_prefix_and_suffix_for_exact_next_token_loss(
-    input_ids: torch.Tensor,
-    prefix_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if prefix_tokens < 2:
-        raise ValueError("prefix_tokens must be >= 2")
-    prefix_cache_ids = input_ids[:, : prefix_tokens - 1]
-    lm_input_ids = input_ids[:, prefix_tokens - 1 : -1]
-    lm_labels = input_ids[:, prefix_tokens:]
-    return prefix_cache_ids, lm_input_ids, lm_labels
 
 
 class WarmupCosineScheduler:

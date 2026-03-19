@@ -69,6 +69,12 @@ class AutoTokenizer:
         return TinyTokenizer(model_id)
 
 
+class AutoConfig:
+    @staticmethod
+    def from_pretrained(model_id: str) -> "TinyConfig":
+        return TinyConfig(_name_or_path=model_id)
+
+
 class PreTrainedModel(nn.Module):
     config: object
 
