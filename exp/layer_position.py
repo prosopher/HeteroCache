@@ -1907,8 +1907,8 @@ class SummaryRow:
     average_delta_dir_only: float
     average_delta_mag_only: float
     average_delta_full_mix: float
-    average_native_ppl: float
-    average_full_mix_ppl: float
+    average_native_loss: float
+    average_full_mix_loss: float
     average_native_to_dir_only_logit_kl: float
     average_native_to_mag_only_logit_kl: float
     average_native_to_full_mix_logit_kl: float
@@ -1936,9 +1936,9 @@ def extract_eval_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]:
         "average_delta_dir_only": combined_metrics["average_delta_dir_only"],
         "average_delta_mag_only": combined_metrics["average_delta_mag_only"],
         "average_delta_full_mix": combined_metrics["average_delta_full_mix"],
-        "openwebtext_validation_ppl": combined_metrics["openwebtext_validation_ppl"],
-        "average_native_ppl": combined_metrics["average_native_ppl"],
-        "average_full_mix_ppl": combined_metrics["average_full_mix_ppl"],
+        "openwebtext_validation_loss": combined_metrics["openwebtext_validation_loss"],
+        "average_native_loss": combined_metrics["average_native_loss"],
+        "average_full_mix_loss": combined_metrics["average_full_mix_loss"],
         f"average_{metric_name}": combined_metrics[f"average_{metric_name}"],
         f"average_native_{metric_name}": combined_metrics[f"average_native_{metric_name}"],
     }
@@ -1958,9 +1958,9 @@ def extract_analysis_metrics(combined_metrics: Dict[str, Any]) -> Dict[str, Any]
         "average_delta_dir_only": combined_metrics["average_delta_dir_only"],
         "average_delta_mag_only": combined_metrics["average_delta_mag_only"],
         "average_delta_full_mix": combined_metrics["average_delta_full_mix"],
-        "openwebtext_validation_ppl": combined_metrics["openwebtext_validation_ppl"],
-        "average_native_ppl": combined_metrics["average_native_ppl"],
-        "average_full_mix_ppl": combined_metrics["average_full_mix_ppl"],
+        "openwebtext_validation_loss": combined_metrics["openwebtext_validation_loss"],
+        "average_native_loss": combined_metrics["average_native_loss"],
+        "average_full_mix_loss": combined_metrics["average_full_mix_loss"],
     }
 
 
@@ -1988,8 +1988,8 @@ def build_summary_row(
         average_delta_dir_only=float(metrics["average_delta_dir_only"]),
         average_delta_mag_only=float(metrics["average_delta_mag_only"]),
         average_delta_full_mix=float(metrics["average_delta_full_mix"]),
-        average_native_ppl=float(metrics["average_native_ppl"]),
-        average_full_mix_ppl=float(metrics["average_full_mix_ppl"]),
+        average_native_loss=float(metrics["average_native_loss"]),
+        average_full_mix_loss=float(metrics["average_full_mix_loss"]),
         average_native_to_dir_only_logit_kl=float(metrics["average_native_to_dir_only_logit_kl"]),
         average_native_to_mag_only_logit_kl=float(metrics["average_native_to_mag_only_logit_kl"]),
         average_native_to_full_mix_logit_kl=float(metrics["average_native_to_full_mix_logit_kl"]),
@@ -2073,8 +2073,8 @@ def build_logit_kl_chart_path(study_dir: Path) -> Path:
     return study_dir / "layer_idx_vs_logit_kl.png"
 
 
-def build_openwebtext_ppl_chart_path(study_dir: Path) -> Path:
-    return study_dir / "layer_idx_vs_openwebtext_validation_ppl.png"
+def build_openwebtext_loss_chart_path(study_dir: Path) -> Path:
+    return study_dir / "layer_idx_vs_openwebtext_validation_loss.png"
 
 
 def plot_metric_controls_summary(summary_path: Path) -> Path:
@@ -2145,7 +2145,7 @@ def plot_logit_kl_summary(summary_path: Path) -> Path:
     return chart_path
 
 
-def plot_openwebtext_ppl_summary(summary_path: Path) -> Path:
+def plot_openwebtext_loss_summary(summary_path: Path) -> Path:
     rows = read_summary_rows(summary_path)
     if not rows:
         raise ValueError(f"No plottable rows found in {summary_path}")
@@ -2159,18 +2159,18 @@ def plot_openwebtext_ppl_summary(summary_path: Path) -> Path:
 
     fig = plt.figure(figsize=(9, 5.2))
     ax = fig.add_subplot(111)
-    ax.plot(x_values, [row.average_native_ppl for row in rows], marker="o", label="Native PPL")
-    ax.plot(x_values, [row.average_full_mix_ppl for row in rows], marker="D", label="Full-mix PPL")
-    annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_ppl)
+    ax.plot(x_values, [row.average_native_loss for row in rows], marker="o", label="Native Loss")
+    ax.plot(x_values, [row.average_full_mix_loss for row in rows], marker="D", label="Full-mix Loss")
+    annotate_injected_layer_ranges(ax, rows, lambda row: row.average_full_mix_loss)
     ax.set_xlabel("Reference target layer index")
-    ax.set_ylabel("OpenWebText validation PPL")
-    ax.set_title(f"OpenWebText validation PPL vs layer index ({window_title})")
+    ax.set_ylabel("OpenWebText validation Loss")
+    ax.set_title(f"OpenWebText validation Loss vs layer index ({window_title})")
     ax.set_xticks(x_values)
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
 
-    chart_path = build_openwebtext_ppl_chart_path(study_dir)
+    chart_path = build_openwebtext_loss_chart_path(study_dir)
     fig.savefig(chart_path, dpi=200)
     plt.close(fig)
     return chart_path
@@ -2186,7 +2186,7 @@ def remove_stale_summary_artifacts(study_dir: Path, run_dir: Path) -> None:
         study_dir / "drift_summary.csv",
         study_dir / "drift_cosine.png",
         study_dir / "drift_l2.png",
-        study_dir / "layer_idx_vs_openwebtext_validation_ppl.png",
+        study_dir / "layer_idx_vs_openwebtext_validation_loss.png",
     ]
     for stale_path in stale_paths:
         if stale_path.exists():
@@ -2214,8 +2214,8 @@ def save_run_artifacts(
     summary_path = update_summary(config, run_dir, combined_metrics)
     metric_controls_chart_path = plot_metric_controls_summary(summary_path)
     logit_kl_chart_path = plot_logit_kl_summary(summary_path)
-    openwebtext_ppl_chart_path = plot_openwebtext_ppl_summary(summary_path)
-    return summary_path, build_metrics_path(run_dir), metric_controls_chart_path, logit_kl_chart_path, openwebtext_ppl_chart_path
+    openwebtext_loss_chart_path = plot_openwebtext_loss_summary(summary_path)
+    return summary_path, build_metrics_path(run_dir), metric_controls_chart_path, logit_kl_chart_path, openwebtext_loss_chart_path
 
 def run_eval(
     config: LayerPositionConfig,
@@ -2278,7 +2278,7 @@ def run_eval(
             models=models,
         )
 
-    openwebtext_ppl_by_direction = evaluate_openwebtext_validation_loss_metrics(
+    openwebtext_loss_by_direction = evaluate_openwebtext_validation_loss_metrics(
         tokenizer=tokenizer,
         config=config,
         batch_size=config.eval_batch_size,
@@ -2301,25 +2301,19 @@ def run_eval(
                 "native": "native_loss",
                 "full_mix": "full_mix_loss",
             },
-            ppl_field_by_name={
-                "native": "native_ppl",
-                "full_mix": "full_mix_ppl",
-            },
-            ppl_delta_reference_name="native",
-            ppl_delta_field_by_name={
-                "full_mix": "delta_full_mix_ppl",
+            loss_delta_reference_name="native",
+            loss_delta_field_by_name={
+                "full_mix": "delta_full_mix_loss",
             },
         ),
     )
     for direction in active_directions:
-        row = openwebtext_ppl_by_direction[direction]
+        row = openwebtext_loss_by_direction[direction]
         logger.info(
-            "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | native_ppl=%.6f | full_mix_ppl=%.6f | count=%d",
+            "[OpenWebText/validation] %s | native_loss=%.6f | full_mix_loss=%.6f | count=%d",
             direction,
             row["native_loss"],
             row["full_mix_loss"],
-            row["native_ppl"],
-            row["full_mix_ppl"],
             int(row["count"]),
         )
 
@@ -2405,9 +2399,9 @@ def run_eval(
     average_native_to_full_mix_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "native_to_full_mix_logit_kl")
     average_full_mix_to_dir_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "full_mix_to_dir_only_logit_kl")
     average_full_mix_to_mag_only_logit_kl = compute_average_metric(dataset_logit_kl_by_name, "full_mix_to_mag_only_logit_kl")
-    openwebtext_ppl_results = {"OpenWebText/validation": openwebtext_ppl_by_direction}
-    average_native_ppl = compute_average_metric(openwebtext_ppl_results, "native_ppl")
-    average_full_mix_ppl = compute_average_metric(openwebtext_ppl_results, "full_mix_ppl")
+    openwebtext_loss_results = {"OpenWebText/validation": openwebtext_loss_by_direction}
+    average_native_loss = compute_average_metric(openwebtext_loss_results, "native_loss")
+    average_full_mix_loss = compute_average_metric(openwebtext_loss_results, "full_mix_loss")
 
     logger.info(
         "[Summary] metric=%s | native=%.6f | dir_only=%.6f | mag_only=%.6f | full_mix=%.6f",
@@ -2432,9 +2426,9 @@ def run_eval(
         average_full_mix_to_mag_only_logit_kl,
     )
     logger.info(
-        "[Summary] OpenWebText/validation ppl | native=%.6f | full_mix=%.6f",
-        average_native_ppl,
-        average_full_mix_ppl,
+        "[Summary] OpenWebText/validation loss | native=%.6f | full_mix=%.6f",
+        average_native_loss,
+        average_full_mix_loss,
     )
     return {
         "benchmark_mode": config.benchmark_mode,
@@ -2449,9 +2443,9 @@ def run_eval(
         "average_delta_dir_only": average_delta_dir_only,
         "average_delta_mag_only": average_delta_mag_only,
         "average_delta_full_mix": average_delta_full_mix,
-        "openwebtext_validation_ppl": openwebtext_ppl_by_direction,
-        "average_native_ppl": average_native_ppl,
-        "average_full_mix_ppl": average_full_mix_ppl,
+        "openwebtext_validation_loss": openwebtext_loss_by_direction,
+        "average_native_loss": average_native_loss,
+        "average_full_mix_loss": average_full_mix_loss,
         f"average_{metric_name}": average_full_mix_metric,
         f"average_native_{metric_name}": average_native_metric,
         "dataset_logit_kl": dataset_logit_kl_by_name,
@@ -2607,7 +2601,7 @@ def main() -> None:
     eval_metrics = extract_eval_metrics(combined_metrics)
     analysis_metrics = extract_analysis_metrics(combined_metrics)
 
-    summary_path, metrics_path, metric_controls_chart_path, logit_kl_chart_path, openwebtext_ppl_chart_path = save_run_artifacts(
+    summary_path, metrics_path, metric_controls_chart_path, logit_kl_chart_path, openwebtext_loss_chart_path = save_run_artifacts(
         config=config,
         run_dir=run_dir,
         layer_mappings=layer_mappings,
@@ -2623,7 +2617,7 @@ def main() -> None:
     print(f"Control analysis metrics: {analysis_metrics_path}")
     print(f"Principal rotation metadata: {build_principal_rotation_metadata_path(run_dir)}")
     print(f"Logit KL chart: {logit_kl_chart_path}")
-    print(f"OpenWebText validation PPL chart: {openwebtext_ppl_chart_path}")
+    print(f"OpenWebText validation Loss chart: {openwebtext_loss_chart_path}")
 
 
 if __name__ == "__main__":

@@ -318,7 +318,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
     all_generation_results = {}
 
     logger.info("Preparing validation dataloader for OpenWebText/validation")
-    openwebtext_ppl_results = evaluate_openwebtext_validation_ppl(
+    openwebtext_loss_results = evaluate_openwebtext_validation_loss(
         tokenizer=tokenizer,
         train_config=train_config,
         eval_config=eval_config,
@@ -331,14 +331,12 @@ def run_eval(eval_config: EvalConfig) -> Path:
         logger=logger,
     )
     for direction in active_directions:
-        row = openwebtext_ppl_results[direction]
+        row = openwebtext_loss_results[direction]
         logger.info(
-            "[OpenWebText/validation] %s | native_loss=%.6f | translated_loss=%.6f | native_ppl=%.6f | translated_ppl=%.6f | count=%d",
+            "[OpenWebText/validation] %s | native_loss=%.6f | translated_loss=%.6f | count=%d",
             direction,
             row["native_loss"],
             row["loss"],
-            row["native_ppl"],
-            row["ppl"],
             int(row["count"]),
         )
 
@@ -423,7 +421,7 @@ def run_eval(eval_config: EvalConfig) -> Path:
         active_directions=active_directions,
         all_logit_results=all_logit_results,
         all_generation_results=all_generation_results,
-        openwebtext_ppl_results=openwebtext_ppl_results,
+        openwebtext_loss_results=openwebtext_loss_results,
     )
     logger.info("===== FINAL MARKDOWN SUMMARY =====\n%s", final_summary_markdown)
 

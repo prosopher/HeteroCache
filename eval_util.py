@@ -205,32 +205,23 @@ def build_openwebtext_eval_dataloader(
 
 
 
-def _loss_to_perplexity(loss_value: float) -> float:
-    if not math.isfinite(loss_value):
-        return float("nan")
-    return float(math.exp(min(loss_value, 80.0)))
-
-
-
 def summarize_openwebtext_named_losses(
     average_losses: Dict[str, float],
     count: int,
     *,
     primary_name: str,
     loss_field_by_name: Optional[Dict[str, str]] = None,
-    ppl_field_by_name: Optional[Dict[str, str]] = None,
-    ppl_delta_reference_name: Optional[str] = None,
-    ppl_delta_field_by_name: Optional[Dict[str, str]] = None,
+    loss_delta_reference_name: Optional[str] = None,
+    loss_delta_field_by_name: Optional[Dict[str, str]] = None,
 ) -> Dict[str, float]:
     loss_field_by_name = dict(loss_field_by_name or {})
-    ppl_field_by_name = dict(ppl_field_by_name or {})
-    ppl_delta_field_by_name = dict(ppl_delta_field_by_name or {})
+    loss_delta_field_by_name = dict(loss_delta_field_by_name or {})
 
-    metric_names = set(loss_field_by_name) | set(ppl_field_by_name)
+    metric_names = set(loss_field_by_name)
     metric_names.add(primary_name)
-    if ppl_delta_reference_name is not None:
-        metric_names.add(ppl_delta_reference_name)
-    metric_names.update(ppl_delta_field_by_name)
+    if loss_delta_reference_name is not None:
+        metric_names.add(loss_delta_reference_name)
+    metric_names.update(loss_delta_field_by_name)
 
     summary: Dict[str, float] = {"count": int(count)}
 
@@ -238,30 +229,25 @@ def summarize_openwebtext_named_losses(
         average_loss = float(average_losses.get(name, float("nan"))) if count > 0 else float("nan")
         if name == primary_name:
             summary["loss"] = average_loss
-            summary["ppl"] = _loss_to_perplexity(average_loss)
 
         loss_field = loss_field_by_name.get(name)
         if loss_field is not None:
             summary[loss_field] = average_loss
 
-        ppl_field = ppl_field_by_name.get(name)
-        if ppl_field is not None:
-            summary[ppl_field] = _loss_to_perplexity(average_loss)
-
-    if ppl_delta_reference_name is not None:
-        if ppl_delta_reference_name == primary_name:
-            reference_ppl = float(summary.get("ppl", float("nan")))
+    if loss_delta_reference_name is not None:
+        if loss_delta_reference_name == primary_name:
+            reference_loss = float(summary.get("loss", float("nan")))
         else:
-            reference_ppl = float(summary.get(ppl_field_by_name.get(ppl_delta_reference_name, ""), float("nan")))
+            reference_loss = float(summary.get(loss_field_by_name.get(loss_delta_reference_name, ""), float("nan")))
 
-        for name, delta_field in ppl_delta_field_by_name.items():
+        for name, delta_field in loss_delta_field_by_name.items():
             if name == primary_name:
-                candidate_ppl = float(summary.get("ppl", float("nan")))
+                candidate_loss = float(summary.get("loss", float("nan")))
             else:
-                candidate_ppl = float(summary.get(ppl_field_by_name.get(name, ""), float("nan")))
+                candidate_loss = float(summary.get(loss_field_by_name.get(name, ""), float("nan")))
 
-            if math.isfinite(reference_ppl) and math.isfinite(candidate_ppl):
-                summary[delta_field] = candidate_ppl - reference_ppl
+            if math.isfinite(reference_loss) and math.isfinite(candidate_loss):
+                summary[delta_field] = candidate_loss - reference_loss
             else:
                 summary[delta_field] = float("nan")
 
@@ -366,7 +352,7 @@ def evaluate_openwebtext_validation_loss_metrics(
 
 
 @torch.inference_mode()
-def evaluate_openwebtext_validation_ppl(
+def evaluate_openwebtext_validation_loss(
     tokenizer,
     train_config,
     eval_config: EvalConfig,
@@ -439,9 +425,6 @@ def evaluate_openwebtext_validation_ppl(
             primary_name="translated",
             loss_field_by_name={
                 "native": "native_loss",
-            },
-            ppl_field_by_name={
-                "native": "native_ppl",
             },
         ),
     )
@@ -1660,7 +1643,7 @@ def build_direction_summary_markdown_table(
     edges: List[Edge],
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
-    openwebtext_ppl_results: Optional[Dict[str, Dict[str, float]]] = None,
+    openwebtext_loss_results: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> str:
     node_map = build_node_map(nodes)
     edge_map = build_edge_map(edges)
@@ -1683,7 +1666,7 @@ def build_direction_summary_markdown_table(
         display_name: all_generation_results.get(dataset_key, {}).get(direction, {})
         for display_name, dataset_key in generation_dataset_keys
     }
-    ppl_row = (openwebtext_ppl_results or {}).get(direction, {})
+    loss_row = (openwebtext_loss_results or {}).get(direction, {})
 
     translated_cosine_avg = _summary_mean([
         logit_rows["BoolQ"].get("cosine", float("nan")),
@@ -1717,7 +1700,7 @@ def build_direction_summary_markdown_table(
     lines = [
         f"### {direction_title}",
         "",
-        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val PPL |",
+        "| Method | Cosine Sim Avg | BoolQ | PubMedQA | Acc Avg | SQuAD | NewsQA | Gen F1 Avg | OWT Val Loss |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         (
             f"| {target_model_id} (baseline) | N/A | "
@@ -1727,7 +1710,7 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_float(generation_rows['SQuAD'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('native_f1', float('nan')))} | "
             f"{_format_summary_float(native_generation_f1_avg)} | "
-            f"{_format_summary_float(ppl_row.get('native_ppl', float('nan')))} |"
+            f"{_format_summary_float(loss_row.get('native_loss', float('nan')))} |"
         ),
         (
             f"| {alg} | "
@@ -1738,7 +1721,7 @@ def build_direction_summary_markdown_table(
             f"{_format_summary_float(generation_rows['SQuAD'].get('f1', float('nan')))} | "
             f"{_format_summary_float(generation_rows['NewsQA'].get('f1', float('nan')))} | "
             f"{_format_summary_float(translated_generation_f1_avg)} | "
-            f"{_format_summary_float(ppl_row.get('ppl', float('nan')))} |"
+            f"{_format_summary_float(loss_row.get('loss', float('nan')))} |"
         ),
     ]
     return "\n".join(lines)
@@ -1751,7 +1734,7 @@ def build_final_summary_markdown(
     active_directions,
     all_logit_results: Dict[str, Dict[str, Dict[str, float]]],
     all_generation_results: Dict[str, Dict[str, Dict[str, float]]],
-    openwebtext_ppl_results: Optional[Dict[str, Dict[str, float]]] = None,
+    openwebtext_loss_results: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> str:
     sections = []
 
@@ -1764,7 +1747,7 @@ def build_final_summary_markdown(
                 edges=edges,
                 all_logit_results=all_logit_results,
                 all_generation_results=all_generation_results,
-                openwebtext_ppl_results=openwebtext_ppl_results,
+                openwebtext_loss_results=openwebtext_loss_results,
             )
         )
 
