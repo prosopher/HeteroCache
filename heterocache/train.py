@@ -45,10 +45,11 @@ class TrainConfig:
         initialize_train_output_paths(self)
 
 
-class SelfAttentionBlock(nn.Module):
+class CrossAttentionBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 2) -> None:
         super().__init__()
-        self.attn_norm = nn.LayerNorm(dim)
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
         self.ffn_norm = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
@@ -57,15 +58,23 @@ class SelfAttentionBlock(nn.Module):
             nn.Linear(dim * mlp_ratio, dim),
         )
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        norm_hidden = self.attn_norm(hidden)
-        attn_out, _ = self.attn(norm_hidden, norm_hidden, norm_hidden, need_weights=False)
+    def forward(self, hidden: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        q = self.query_norm(hidden)
+        kv = self.context_norm(context)
+        attn_out, _ = self.attn(q, kv, kv, need_weights=False)
         hidden = hidden + attn_out
         hidden = hidden + self.ffn(self.ffn_norm(hidden))
         return hidden
 
 
 class CrossLayerWindowTranslator(nn.Module):
+    """
+    Recurrent cross-attention translator following the LSC translator pattern.
+
+    Input:  [batch, seq, num_layers, src_hidden]
+    Output: [batch, seq, num_layers, dst_hidden]
+    """
+
     def __init__(
         self,
         src_hidden_size: int,
@@ -79,23 +88,29 @@ class CrossLayerWindowTranslator(nn.Module):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
+        if translator_depth < 1:
+            raise ValueError("translator_depth must be >= 1")
         self.num_layers = num_layers
+        self.translator_depth = translator_depth
         self.input_norm = nn.LayerNorm(src_hidden_size)
         self.input_proj = nn.Linear(src_hidden_size, translator_dim)
-        self.layer_embeddings = nn.Parameter(torch.zeros(1, 1, num_layers, translator_dim))
-        self.blocks = nn.ModuleList(
+        self.recurrent_blocks = nn.ModuleList(
             [
-                SelfAttentionBlock(
-                    dim=translator_dim,
-                    num_heads=translator_heads,
-                    mlp_ratio=mlp_ratio,
+                nn.ModuleList(
+                    [
+                        CrossAttentionBlock(
+                            dim=translator_dim,
+                            num_heads=translator_heads,
+                            mlp_ratio=mlp_ratio,
+                        )
+                        for _ in range(num_layers)
+                    ]
                 )
                 for _ in range(translator_depth)
             ]
         )
-        self.output_norm = nn.LayerNorm(translator_dim)
-        self.output_proj = nn.Linear(translator_dim, dst_hidden_size)
-        nn.init.normal_(self.layer_embeddings, mean=0.0, std=0.02)
+        self.output_norm = nn.LayerNorm(num_layers * translator_dim)
+        self.output_proj = nn.Linear(num_layers * translator_dim, num_layers * dst_hidden_size)
 
     def forward(self, layer_window_cache: torch.Tensor) -> torch.Tensor:
         if layer_window_cache.ndim != 4:
@@ -108,16 +123,23 @@ class CrossLayerWindowTranslator(nn.Module):
                 f"CrossLayerWindowTranslator expected {self.num_layers} layers, got {layer_window_cache.shape[2]}"
             )
 
-        hidden = F.gelu(self.input_proj(self.input_norm(layer_window_cache)))
-        hidden = hidden + self.layer_embeddings.to(device=hidden.device, dtype=hidden.dtype)
-        batch_size, seq_len, num_layers, hidden_dim = hidden.shape
-        hidden = hidden.transpose(1, 2).contiguous().view(batch_size, seq_len * num_layers, hidden_dim)
-        for block in self.blocks:
-            hidden = block(hidden)
-        hidden = self.output_proj(self.output_norm(hidden))
-        output_dim = hidden.shape[-1]
-        hidden = hidden.view(batch_size, num_layers, seq_len, output_dim).transpose(1, 2).contiguous()
-        return hidden
+        batch_size, seq_len, _, _ = layer_window_cache.shape
+        projected = F.gelu(self.input_proj(self.input_norm(layer_window_cache)))
+
+        hidden = projected[:, :, 0, :]
+        collected = []
+        for stage_blocks in self.recurrent_blocks:
+            stage_hidden = hidden
+            stage_collected = []
+            for layer_idx, block in enumerate(stage_blocks):
+                stage_hidden = block(stage_hidden, projected[:, :, layer_idx, :])
+                stage_collected.append(stage_hidden)
+            hidden = stage_hidden
+            collected = stage_collected
+
+        fused = torch.cat(collected, dim=-1)
+        translated = F.gelu(self.output_proj(self.output_norm(fused)))
+        return translated.view(batch_size, seq_len, self.num_layers, -1)
 
 
 class TopLayerDirectionalTranslator(nn.Module):
