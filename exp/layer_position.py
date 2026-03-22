@@ -2490,9 +2490,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translator-depth", type=int, default=2)
     parser.add_argument("--translator-mlp-ratio", type=int, default=4)
     parser.add_argument(
-        "--enable-principal-rotation",
+        "--disable-principal-rotation",
         action="store_true",
-        help="Enable SVD principal-basis rotation before translation and inverse rotation after translation.",
+        help="Disable SVD principal-basis rotation before translation and inverse rotation after translation.",
     )
     parser.add_argument(
         "--principal-rotation-streams",
@@ -2550,7 +2550,7 @@ def main() -> None:
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,
         translator_mlp_ratio=args.translator_mlp_ratio,
-        enable_principal_rotation=args.enable_principal_rotation,
+        enable_principal_rotation=not args.disable_principal_rotation,
         principal_rotation_streams=args.principal_rotation_streams,
         principal_rotation_calibration_steps=args.principal_rotation_calibration_steps,
         device=args.device,
