@@ -35,46 +35,46 @@ class LayerMapping:
 
 @dataclass
 class LayerPositionConfig:
-    model_ids: str = "gpt2,gpt2"
-    model_directions: str = "A_to_B"
-    reference_direction: Optional[str] = None
-    position_layer_idx: Optional[int] = None
-    injection_window_size: int = 1
+    model_ids: str
+    model_directions: str
+    reference_direction: Optional[str]
+    position_layer_idx: Optional[int]
+    injection_window_size: int
 
-    output_root: str = "outputs/layer_position"
-    study_id: Optional[str] = None
+    output_root: str
+    study_id: Optional[str]
 
-    max_steps: int = 500
-    batch_size: int = 4
-    grad_accum_steps: int = 4
-    total_tokens: int = 128
-    prefix_tokens: int = 64
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-2
-    warmup_steps: int = 50
-    grad_clip_norm: float = 1.0
-    log_every: int = 25
-    seed: int = 42
-    shuffle_buffer: int = 50_000
+    max_steps: int
+    batch_size: int
+    grad_accum_steps: int
+    total_tokens: int
+    prefix_tokens: int
+    learning_rate: float
+    weight_decay: float
+    warmup_steps: int
+    grad_clip_norm: float
+    log_every: int
+    seed: int
+    shuffle_buffer: int
 
-    translator_dim: int = 1024
-    translator_heads: int = 16
-    translator_depth: int = 2
-    translator_mlp_ratio: int = 4
+    translator_dim: int
+    translator_heads: int
+    translator_depth: int
+    translator_mlp_ratio: int
 
-    enable_principal_rotation: bool = True
-    principal_rotation_streams: str = "k"
-    principal_rotation_calibration_steps: int = 512
+    enable_principal_rotation: bool
+    principal_rotation_streams: str
+    principal_rotation_calibration_steps: int
 
-    device: str = "auto"
-    dtype: str = "float32"
+    device: str
+    dtype: str
 
-    eval_batch_size: int = 4
-    eval_num_workers: int = 0
-    eval_max_examples_per_dataset: int = 100
-    eval_shuffle_stream: bool = False
-    benchmark_mode: str = "gen_qa"
-    generation_max_new_tokens: int = 64
+    eval_batch_size: int
+    eval_num_workers: int
+    eval_max_examples_per_dataset: int
+    eval_shuffle_stream: bool
+    benchmark_mode: str
+    generation_max_new_tokens: int
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -2490,9 +2490,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--translator-depth", type=int, default=2)
     parser.add_argument("--translator-mlp-ratio", type=int, default=4)
     parser.add_argument(
-        "--disable-principal-rotation",
+        "--enable-principal-rotation",
         action="store_true",
-        help="Disable SVD principal-basis rotation before translation and inverse rotation after translation.",
+        help="Enable SVD principal-basis rotation before translation and inverse rotation after translation.",
     )
     parser.add_argument(
         "--principal-rotation-streams",
@@ -2550,7 +2550,7 @@ def main() -> None:
         translator_heads=args.translator_heads,
         translator_depth=args.translator_depth,
         translator_mlp_ratio=args.translator_mlp_ratio,
-        enable_principal_rotation=not args.disable_principal_rotation,
+        enable_principal_rotation=args.enable_principal_rotation,
         principal_rotation_streams=args.principal_rotation_streams,
         principal_rotation_calibration_steps=args.principal_rotation_calibration_steps,
         device=args.device,
