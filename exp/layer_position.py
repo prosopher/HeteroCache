@@ -1369,6 +1369,11 @@ def run_train(
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
                 )
+                native_target_key_block, native_target_value_block = extract_layer_window_blocks(
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    start_layer_idx=mapping.dst_layer_idx,
+                    num_layers=mapping.translated_num_layers,
+                )
                 mixed_target_past = replay_target_prefill_with_injected_window(
                     target_model=models[edge.dst_id],
                     prefix_input_ids=prefix_cache_ids,
@@ -1377,11 +1382,15 @@ def run_train(
                     injected_value_block=translated_value,
                     dst_spec=model_specs[edge.dst_id],
                 )
-                total_direction_loss = total_direction_loss + compute_suffix_lm_loss(
+                total_direction_loss = total_direction_loss + compute_prefix_recon_and_suffix_lm_loss(
                     target_model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
+                    translated_key_block=translated_key,
+                    translated_value_block=translated_value,
+                    native_target_key_block=native_target_key_block,
+                    native_target_value_block=native_target_value_block,
                 )
 
             loss = total_direction_loss / config.grad_accum_steps

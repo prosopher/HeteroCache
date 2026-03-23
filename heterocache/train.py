@@ -439,21 +439,39 @@ def run_train(config: TrainConfig) -> Path:
             total_direction_loss = 0.0
             for direction in model_directions:
                 edge = edge_map[direction]
-                translated_top_past = translator_pool.translate_top_layers(
+                src_key_block, src_value_block = extract_top_layer_blocks(
                     past_key_values=past_by_node_id[edge.src_id],
+                    top_layers_to_translate=config.top_layers_to_translate,
+                )
+                native_target_key_block, native_target_value_block = extract_top_layer_blocks(
+                    past_key_values=past_by_node_id[edge.dst_id],
+                    top_layers_to_translate=config.top_layers_to_translate,
+                )
+                translated_key_block, translated_value_block = translator_pool.translate_top_layer_blocks(
+                    key_block=src_key_block,
+                    value_block=src_value_block,
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
-                    dst_spec=model_specs[edge.dst_id],
+                )
+                translated_top_past = blocks_to_partial_past_key_values(
+                    key_block=translated_key_block,
+                    value_block=translated_value_block,
+                    num_heads=model_specs[edge.dst_id].num_heads,
+                    head_dim=model_specs[edge.dst_id].head_dim,
                 )
                 mixed_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
                     translated_top_past_key_values=translated_top_past,
                 )
-                direction_loss = compute_suffix_lm_loss(
+                direction_loss = compute_prefix_recon_and_suffix_lm_loss(
                     target_model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
+                    translated_key_block=translated_key_block,
+                    translated_value_block=translated_value_block,
+                    native_target_key_block=native_target_key_block,
+                    native_target_value_block=native_target_value_block,
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 

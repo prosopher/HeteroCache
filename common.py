@@ -135,6 +135,41 @@ def compute_suffix_lm_loss(
     )
 
 
+def compute_prefix_recon_and_suffix_lm_loss(
+    target_model: PreTrainedModel,
+    past_key_values: PastKeyValues,
+    lm_input_ids: torch.Tensor,
+    lm_labels: torch.Tensor,
+    translated_key_block: torch.Tensor,
+    translated_value_block: torch.Tensor,
+    native_target_key_block: torch.Tensor,
+    native_target_value_block: torch.Tensor,
+    prefix_reconstruction_weight: float = 1.0,
+) -> torch.Tensor:
+    if translated_key_block.shape != native_target_key_block.shape:
+        raise ValueError(
+            "translated_key_block and native_target_key_block must have the same shape, "
+            f"got {tuple(translated_key_block.shape)} vs {tuple(native_target_key_block.shape)}"
+        )
+    if translated_value_block.shape != native_target_value_block.shape:
+        raise ValueError(
+            "translated_value_block and native_target_value_block must have the same shape, "
+            f"got {tuple(translated_value_block.shape)} vs {tuple(native_target_value_block.shape)}"
+        )
+
+    suffix_lm_loss = compute_suffix_lm_loss(
+        target_model=target_model,
+        past_key_values=past_key_values,
+        lm_input_ids=lm_input_ids,
+        lm_labels=lm_labels,
+    )
+    prefix_reconstruction_loss = (
+        F.mse_loss(translated_key_block, native_target_key_block, reduction="mean")
+        + F.mse_loss(translated_value_block, native_target_value_block, reduction="mean")
+    )
+    return suffix_lm_loss + (prefix_reconstruction_weight * prefix_reconstruction_loss)
+
+
 @dataclass
 class ModelSpec:
     model_id: str
