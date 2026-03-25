@@ -173,7 +173,7 @@ LOGIT_QA_SPEC_GROUP_FACTORIES = [
 
 GEN_QA_SPEC_GROUP_FACTORIES = [
     get_squad_v11_dataset_spec,
-    get_newsqa_generation_dataset_spec,
+    # get_newsqa_generation_dataset_spec,
 ]
 
 EVAL_SPEC_GROUP_FACTORIES = {
