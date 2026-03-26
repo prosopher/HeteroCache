@@ -108,11 +108,45 @@ class StreamPrincipalRotation:
 
 
 @dataclass
+class PairedPrincipalAlignment:
+    aligned_src: StreamPrincipalRotation
+    aligned_dst: StreamPrincipalRotation
+    shared_rank: int
+    top_singular_value_ratio: float
+    mean_abs_diagonal_correlation: float
+
+
+@dataclass
 class DirectionalPrincipalRotations:
     src_key: List[StreamPrincipalRotation]
     dst_key: List[StreamPrincipalRotation]
     src_value: List[StreamPrincipalRotation]
     dst_value: List[StreamPrincipalRotation]
+
+
+def stabilize_basis_column_signs(basis: torch.Tensor) -> torch.Tensor:
+    stabilized = basis.clone()
+    for column_idx in range(stabilized.shape[1]):
+        pivot_idx = int(torch.argmax(stabilized[:, column_idx].abs()).item())
+        if stabilized[pivot_idx, column_idx] < 0:
+            stabilized[:, column_idx] = -stabilized[:, column_idx]
+    return stabilized
+
+
+def stabilize_paired_basis_column_signs(src_basis: torch.Tensor, dst_basis: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    stabilized_src = src_basis.clone()
+    stabilized_dst = dst_basis.clone()
+    shared_columns = min(stabilized_src.shape[1], stabilized_dst.shape[1])
+    for column_idx in range(shared_columns):
+        pivot_idx = int(torch.argmax(stabilized_src[:, column_idx].abs()).item())
+        if stabilized_src[pivot_idx, column_idx] < 0:
+            stabilized_src[:, column_idx] = -stabilized_src[:, column_idx]
+            stabilized_dst[:, column_idx] = -stabilized_dst[:, column_idx]
+    if stabilized_src.shape[1] > shared_columns:
+        stabilized_src[:, shared_columns:] = stabilize_basis_column_signs(stabilized_src[:, shared_columns:])
+    if stabilized_dst.shape[1] > shared_columns:
+        stabilized_dst[:, shared_columns:] = stabilize_basis_column_signs(stabilized_dst[:, shared_columns:])
+    return stabilized_src, stabilized_dst
 
 
 class RunningCovarianceAccumulator:
@@ -146,17 +180,303 @@ class RunningCovarianceAccumulator:
         eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
         order = torch.argsort(eigenvalues, descending=True)
         eigenvalues = eigenvalues[order]
-        basis = eigenvectors[:, order]
-        for column_idx in range(basis.shape[1]):
-            pivot_idx = int(torch.argmax(basis[:, column_idx].abs()).item())
-            if basis[pivot_idx, column_idx] < 0:
-                basis[:, column_idx] = -basis[:, column_idx]
+        basis = stabilize_basis_column_signs(eigenvectors[:, order])
         total_variance = float(eigenvalues.clamp_min(0).sum().item())
         top_ratio = 0.0 if total_variance <= 0.0 else float(eigenvalues[0].clamp_min(0).item() / total_variance)
         return StreamPrincipalRotation(
             mean=mean.to(dtype=torch.float32),
             basis=basis.to(dtype=torch.float32),
             top_explained_variance_ratio=top_ratio,
+        )
+
+
+class RunningPairedCovarianceAccumulator:
+    def __init__(self, src_hidden_size: int, dst_hidden_size: int) -> None:
+        self.src_hidden_size = int(src_hidden_size)
+        self.dst_hidden_size = int(dst_hidden_size)
+        self.count = 0
+        self.src_sum = torch.zeros(self.src_hidden_size, dtype=torch.float64)
+        self.dst_sum = torch.zeros(self.dst_hidden_size, dtype=torch.float64)
+        self.xty = torch.zeros(self.src_hidden_size, self.dst_hidden_size, dtype=torch.float64)
+
+    def update(self, src_samples: torch.Tensor, dst_samples: torch.Tensor) -> None:
+        flattened_src = src_samples.detach().reshape(-1, src_samples.shape[-1]).to(device="cpu", dtype=torch.float64)
+        flattened_dst = dst_samples.detach().reshape(-1, dst_samples.shape[-1]).to(device="cpu", dtype=torch.float64)
+        if flattened_src.shape[-1] != self.src_hidden_size:
+            raise ValueError(
+                f"RunningPairedCovarianceAccumulator expected src hidden size {self.src_hidden_size}, got {flattened_src.shape[-1]}"
+            )
+        if flattened_dst.shape[-1] != self.dst_hidden_size:
+            raise ValueError(
+                f"RunningPairedCovarianceAccumulator expected dst hidden size {self.dst_hidden_size}, got {flattened_dst.shape[-1]}"
+            )
+        if flattened_src.shape[0] != flattened_dst.shape[0]:
+            raise ValueError(
+                "RunningPairedCovarianceAccumulator requires paired source/target samples with identical counts, "
+                f"got {flattened_src.shape[0]} vs {flattened_dst.shape[0]}"
+            )
+        self.count += int(flattened_src.shape[0])
+        self.src_sum += flattened_src.sum(dim=0)
+        self.dst_sum += flattened_dst.sum(dim=0)
+        self.xty += flattened_src.transpose(0, 1) @ flattened_dst
+
+    def finalize_alignment(
+        self,
+        src_rotation: StreamPrincipalRotation,
+        dst_rotation: StreamPrincipalRotation,
+    ) -> PairedPrincipalAlignment:
+        shared_rank = min(self.src_hidden_size, self.dst_hidden_size)
+        if self.count < 1 or shared_rank < 1:
+            return PairedPrincipalAlignment(
+                aligned_src=src_rotation,
+                aligned_dst=dst_rotation,
+                shared_rank=shared_rank,
+                top_singular_value_ratio=0.0,
+                mean_abs_diagonal_correlation=0.0,
+            )
+
+        src_mean = src_rotation.mean.to(dtype=torch.float64)
+        dst_mean = dst_rotation.mean.to(dtype=torch.float64)
+        cross_covariance = self.xty / float(self.count) - torch.outer(src_mean, dst_mean)
+        src_basis = src_rotation.basis.to(dtype=torch.float64)
+        dst_basis = dst_rotation.basis.to(dtype=torch.float64)
+        latent_cross_covariance = src_basis.transpose(0, 1) @ cross_covariance @ dst_basis
+        try:
+            src_alignment, singular_values, dst_alignment_t = torch.linalg.svd(
+                latent_cross_covariance,
+                full_matrices=True,
+            )
+        except RuntimeError:
+            return PairedPrincipalAlignment(
+                aligned_src=src_rotation,
+                aligned_dst=dst_rotation,
+                shared_rank=shared_rank,
+                top_singular_value_ratio=0.0,
+                mean_abs_diagonal_correlation=0.0,
+            )
+
+        aligned_src_basis, aligned_dst_basis = stabilize_paired_basis_column_signs(
+            src_basis @ src_alignment,
+            dst_basis @ dst_alignment_t.transpose(0, 1),
+        )
+        diagonalized_cross_covariance = (
+            aligned_src_basis.transpose(0, 1) @ cross_covariance @ aligned_dst_basis
+        )
+        diagonal_slice = diagonalized_cross_covariance.diagonal()[:shared_rank]
+        singular_value_sum = float(singular_values[:shared_rank].sum().item())
+        top_singular_value_ratio = (
+            0.0
+            if singular_value_sum <= 0.0
+            else float(singular_values[0].item() / singular_value_sum)
+        )
+        mean_abs_diagonal_correlation = float(diagonal_slice.abs().mean().item()) if shared_rank > 0 else 0.0
+        return PairedPrincipalAlignment(
+            aligned_src=StreamPrincipalRotation(
+                mean=src_rotation.mean,
+                basis=aligned_src_basis.to(dtype=torch.float32),
+                top_explained_variance_ratio=src_rotation.top_explained_variance_ratio,
+            ),
+            aligned_dst=StreamPrincipalRotation(
+                mean=dst_rotation.mean,
+                basis=aligned_dst_basis.to(dtype=torch.float32),
+                top_explained_variance_ratio=dst_rotation.top_explained_variance_ratio,
+            ),
+            shared_rank=shared_rank,
+            top_singular_value_ratio=top_singular_value_ratio,
+            mean_abs_diagonal_correlation=mean_abs_diagonal_correlation,
+        )
+
+
+def _make_block_diagonal_basis(head_bases: torch.Tensor) -> torch.Tensor:
+    if head_bases.ndim != 3:
+        raise ValueError(f"Expected head_bases with shape [num_heads, head_dim, head_dim], got {tuple(head_bases.shape)}")
+    return torch.block_diag(*[head_bases[head_idx] for head_idx in range(head_bases.shape[0])])
+
+
+def _extract_headwise_blocks(flat_basis: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    if flat_basis.shape != (num_heads * head_dim, num_heads * head_dim):
+        raise ValueError(
+            "Flat block-diagonal basis has incompatible shape: "
+            f"expected {(num_heads * head_dim, num_heads * head_dim)}, got {tuple(flat_basis.shape)}"
+        )
+    return torch.stack(
+        [flat_basis[i * head_dim : (i + 1) * head_dim, i * head_dim : (i + 1) * head_dim] for i in range(num_heads)],
+        dim=0,
+    )
+
+
+class RunningHeadwiseCovarianceAccumulator:
+    def __init__(self, num_heads: int, head_dim: int) -> None:
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        if self.num_heads < 1 or self.head_dim < 1:
+            raise ValueError("RunningHeadwiseCovarianceAccumulator requires positive num_heads and head_dim")
+        self.hidden_size = self.num_heads * self.head_dim
+        self.count = 0
+        self.sum = torch.zeros(self.num_heads, self.head_dim, dtype=torch.float64)
+        self.xtx = torch.zeros(self.num_heads, self.head_dim, self.head_dim, dtype=torch.float64)
+
+    def update(self, samples: torch.Tensor) -> None:
+        flattened = samples.detach().reshape(-1, samples.shape[-1]).to(device="cpu", dtype=torch.float64)
+        if flattened.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"RunningHeadwiseCovarianceAccumulator expected hidden size {self.hidden_size}, got {flattened.shape[-1]}"
+            )
+        headwise = flattened.view(flattened.shape[0], self.num_heads, self.head_dim)
+        self.count += int(headwise.shape[0])
+        self.sum += headwise.sum(dim=0)
+        self.xtx += torch.einsum("nhd,nhe->hde", headwise, headwise)
+
+    def finalize(self) -> StreamPrincipalRotation:
+        if self.count < 1:
+            identity = torch.eye(self.hidden_size, dtype=torch.float32)
+            return StreamPrincipalRotation(
+                mean=torch.zeros(self.hidden_size, dtype=torch.float32),
+                basis=identity,
+                top_explained_variance_ratio=0.0,
+            )
+
+        means = self.sum / float(self.count)
+        head_bases = []
+        head_top_ratios = []
+        for head_idx in range(self.num_heads):
+            covariance = self.xtx[head_idx] / float(self.count) - torch.outer(means[head_idx], means[head_idx])
+            covariance = 0.5 * (covariance + covariance.transpose(0, 1))
+            eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+            order = torch.argsort(eigenvalues, descending=True)
+            eigenvalues = eigenvalues[order]
+            head_basis = stabilize_basis_column_signs(eigenvectors[:, order])
+            total_variance = float(eigenvalues.clamp_min(0).sum().item())
+            head_top_ratios.append(0.0 if total_variance <= 0.0 else float(eigenvalues[0].clamp_min(0).item() / total_variance))
+            head_bases.append(head_basis.to(dtype=torch.float64))
+
+        stacked_bases = torch.stack(head_bases, dim=0)
+        return StreamPrincipalRotation(
+            mean=means.reshape(-1).to(dtype=torch.float32),
+            basis=_make_block_diagonal_basis(stacked_bases).to(dtype=torch.float32),
+            top_explained_variance_ratio=float(sum(head_top_ratios) / len(head_top_ratios)),
+        )
+
+
+class RunningHeadwisePairedCovarianceAccumulator:
+    def __init__(self, src_num_heads: int, src_head_dim: int, dst_num_heads: int, dst_head_dim: int) -> None:
+        self.src_num_heads = int(src_num_heads)
+        self.src_head_dim = int(src_head_dim)
+        self.dst_num_heads = int(dst_num_heads)
+        self.dst_head_dim = int(dst_head_dim)
+        self.compatible_num_heads = self.src_num_heads == self.dst_num_heads and self.src_num_heads > 0
+        self.count = 0
+        self.src_hidden_size = self.src_num_heads * self.src_head_dim
+        self.dst_hidden_size = self.dst_num_heads * self.dst_head_dim
+        if self.compatible_num_heads:
+            self.xty = torch.zeros(self.src_num_heads, self.src_head_dim, self.dst_head_dim, dtype=torch.float64)
+        else:
+            self.xty = None
+
+    def update(self, src_samples: torch.Tensor, dst_samples: torch.Tensor) -> None:
+        flattened_src = src_samples.detach().reshape(-1, src_samples.shape[-1]).to(device="cpu", dtype=torch.float64)
+        flattened_dst = dst_samples.detach().reshape(-1, dst_samples.shape[-1]).to(device="cpu", dtype=torch.float64)
+        if flattened_src.shape[-1] != self.src_hidden_size:
+            raise ValueError(
+                f"RunningHeadwisePairedCovarianceAccumulator expected src hidden size {self.src_hidden_size}, got {flattened_src.shape[-1]}"
+            )
+        if flattened_dst.shape[-1] != self.dst_hidden_size:
+            raise ValueError(
+                f"RunningHeadwisePairedCovarianceAccumulator expected dst hidden size {self.dst_hidden_size}, got {flattened_dst.shape[-1]}"
+            )
+        if flattened_src.shape[0] != flattened_dst.shape[0]:
+            raise ValueError(
+                "RunningHeadwisePairedCovarianceAccumulator requires paired source/target samples with identical counts, "
+                f"got {flattened_src.shape[0]} vs {flattened_dst.shape[0]}"
+            )
+        self.count += int(flattened_src.shape[0])
+        if not self.compatible_num_heads:
+            return
+        src_headwise = flattened_src.view(flattened_src.shape[0], self.src_num_heads, self.src_head_dim)
+        dst_headwise = flattened_dst.view(flattened_dst.shape[0], self.dst_num_heads, self.dst_head_dim)
+        self.xty += torch.einsum("nhd,nhe->hde", src_headwise, dst_headwise)
+
+    def finalize_alignment(
+        self,
+        src_rotation: StreamPrincipalRotation,
+        dst_rotation: StreamPrincipalRotation,
+    ) -> PairedPrincipalAlignment:
+        shared_rank = min(self.src_hidden_size, self.dst_hidden_size)
+        if self.count < 1 or shared_rank < 1 or not self.compatible_num_heads or self.xty is None:
+            return PairedPrincipalAlignment(
+                aligned_src=src_rotation,
+                aligned_dst=dst_rotation,
+                shared_rank=shared_rank,
+                top_singular_value_ratio=0.0,
+                mean_abs_diagonal_correlation=0.0,
+            )
+
+        src_means = src_rotation.mean.view(self.src_num_heads, self.src_head_dim).to(dtype=torch.float64)
+        dst_means = dst_rotation.mean.view(self.dst_num_heads, self.dst_head_dim).to(dtype=torch.float64)
+        src_bases = _extract_headwise_blocks(src_rotation.basis.to(dtype=torch.float64), self.src_num_heads, self.src_head_dim)
+        dst_bases = _extract_headwise_blocks(dst_rotation.basis.to(dtype=torch.float64), self.dst_num_heads, self.dst_head_dim)
+
+        aligned_src_blocks = []
+        aligned_dst_blocks = []
+        top_singular_value_ratios: List[float] = []
+        mean_abs_diagonal_correlations: List[float] = []
+        head_shared_rank = min(self.src_head_dim, self.dst_head_dim)
+
+        for head_idx in range(self.src_num_heads):
+            cross_covariance = self.xty[head_idx] / float(self.count) - torch.outer(src_means[head_idx], dst_means[head_idx])
+            latent_cross_covariance = src_bases[head_idx].transpose(0, 1) @ cross_covariance @ dst_bases[head_idx]
+            try:
+                src_alignment, singular_values, dst_alignment_t = torch.linalg.svd(
+                    latent_cross_covariance,
+                    full_matrices=True,
+                )
+                aligned_src_basis, aligned_dst_basis = stabilize_paired_basis_column_signs(
+                    src_bases[head_idx] @ src_alignment,
+                    dst_bases[head_idx] @ dst_alignment_t.transpose(0, 1),
+                )
+                diagonalized_cross_covariance = (
+                    aligned_src_basis.transpose(0, 1) @ cross_covariance @ aligned_dst_basis
+                )
+                diagonal_slice = diagonalized_cross_covariance.diagonal()[:head_shared_rank]
+                singular_value_sum = float(singular_values[:head_shared_rank].sum().item())
+                top_singular_value_ratios.append(
+                    0.0 if singular_value_sum <= 0.0 else float(singular_values[0].item() / singular_value_sum)
+                )
+                mean_abs_diagonal_correlations.append(
+                    float(diagonal_slice.abs().mean().item()) if head_shared_rank > 0 else 0.0
+                )
+            except RuntimeError:
+                aligned_src_basis = src_bases[head_idx]
+                aligned_dst_basis = dst_bases[head_idx]
+                top_singular_value_ratios.append(0.0)
+                mean_abs_diagonal_correlations.append(0.0)
+            aligned_src_blocks.append(aligned_src_basis.to(dtype=torch.float64))
+            aligned_dst_blocks.append(aligned_dst_basis.to(dtype=torch.float64))
+
+        aligned_src_basis = _make_block_diagonal_basis(torch.stack(aligned_src_blocks, dim=0))
+        aligned_dst_basis = _make_block_diagonal_basis(torch.stack(aligned_dst_blocks, dim=0))
+        return PairedPrincipalAlignment(
+            aligned_src=StreamPrincipalRotation(
+                mean=src_rotation.mean,
+                basis=aligned_src_basis.to(dtype=torch.float32),
+                top_explained_variance_ratio=src_rotation.top_explained_variance_ratio,
+            ),
+            aligned_dst=StreamPrincipalRotation(
+                mean=dst_rotation.mean,
+                basis=aligned_dst_basis.to(dtype=torch.float32),
+                top_explained_variance_ratio=dst_rotation.top_explained_variance_ratio,
+            ),
+            shared_rank=self.src_num_heads * head_shared_rank,
+            top_singular_value_ratio=(
+                float(sum(top_singular_value_ratios) / len(top_singular_value_ratios))
+                if top_singular_value_ratios
+                else 0.0
+            ),
+            mean_abs_diagonal_correlation=(
+                float(sum(mean_abs_diagonal_correlations) / len(mean_abs_diagonal_correlations))
+                if mean_abs_diagonal_correlations
+                else 0.0
+            ),
         )
 
 
@@ -189,6 +509,28 @@ def summarize_principal_rotation_stats(stats: List[StreamPrincipalRotation]) -> 
         "num_layers": len(stats),
         "top_explained_variance_ratio": ratios,
         "average_top_explained_variance_ratio": float(sum(ratios) / len(ratios)) if ratios else float("nan"),
+    }
+
+
+def summarize_paired_alignment_stats(stats: List[PairedPrincipalAlignment]) -> Dict[str, Any]:
+    top_singular_value_ratios = [float(stat.top_singular_value_ratio) for stat in stats]
+    mean_abs_diagonal_correlations = [float(stat.mean_abs_diagonal_correlation) for stat in stats]
+    shared_ranks = [int(stat.shared_rank) for stat in stats]
+    return {
+        "num_layers": len(stats),
+        "shared_rank": shared_ranks,
+        "top_singular_value_ratio": top_singular_value_ratios,
+        "mean_abs_diagonal_correlation": mean_abs_diagonal_correlations,
+        "average_top_singular_value_ratio": (
+            float(sum(top_singular_value_ratios) / len(top_singular_value_ratios))
+            if top_singular_value_ratios
+            else float("nan")
+        ),
+        "average_mean_abs_diagonal_correlation": (
+            float(sum(mean_abs_diagonal_correlations) / len(mean_abs_diagonal_correlations))
+            if mean_abs_diagonal_correlations
+            else float("nan")
+        ),
     }
 
 
@@ -319,10 +661,13 @@ class LayerWindowDirectionalTranslator(nn.Module):
         src_bases: torch.Tensor,
         dst_means: torch.Tensor,
         dst_bases: torch.Tensor,
+        apply_dst_rotation: bool = True,
     ) -> torch.Tensor:
         rotated_input = self._rotate_layer_window_into_basis(layer_cache, src_means, src_bases)
-        translated_rotated = translator(rotated_input)
-        return self._inverse_rotate_layer_window_from_basis(translated_rotated, dst_means, dst_bases)
+        translated_output = translator(rotated_input)
+        if not apply_dst_rotation:
+            return translated_output
+        return self._inverse_rotate_layer_window_from_basis(translated_output, dst_means, dst_bases)
 
     def forward(self, key_block: torch.Tensor, value_block: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if key_block.shape != value_block.shape:
@@ -347,6 +692,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             src_bases=self.src_key_bases,
             dst_means=self.dst_key_means,
             dst_bases=self.dst_key_bases,
+            apply_dst_rotation=False,
         )
         translated_value = self._translate_stream(
             layer_cache=value_block,
@@ -355,6 +701,7 @@ class LayerWindowDirectionalTranslator(nn.Module):
             src_bases=self.src_value_bases,
             dst_means=self.dst_value_means,
             dst_bases=self.dst_value_bases,
+            apply_dst_rotation=False,
         )
         return translated_key, translated_value
 
@@ -465,17 +812,21 @@ def calibrate_principal_rotations(
         ),
     )
     edge_map = build_edge_map(edges)
-    stats: Dict[str, Dict[str, List[RunningCovarianceAccumulator]]] = {}
+    stats: Dict[str, Dict[str, Any]] = {}
     for direction in translator_pool.active_directions:
         edge = edge_map[direction]
         mapping = layer_mappings[direction]
-        src_hidden = translator_pool.model_specs[edge.src_id].hidden_size
-        dst_hidden = translator_pool.model_specs[edge.dst_id].hidden_size
+        src_spec = translator_pool.model_specs[edge.src_id]
+        dst_spec = translator_pool.model_specs[edge.dst_id]
+        src_hidden = src_spec.hidden_size
+        dst_hidden = dst_spec.hidden_size
         stats[direction] = {
             "src_key": [RunningCovarianceAccumulator(src_hidden) for _ in range(mapping.translated_num_layers)],
             "dst_key": [RunningCovarianceAccumulator(dst_hidden) for _ in range(mapping.translated_num_layers)],
-            "src_value": [RunningCovarianceAccumulator(src_hidden) for _ in range(mapping.translated_num_layers)],
-            "dst_value": [RunningCovarianceAccumulator(dst_hidden) for _ in range(mapping.translated_num_layers)],
+            "src_value": [RunningHeadwiseCovarianceAccumulator(src_spec.num_heads, src_spec.head_dim) for _ in range(mapping.translated_num_layers)],
+            "dst_value": [RunningHeadwiseCovarianceAccumulator(dst_spec.num_heads, dst_spec.head_dim) for _ in range(mapping.translated_num_layers)],
+            "key_pair": [RunningPairedCovarianceAccumulator(src_hidden, dst_hidden) for _ in range(mapping.translated_num_layers)],
+            "value_pair": [RunningHeadwisePairedCovarianceAccumulator(src_spec.num_heads, src_spec.head_dim, dst_spec.num_heads, dst_spec.head_dim) for _ in range(mapping.translated_num_layers)],
         }
 
     progress_bar = tqdm(range(config.principal_rotation_calibration_steps), desc="PrincipalRotationCalib")
@@ -506,11 +857,17 @@ def calibrate_principal_rotations(
             )
             for offset in range(mapping.translated_num_layers):
                 if principal_rotation_stream_is_enabled(config, "k"):
-                    stats[direction]["src_key"][offset].update(src_key_block[:, :, offset, :])
-                    stats[direction]["dst_key"][offset].update(dst_key_block[:, :, offset, :])
+                    src_key_samples = src_key_block[:, :, offset, :]
+                    dst_key_samples = dst_key_block[:, :, offset, :]
+                    stats[direction]["src_key"][offset].update(src_key_samples)
+                    stats[direction]["dst_key"][offset].update(dst_key_samples)
+                    stats[direction]["key_pair"][offset].update(src_key_samples, dst_key_samples)
                 if principal_rotation_stream_is_enabled(config, "v"):
-                    stats[direction]["src_value"][offset].update(src_value_block[:, :, offset, :])
-                    stats[direction]["dst_value"][offset].update(dst_value_block[:, :, offset, :])
+                    src_value_samples = src_value_block[:, :, offset, :]
+                    dst_value_samples = dst_value_block[:, :, offset, :]
+                    stats[direction]["src_value"][offset].update(src_value_samples)
+                    stats[direction]["dst_value"][offset].update(dst_value_samples)
+                    stats[direction]["value_pair"][offset].update(src_value_samples, dst_value_samples)
 
     metadata = {
         "enabled": True,
@@ -522,26 +879,61 @@ def calibrate_principal_rotations(
         edge = edge_map[direction]
         src_hidden = translator_pool.model_specs[edge.src_id].hidden_size
         dst_hidden = translator_pool.model_specs[edge.dst_id].hidden_size
-        src_key_rotations = (
-            [acc.finalize() for acc in stats[direction]["src_key"]]
-            if principal_rotation_stream_is_enabled(config, "k")
-            else [make_identity_principal_rotation(src_hidden) for _ in stats[direction]["src_key"]]
-        )
-        dst_key_rotations = (
-            [acc.finalize() for acc in stats[direction]["dst_key"]]
-            if principal_rotation_stream_is_enabled(config, "k")
-            else [make_identity_principal_rotation(dst_hidden) for _ in stats[direction]["dst_key"]]
-        )
-        src_value_rotations = (
-            [acc.finalize() for acc in stats[direction]["src_value"]]
-            if principal_rotation_stream_is_enabled(config, "v")
-            else [make_identity_principal_rotation(src_hidden) for _ in stats[direction]["src_value"]]
-        )
-        dst_value_rotations = (
-            [acc.finalize() for acc in stats[direction]["dst_value"]]
-            if principal_rotation_stream_is_enabled(config, "v")
-            else [make_identity_principal_rotation(dst_hidden) for _ in stats[direction]["dst_value"]]
-        )
+
+        if principal_rotation_stream_is_enabled(config, "k"):
+            src_key_rotations = [acc.finalize() for acc in stats[direction]["src_key"]]
+            dst_key_rotations = [acc.finalize() for acc in stats[direction]["dst_key"]]
+            key_alignments = [
+                pair_acc.finalize_alignment(src_rotation, dst_rotation)
+                for pair_acc, src_rotation, dst_rotation in zip(
+                    stats[direction]["key_pair"],
+                    src_key_rotations,
+                    dst_key_rotations,
+                )
+            ]
+            src_key_rotations = [alignment.aligned_src for alignment in key_alignments]
+            dst_key_rotations = [make_identity_principal_rotation(dst_hidden) for _ in key_alignments]
+        else:
+            src_key_rotations = [make_identity_principal_rotation(src_hidden) for _ in stats[direction]["src_key"]]
+            dst_key_rotations = [make_identity_principal_rotation(dst_hidden) for _ in stats[direction]["dst_key"]]
+            key_alignments = [
+                PairedPrincipalAlignment(
+                    aligned_src=src_rotation,
+                    aligned_dst=dst_rotation,
+                    shared_rank=min(src_hidden, dst_hidden),
+                    top_singular_value_ratio=0.0,
+                    mean_abs_diagonal_correlation=0.0,
+                )
+                for src_rotation, dst_rotation in zip(src_key_rotations, dst_key_rotations)
+            ]
+
+        if principal_rotation_stream_is_enabled(config, "v"):
+            src_value_rotations = [acc.finalize() for acc in stats[direction]["src_value"]]
+            dst_value_rotations = [acc.finalize() for acc in stats[direction]["dst_value"]]
+            value_alignments = [
+                pair_acc.finalize_alignment(src_rotation, dst_rotation)
+                for pair_acc, src_rotation, dst_rotation in zip(
+                    stats[direction]["value_pair"],
+                    src_value_rotations,
+                    dst_value_rotations,
+                )
+            ]
+            src_value_rotations = [alignment.aligned_src for alignment in value_alignments]
+            dst_value_rotations = [make_identity_principal_rotation(dst_hidden) for _ in value_alignments]
+        else:
+            src_value_rotations = [make_identity_principal_rotation(src_hidden) for _ in stats[direction]["src_value"]]
+            dst_value_rotations = [make_identity_principal_rotation(dst_hidden) for _ in stats[direction]["dst_value"]]
+            value_alignments = [
+                PairedPrincipalAlignment(
+                    aligned_src=src_rotation,
+                    aligned_dst=dst_rotation,
+                    shared_rank=min(src_hidden, dst_hidden),
+                    top_singular_value_ratio=0.0,
+                    mean_abs_diagonal_correlation=0.0,
+                )
+                for src_rotation, dst_rotation in zip(src_value_rotations, dst_value_rotations)
+            ]
+
         rotations = DirectionalPrincipalRotations(
             src_key=src_key_rotations,
             dst_key=dst_key_rotations,
@@ -550,10 +942,14 @@ def calibrate_principal_rotations(
         )
         translator_pool.set_principal_rotations(direction, rotations)
         metadata["directions"][direction] = {
+            "key_rotation_mode": "global_src_only_paired_pca",
+            "value_rotation_mode": "headwise_block_diagonal_src_only_paired_pca",
             "src_key": summarize_principal_rotation_stats(src_key_rotations),
             "dst_key": summarize_principal_rotation_stats(dst_key_rotations),
             "src_value": summarize_principal_rotation_stats(src_value_rotations),
             "dst_value": summarize_principal_rotation_stats(dst_value_rotations),
+            "key_pair_alignment": summarize_paired_alignment_stats(key_alignments),
+            "value_pair_alignment": summarize_paired_alignment_stats(value_alignments),
         }
 
     if torch.cuda.is_available():
@@ -2506,7 +2902,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--principal-rotation-streams",
         choices=["k", "v", "kv"],
-        default="k",
+        default="kv",
         help="Which cache streams to rotate into principal coordinates before translation.",
     )
     parser.add_argument(
