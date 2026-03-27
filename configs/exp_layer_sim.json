@@ -1,0 +1,21 @@
+{
+  "model_a_id": "gpt2",
+  "model_b_id": "gpt2-medium",
+  "shared_tokenizer_model_id": "gpt2",
+  "output_root": "outputs/layer_sim",
+  "study_id": null,
+  "split": "train",
+  "num_samples": 500,
+  "batch_size": 4,
+  "num_workers": 0,
+  "prefix_tokens": 128,
+  "shuffle_stream": true,
+  "shuffle_buffer": 10000,
+  "seed": 42,
+  "pool_mode": "mean",
+  "metric": "linear_cka",
+  "device": "cuda",
+  "dtype": "float32",
+  "figure_dpi": 180,
+  "annotate_heatmap": false
+}
