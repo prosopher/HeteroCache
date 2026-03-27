@@ -70,50 +70,57 @@ class CrossAttentionBlock(nn.Module):
         return hidden
 
 
-class ResidualLayerCacheFuser(nn.Module):
+class ResidualCacheFuser(nn.Module):
     """
-    C2C-style per-direction residual cache fuser.
+    Fuses top-layer receiver/sharer cache blocks following the C2C recipe:
+    project -> feature fuse -> dynamic weighting -> gated residual injection.
 
-    Inputs:
-      receiver_block: [batch, seq, num_layers, receiver_hidden]
-      sharer_block:   [batch, seq, num_layers, sharer_hidden]
-
-    Outputs:
-      delta_block:    [batch, seq, num_layers, receiver_hidden]
-      gate_probs:     [num_layers]
+    receiver_block: [batch, seq, num_layers, dst_hidden]
+    sharer_block:   [batch, seq, num_layers, src_hidden]
+    output:         [batch, seq, num_layers, dst_hidden]
     """
 
     def __init__(
         self,
-        sharer_hidden_size: int,
-        receiver_hidden_size: int,
-        receiver_num_heads: int,
-        top_layers_to_fuse: int,
+        src_hidden_size: int,
+        dst_hidden_size: int,
+        num_layers: int,
         fuser_dim: int,
         fuser_heads: int,
         fuser_depth: int,
         mlp_ratio: int,
+        gate_temperature_start: float,
         hard_gate_eval: bool,
     ) -> None:
         super().__init__()
-        if top_layers_to_fuse < 1:
-            raise ValueError("top_layers_to_fuse must be >= 1")
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
         if fuser_depth < 1:
             raise ValueError("fuser_depth must be >= 1")
-        if receiver_hidden_size % receiver_num_heads != 0:
-            raise ValueError("receiver_hidden_size must be divisible by receiver_num_heads")
+        if gate_temperature_start <= 0.0:
+            raise ValueError("gate_temperature_start must be > 0")
 
-        self.top_layers_to_fuse = top_layers_to_fuse
-        self.receiver_hidden_size = receiver_hidden_size
-        self.receiver_num_heads = receiver_num_heads
-        self.receiver_head_dim = receiver_hidden_size // receiver_num_heads
+        self.num_layers = num_layers
+        self.fuser_depth = fuser_depth
         self.hard_gate_eval = hard_gate_eval
+        self.temperature = float(gate_temperature_start)
 
-        self.receiver_norm = nn.LayerNorm(receiver_hidden_size)
-        self.sharer_norm = nn.LayerNorm(sharer_hidden_size)
-        self.receiver_proj = nn.Linear(receiver_hidden_size, fuser_dim)
-        self.sharer_proj = nn.Linear(sharer_hidden_size, fuser_dim)
-        self.pre_fuse = nn.Linear(fuser_dim * 2, fuser_dim)
+        self.receiver_norm = nn.LayerNorm(dst_hidden_size)
+        self.receiver_proj = nn.Linear(dst_hidden_size, fuser_dim)
+        self.sharer_norm = nn.LayerNorm(src_hidden_size)
+        self.sharer_proj = nn.Linear(src_hidden_size, fuser_dim)
+
+        self.feature_norm = nn.LayerNorm(fuser_dim * 2)
+        self.feature_proj = nn.Linear(fuser_dim * 2, fuser_dim)
+        self.feature_fusion = nn.Sequential(
+            nn.LayerNorm(fuser_dim),
+            nn.Linear(fuser_dim, fuser_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(fuser_dim * mlp_ratio, fuser_dim),
+        )
+
+        self.dynamic_weight_norm = nn.LayerNorm(fuser_dim)
+        self.dynamic_weight = nn.Linear(fuser_dim, fuser_dim)
 
         self.recurrent_blocks = nn.ModuleList(
             [
@@ -124,118 +131,144 @@ class ResidualLayerCacheFuser(nn.Module):
                             num_heads=fuser_heads,
                             mlp_ratio=mlp_ratio,
                         )
-                        for _ in range(top_layers_to_fuse)
+                        for _ in range(num_layers)
                     ]
                 )
                 for _ in range(fuser_depth)
             ]
         )
 
-        self.output_norm = nn.LayerNorm(top_layers_to_fuse * fuser_dim)
-        self.output_proj = nn.Linear(top_layers_to_fuse * fuser_dim, top_layers_to_fuse * receiver_hidden_size)
+        self.output_norm = nn.LayerNorm(num_layers * fuser_dim)
+        self.output_proj = nn.Linear(num_layers * fuser_dim, num_layers * dst_hidden_size)
+        # Starting all gates exactly at 0.0 makes it very easy for a short toy run to
+        # learn an all-closed hard gate solution, which turns the whole C2C path into
+        # an exact identity map at evaluation time. We bias the gates slightly open so
+        # the fusion module actually gets used early in training.
+        self.gate_logits = nn.Parameter(torch.full((num_layers,), 1.5))
 
-        self.head_modulator = nn.Sequential(
-            nn.LayerNorm(receiver_hidden_size),
-            nn.Linear(receiver_hidden_size, receiver_num_heads),
-        )
-        self.gate_logits = nn.Parameter(torch.zeros(top_layers_to_fuse))
+    def set_temperature(self, temperature: float) -> None:
+        self.temperature = max(1e-4, float(temperature))
 
-    def _sample_gate(self, temperature: float) -> torch.Tensor:
-        logits = self.gate_logits
+    def set_hard_gate_eval(self, enabled: bool) -> None:
+        self.hard_gate_eval = bool(enabled)
+
+    def gate_probabilities(self) -> torch.Tensor:
+        return torch.sigmoid(self.gate_logits)
+
+    def sample_gate(self) -> torch.Tensor:
+        probs = self.gate_probabilities()
         if self.training:
-            uniform = torch.rand_like(logits).clamp_(1e-6, 1.0 - 1e-6)
-            logistic = torch.log(uniform) - torch.log1p(-uniform)
-            gate = torch.sigmoid((logits + logistic) / max(temperature, 1e-6))
-        else:
-            gate = torch.sigmoid(logits / max(temperature, 1e-6))
-            if self.hard_gate_eval:
-                gate = (gate >= 0.5).to(gate.dtype)
-        return gate
+            uniform = torch.rand_like(probs).clamp_(1e-6, 1.0 - 1e-6)
+            logistic_noise = torch.log(uniform) - torch.log1p(-uniform)
+            soft_gate = torch.sigmoid((self.gate_logits + logistic_noise) / self.temperature)
+            return soft_gate
+        if self.hard_gate_eval:
+            hard_gate = (probs >= 0.5).to(probs.dtype)
+            # Avoid an exact all-zero hard gate at eval time. That makes fusion a strict
+            # identity map, which is exactly the failure mode behind cosine=1.0 and
+            # baseline-identical metrics. In that case we fall back to the learned soft
+            # probabilities instead of silently disabling the whole C2C path.
+            if float(hard_gate.sum().item()) == 0.0:
+                return probs
+            return hard_gate
+        return probs
 
-    def forward(
-        self,
-        receiver_block: torch.Tensor,
-        sharer_block: torch.Tensor,
-        temperature: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, receiver_block: torch.Tensor, sharer_block: torch.Tensor) -> torch.Tensor:
         if receiver_block.ndim != 4 or sharer_block.ndim != 4:
-            raise ValueError("Expected receiver_block and sharer_block to be rank-4 tensors.")
+            raise ValueError(
+                "ResidualCacheFuser expects [batch, seq, num_layers, hidden] tensors, "
+                f"got receiver={tuple(receiver_block.shape)}, sharer={tuple(sharer_block.shape)}"
+            )
         if receiver_block.shape[:3] != sharer_block.shape[:3]:
             raise ValueError(
-                "receiver_block and sharer_block must match in [batch, seq, layers], got "
-                f"{tuple(receiver_block.shape)} vs {tuple(sharer_block.shape)}"
+                "receiver_block and sharer_block must agree on [batch, seq, num_layers], "
+                f"got receiver={tuple(receiver_block.shape)}, sharer={tuple(sharer_block.shape)}"
             )
-        if receiver_block.shape[2] != self.top_layers_to_fuse:
+        if receiver_block.shape[2] != self.num_layers:
             raise ValueError(
-                f"Expected {self.top_layers_to_fuse} layers, got {receiver_block.shape[2]}"
+                f"ResidualCacheFuser expected {self.num_layers} aligned layers, got {receiver_block.shape[2]}"
             )
 
-        receiver_proj = F.gelu(self.receiver_proj(self.receiver_norm(receiver_block)))
-        sharer_proj = F.gelu(self.sharer_proj(self.sharer_norm(sharer_block)))
-        fused_context = F.gelu(self.pre_fuse(torch.cat([receiver_proj, sharer_proj], dim=-1)))
+        batch_size, seq_len, _, dst_hidden_size = receiver_block.shape
 
-        hidden = receiver_proj[:, :, 0, :]
+        receiver_projected = F.gelu(self.receiver_proj(self.receiver_norm(receiver_block)))
+        sharer_projected = F.gelu(self.sharer_proj(self.sharer_norm(sharer_block)))
+
+        combined = torch.cat([receiver_projected, sharer_projected], dim=-1)
+        projected = F.gelu(self.feature_proj(self.feature_norm(combined)))
+        fused_context = self.feature_fusion(projected) + projected
+
+        weights = torch.sigmoid(self.dynamic_weight(self.dynamic_weight_norm(fused_context)))
+        weighted_context = fused_context * weights
+
+        hidden = receiver_projected[:, :, 0, :]
         collected = []
         for stage_blocks in self.recurrent_blocks:
             stage_hidden = hidden
             stage_collected = []
             for layer_idx, block in enumerate(stage_blocks):
-                context = fused_context[:, :, layer_idx, :]
-                stage_hidden = block(stage_hidden, context)
+                stage_hidden = block(stage_hidden, weighted_context[:, :, layer_idx, :])
                 stage_collected.append(stage_hidden)
             hidden = stage_hidden
             collected = stage_collected
 
-        fused = torch.cat(collected, dim=-1)
-        delta = self.output_proj(self.output_norm(fused))
-        batch_size, seq_len, _, _ = receiver_block.shape
-        delta = delta.view(batch_size, seq_len, self.top_layers_to_fuse, self.receiver_hidden_size)
+        residual = F.gelu(self.output_proj(self.output_norm(torch.cat(collected, dim=-1))))
+        residual = residual.view(batch_size, seq_len, self.num_layers, dst_hidden_size)
 
-        head_weights = torch.sigmoid(self.head_modulator(receiver_block))
-        head_weights = head_weights.repeat_interleave(self.receiver_head_dim, dim=-1)
-        delta = delta * head_weights
-
-        gate = self._sample_gate(temperature=temperature).view(1, 1, self.top_layers_to_fuse, 1)
-        delta = delta * gate
-        return delta, gate.view(-1)
+        gate = self.sample_gate().view(1, 1, self.num_layers, 1)
+        return receiver_block + (gate * residual)
 
 
 class DirectionalCacheFuser(nn.Module):
     def __init__(
         self,
-        sharer_hidden_size: int,
-        receiver_hidden_size: int,
-        receiver_num_heads: int,
+        src_hidden_size: int,
+        dst_hidden_size: int,
         top_layers_to_fuse: int,
         fuser_dim: int,
         fuser_heads: int,
         fuser_depth: int,
         mlp_ratio: int,
+        gate_temperature_start: float,
         hard_gate_eval: bool,
     ) -> None:
         super().__init__()
-        self.key_fuser = ResidualLayerCacheFuser(
-            sharer_hidden_size=sharer_hidden_size,
-            receiver_hidden_size=receiver_hidden_size,
-            receiver_num_heads=receiver_num_heads,
-            top_layers_to_fuse=top_layers_to_fuse,
+        self.top_layers_to_fuse = top_layers_to_fuse
+        self.key_fuser = ResidualCacheFuser(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=top_layers_to_fuse,
             fuser_dim=fuser_dim,
             fuser_heads=fuser_heads,
             fuser_depth=fuser_depth,
             mlp_ratio=mlp_ratio,
+            gate_temperature_start=gate_temperature_start,
             hard_gate_eval=hard_gate_eval,
         )
-        self.value_fuser = ResidualLayerCacheFuser(
-            sharer_hidden_size=sharer_hidden_size,
-            receiver_hidden_size=receiver_hidden_size,
-            receiver_num_heads=receiver_num_heads,
-            top_layers_to_fuse=top_layers_to_fuse,
+        self.value_fuser = ResidualCacheFuser(
+            src_hidden_size=src_hidden_size,
+            dst_hidden_size=dst_hidden_size,
+            num_layers=top_layers_to_fuse,
             fuser_dim=fuser_dim,
             fuser_heads=fuser_heads,
             fuser_depth=fuser_depth,
             mlp_ratio=mlp_ratio,
+            gate_temperature_start=gate_temperature_start,
             hard_gate_eval=hard_gate_eval,
         )
+
+    def set_temperature(self, temperature: float) -> None:
+        self.key_fuser.set_temperature(temperature)
+        self.value_fuser.set_temperature(temperature)
+
+    def set_hard_gate_eval(self, enabled: bool) -> None:
+        self.key_fuser.set_hard_gate_eval(enabled)
+        self.value_fuser.set_hard_gate_eval(enabled)
+
+    def mean_gate_probability(self) -> float:
+        key_prob = float(self.key_fuser.gate_probabilities().mean().item())
+        value_prob = float(self.value_fuser.gate_probabilities().mean().item())
+        return 0.5 * (key_prob + value_prob)
 
     def forward(
         self,
@@ -243,14 +276,13 @@ class DirectionalCacheFuser(nn.Module):
         receiver_value_block: torch.Tensor,
         sharer_key_block: torch.Tensor,
         sharer_value_block: torch.Tensor,
-        temperature: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        delta_key, key_gate = self.key_fuser(receiver_key_block, sharer_key_block, temperature=temperature)
-        delta_value, value_gate = self.value_fuser(receiver_value_block, sharer_value_block, temperature=temperature)
-        return delta_key, delta_value, key_gate, value_gate
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        fused_key = self.key_fuser(receiver_key_block, sharer_key_block)
+        fused_value = self.value_fuser(receiver_value_block, sharer_value_block)
+        return fused_key, fused_value
 
 
-class CacheFuserPool(nn.Module):
+class C2CFuserPool(nn.Module):
     def __init__(
         self,
         model_specs: Dict[str, ModelSpec],
@@ -260,41 +292,61 @@ class CacheFuserPool(nn.Module):
         fuser_heads: int,
         fuser_depth: int,
         mlp_ratio: int,
+        gate_temperature_start: float,
         hard_gate_eval: bool,
         active_directions: List[str],
     ) -> None:
         super().__init__()
+        if top_layers_to_fuse < 1:
+            raise ValueError("top_layers_to_fuse must be >= 1")
         if not active_directions:
             raise ValueError("active_directions must contain at least one direction")
+
         self.model_specs = model_specs
         self.top_layers_to_fuse = top_layers_to_fuse
         self.active_directions = tuple(active_directions)
         self.edges_by_id = build_edge_map(edges)
 
-        modules = {}
+        adapters = {}
         for direction in self.active_directions:
             if direction not in self.edges_by_id:
                 raise ValueError(f"Unknown direction: {direction}")
             edge = self.edges_by_id[direction]
-            sharer_spec = model_specs[edge.src_id]
-            receiver_spec = model_specs[edge.dst_id]
-            max_allowed = min(sharer_spec.num_layers, receiver_spec.num_layers)
+            src_spec = model_specs[edge.src_id]
+            dst_spec = model_specs[edge.dst_id]
+            max_allowed = min(src_spec.num_layers, dst_spec.num_layers)
             if top_layers_to_fuse > max_allowed:
                 raise ValueError(
-                    f"top_layers_to_fuse={top_layers_to_fuse} exceeds min layer count {max_allowed} for {direction}"
+                    f"top_layers_to_fuse={top_layers_to_fuse} exceeds min layer count {max_allowed} "
+                    f"for direction {direction}."
                 )
-            modules[direction] = DirectionalCacheFuser(
-                sharer_hidden_size=sharer_spec.hidden_size,
-                receiver_hidden_size=receiver_spec.hidden_size,
-                receiver_num_heads=receiver_spec.num_heads,
+
+            adapters[direction] = DirectionalCacheFuser(
+                src_hidden_size=src_spec.hidden_size,
+                dst_hidden_size=dst_spec.hidden_size,
                 top_layers_to_fuse=top_layers_to_fuse,
                 fuser_dim=fuser_dim,
                 fuser_heads=fuser_heads,
                 fuser_depth=fuser_depth,
                 mlp_ratio=mlp_ratio,
+                gate_temperature_start=gate_temperature_start,
                 hard_gate_eval=hard_gate_eval,
             )
-        self.fusers = nn.ModuleDict(modules)
+
+        self.adapters = nn.ModuleDict(adapters)
+
+    def set_temperature(self, temperature: float) -> None:
+        for module in self.adapters.values():
+            module.set_temperature(temperature)
+
+    def set_hard_gate_eval(self, enabled: bool) -> None:
+        for module in self.adapters.values():
+            module.set_hard_gate_eval(enabled)
+
+    def mean_gate_probability(self) -> float:
+        if not self.adapters:
+            return float("nan")
+        return float(sum(module.mean_gate_probability() for module in self.adapters.values()) / len(self.adapters))
 
     def fuse_top_layer_blocks(
         self,
@@ -304,19 +356,48 @@ class CacheFuserPool(nn.Module):
         sharer_value_block: torch.Tensor,
         src_name: str,
         dst_name: str,
-        temperature: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        module_name = f"{src_name}_to_{dst_name}"
-        if module_name not in self.fusers:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        adapter_name = f"{src_name}_to_{dst_name}"
+        if adapter_name not in self.adapters:
             raise ValueError(
-                f"Fuser direction {module_name} is not available. Active directions: {list(self.active_directions)}"
+                f"C2C direction {adapter_name} is not available. Active directions: {list(self.active_directions)}"
             )
-        return self.fusers[module_name](
+        return self.adapters[adapter_name](
             receiver_key_block=receiver_key_block,
             receiver_value_block=receiver_value_block,
             sharer_key_block=sharer_key_block,
             sharer_value_block=sharer_value_block,
-            temperature=temperature,
+        )
+
+    def fuse_top_layers(
+        self,
+        sharer_past_key_values: PastKeyValues,
+        receiver_past_key_values: PastKeyValues,
+        src_name: str,
+        dst_name: str,
+        dst_spec: ModelSpec,
+    ) -> PastKeyValues:
+        sharer_key_block, sharer_value_block = extract_top_layer_blocks(
+            past_key_values=sharer_past_key_values,
+            top_layers_to_fuse=self.top_layers_to_fuse,
+        )
+        receiver_key_block, receiver_value_block = extract_top_layer_blocks(
+            past_key_values=receiver_past_key_values,
+            top_layers_to_fuse=self.top_layers_to_fuse,
+        )
+        fused_key, fused_value = self.fuse_top_layer_blocks(
+            receiver_key_block=receiver_key_block,
+            receiver_value_block=receiver_value_block,
+            sharer_key_block=sharer_key_block,
+            sharer_value_block=sharer_value_block,
+            src_name=src_name,
+            dst_name=dst_name,
+        )
+        return blocks_to_partial_past_key_values(
+            key_block=fused_key,
+            value_block=fused_value,
+            num_heads=dst_spec.num_heads,
+            head_dim=dst_spec.head_dim,
         )
 
 
@@ -358,17 +439,20 @@ def blocks_to_partial_past_key_values(
 
 
 
-def build_fuser_pool(
+def build_translator_pool(
     models: Dict[str, PreTrainedModel],
     config: TrainConfig,
-) -> Tuple[CacheFuserPool, Dict[str, ModelSpec], List[Node], List[Edge]]:
+) -> Tuple[C2CFuserPool, Dict[str, ModelSpec], List[Node], List[Edge]]:
     nodes, edges = build_nodes_and_edges(config.model_ids, config.model_directions)
-    model_specs = {node.id: get_model_spec(models[node.id]) for node in nodes}
+    model_specs = {
+        node.id: get_model_spec(models[node.id])
+        for node in nodes
+    }
     active_directions = parse_model_directions(
         config.model_directions,
         allowed_directions=[edge.id for edge in edges],
     )
-    fuser_pool = CacheFuserPool(
+    translator_pool = C2CFuserPool(
         model_specs=model_specs,
         edges=edges,
         top_layers_to_fuse=config.top_layers_to_fuse,
@@ -376,11 +460,12 @@ def build_fuser_pool(
         fuser_heads=config.fuser_heads,
         fuser_depth=config.fuser_depth,
         mlp_ratio=config.fuser_mlp_ratio,
+        gate_temperature_start=config.gate_temperature_start,
         hard_gate_eval=config.hard_gate_eval,
         active_directions=active_directions,
     )
-    fuser_pool.to(config.device)
-    return fuser_pool, model_specs, nodes, edges
+    translator_pool.to(config.device)
+    return translator_pool, model_specs, nodes, edges
 
 
 
@@ -389,7 +474,7 @@ def load_translator_pool_from_checkpoint(
     device_override: Optional[str] = None,
 ) -> Tuple[
     TrainConfig,
-    CacheFuserPool,
+    C2CFuserPool,
     Dict[str, ModelSpec],
     Dict[str, PreTrainedModel],
     PreTrainedTokenizerBase,
@@ -401,22 +486,23 @@ def load_translator_pool_from_checkpoint(
     if device_override is not None:
         config.device = device_override
     models, tokenizer, nodes, edges = build_models_and_tokenizer(config)
-    fuser_pool, model_specs, _, _ = build_fuser_pool(models, config)
-    fuser_pool.load_state_dict(payload["translator_pool"])
-    fuser_pool.to(config.device)
-    fuser_pool.eval()
-    return config, fuser_pool, model_specs, models, tokenizer, nodes, edges
+    translator_pool, model_specs, _, _ = build_translator_pool(models, config)
+    translator_pool.load_state_dict(payload["translator_pool"])
+    translator_pool.to(config.device)
+    translator_pool.eval()
+    return config, translator_pool, model_specs, models, tokenizer, nodes, edges
 
 
 
 def compute_gate_temperature(config: TrainConfig, step: int) -> float:
     if config.max_steps <= 1:
-        return config.gate_temperature_end
+        return float(config.gate_temperature_end)
     progress = (step - 1) / (config.max_steps - 1)
-    return (
-        config.gate_temperature_start
-        + progress * (config.gate_temperature_end - config.gate_temperature_start)
+    temperature = (
+        (1.0 - progress) * float(config.gate_temperature_start)
+        + progress * float(config.gate_temperature_end)
     )
+    return max(1e-4, temperature)
 
 
 
@@ -449,8 +535,8 @@ def run_train(config: TrainConfig) -> Path:
     logger.info("[Setup] device=%s", config.device)
     logger.info("[Setup] loading models: %s", {node.id: node.model_id for node in nodes})
     models, tokenizer, _, _ = build_models_and_tokenizer(config)
-    fuser_pool, model_specs, _, _ = build_fuser_pool(models, config)
-    fuser_pool.train()
+    translator_pool, model_specs, _, _ = build_translator_pool(models, config)
+    translator_pool.train()
 
     logger.info("[Setup] full model specs")
     for node in nodes:
@@ -464,12 +550,12 @@ def run_train(config: TrainConfig) -> Path:
             spec.num_heads,
         )
     logger.info("[Setup] top_layers_to_fuse = %d", config.top_layers_to_fuse)
-    logger.info("[Setup] trainable fuser params = %s", f"{count_trainable_parameters(fuser_pool):,}")
+    logger.info("[Setup] trainable C2C params = %s", f"{count_trainable_parameters(translator_pool):,}")
 
     dataloader = build_training_dataloader(tokenizer, config)
 
     optimizer = torch.optim.AdamW(
-        fuser_pool.parameters(),
+        translator_pool.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -482,16 +568,14 @@ def run_train(config: TrainConfig) -> Path:
     gpu_memory_tracker = GPUMemoryTracker(config.device)
 
     running_loss = 0.0
-    running_key_gate = 0.0
-    running_value_gate = 0.0
     progress_bar = tqdm(range(1, config.max_steps + 1), desc="Training")
 
     for step in progress_bar:
+        gate_temperature = compute_gate_temperature(config, step)
+        translator_pool.set_temperature(gate_temperature)
+
         optimizer.zero_grad(set_to_none=True)
         step_loss_value = 0.0
-        step_key_gate_value = 0.0
-        step_value_gate_value = 0.0
-        gate_temperature = compute_gate_temperature(config, step)
 
         for _ in range(config.grad_accum_steps):
             input_ids = next(dataloader).to(config.device)
@@ -507,36 +591,14 @@ def run_train(config: TrainConfig) -> Path:
                 }
 
             total_direction_loss = 0.0
-            total_key_gate = 0.0
-            total_value_gate = 0.0
             for direction in model_directions:
                 edge = edge_map[direction]
-                sharer_key_block, sharer_value_block = extract_top_layer_blocks(
-                    past_key_values=past_by_node_id[edge.src_id],
-                    top_layers_to_fuse=config.top_layers_to_fuse,
-                )
-                receiver_key_block, receiver_value_block = extract_top_layer_blocks(
-                    past_key_values=past_by_node_id[edge.dst_id],
-                    top_layers_to_fuse=config.top_layers_to_fuse,
-                )
-
-                delta_key_block, delta_value_block, key_gate, value_gate = fuser_pool.fuse_top_layer_blocks(
-                    receiver_key_block=receiver_key_block,
-                    receiver_value_block=receiver_value_block,
-                    sharer_key_block=sharer_key_block,
-                    sharer_value_block=sharer_value_block,
+                fused_top_past = translator_pool.fuse_top_layers(
+                    sharer_past_key_values=past_by_node_id[edge.src_id],
+                    receiver_past_key_values=past_by_node_id[edge.dst_id],
                     src_name=edge.src_id,
                     dst_name=edge.dst_id,
-                    temperature=gate_temperature,
-                )
-
-                fused_key_block = receiver_key_block + delta_key_block
-                fused_value_block = receiver_value_block + delta_value_block
-                fused_top_past = blocks_to_partial_past_key_values(
-                    key_block=fused_key_block,
-                    value_block=fused_value_block,
-                    num_heads=model_specs[edge.dst_id].num_heads,
-                    head_dim=model_specs[edge.dst_id].head_dim,
+                    dst_spec=model_specs[edge.dst_id],
                 )
                 mixed_target_past = replace_top_layers(
                     base_past_key_values=past_by_node_id[edge.dst_id],
@@ -549,61 +611,50 @@ def run_train(config: TrainConfig) -> Path:
                     lm_labels=lm_labels,
                 )
                 total_direction_loss = total_direction_loss + direction_loss
-                total_key_gate = total_key_gate + key_gate.mean()
-                total_value_gate = total_value_gate + value_gate.mean()
 
             loss = total_direction_loss / config.grad_accum_steps
             loss.backward()
             step_loss_value += loss.item()
-            step_key_gate_value += (total_key_gate / len(model_directions)).item()
-            step_value_gate_value += (total_value_gate / len(model_directions)).item()
 
-        torch.nn.utils.clip_grad_norm_(fuser_pool.parameters(), config.grad_clip_norm)
+        torch.nn.utils.clip_grad_norm_(translator_pool.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
         gpu_memory_tracker.update()
 
         running_loss += step_loss_value
-        running_key_gate += step_key_gate_value / config.grad_accum_steps
-        running_value_gate += step_value_gate_value / config.grad_accum_steps
         if step % config.log_every == 0:
             avg_loss = running_loss / config.log_every
-            avg_key_gate = running_key_gate / config.log_every
-            avg_value_gate = running_value_gate / config.log_every
             progress_bar.set_postfix(
                 loss=f"{avg_loss:.4f}",
                 lr=f"{scheduler.lr:.2e}",
-                temp=f"{gate_temperature:.3f}",
+                gate=f"{translator_pool.mean_gate_probability():.3f}",
             )
             gpu_memory = gpu_memory_tracker.summary()
             logger.info(
-                "[Step %04d] total_suffix_lm_loss=%.4f | gate_temp=%.4f | key_gate_mean=%.4f | value_gate_mean=%.4f | lr=%.2e | gpu_mem_avg=%s | gpu_mem_peak=%s",
+                "[Step %04d] total_suffix_lm_loss=%.4f | lr=%.2e | gate_temp=%.4f | mean_gate_prob=%.4f | gpu_mem_avg=%s | gpu_mem_peak=%s",
                 step,
                 avg_loss,
-                gate_temperature,
-                avg_key_gate,
-                avg_value_gate,
                 scheduler.lr,
+                gate_temperature,
+                translator_pool.mean_gate_probability(),
                 gpu_memory["avg_allocated_pretty"],
                 gpu_memory["peak_allocated_pretty"],
             )
             running_loss = 0.0
-            running_key_gate = 0.0
-            running_value_gate = 0.0
 
     final_path = get_train_checkpoint_path(output_path)
     save_checkpoint(
         output_path=str(final_path),
-        translator_pool=fuser_pool,
+        translator_pool=translator_pool,
         optimizer=optimizer,
         scheduler=scheduler,
         train_config=config,
         step=config.max_steps,
         extra={
-            "note": "Final checkpoint trained with C2C residual cache fusion and suffix LM loss.",
+            "note": "Final checkpoint trained with C2C-style suffix LM loss.",
             "model_ids": config.model_ids,
-            "model_directions": config.model_directions,
             "top_layers_to_fuse": config.top_layers_to_fuse,
+            "model_directions": config.model_directions,
         },
     )
     final_gpu_memory = gpu_memory_tracker.summary()
