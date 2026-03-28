@@ -19,9 +19,9 @@ for ((i=1; i<=$#; i++)); do
   esac
 done
 
-DISABLE_PRINCIPAL_ROTATION_VALUES=(false)
-BENCHMARK_MODES=(logit_qa gen_qa)
-INJECTION_WINDOW_SIZES=(1 3 5)
+DISABLE_PRINCIPAL_ROTATION_VALUES=(true)
+BENCHMARK_MODES=(gen_qa logit_qa)
+INJECTION_WINDOW_SIZES=(5 3)
 
 for disable_rotation in "${DISABLE_PRINCIPAL_ROTATION_VALUES[@]}"; do
   if [[ "${disable_rotation}" == "true" ]]; then

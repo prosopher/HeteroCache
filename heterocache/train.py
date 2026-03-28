@@ -463,15 +463,13 @@ def run_train(config: TrainConfig) -> Path:
                     base_past_key_values=past_by_node_id[edge.dst_id],
                     translated_top_past_key_values=translated_top_past,
                 )
-                direction_loss = compute_prefix_recon_and_suffix_lm_loss(
+                direction_loss = compute_prefix_correction_and_suffix_lm_loss(
                     target_model=models[edge.dst_id],
                     past_key_values=mixed_target_past,
                     lm_input_ids=lm_input_ids,
                     lm_labels=lm_labels,
-                    translated_key_block=translated_key_block,
-                    translated_value_block=translated_value_block,
-                    native_target_key_block=native_target_key_block,
-                    native_target_value_block=native_target_value_block,
+                    native_target_past_key_values=past_by_node_id[edge.dst_id],
+                    target_start_layer_idx=len(past_by_node_id[edge.dst_id]) - config.top_layers_to_translate,
                 )
                 total_direction_loss = total_direction_loss + direction_loss
 
